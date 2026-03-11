@@ -1,28 +1,44 @@
 """
-统一训练入口 - SNN 论文消融实验框架 (v2)
+统一训练入口 - SNN 论文消融实验框架 (v3)
 =========================================
-支持 CIFAR-10/100（原流程完全不变）+ 走廊导航数据集（离散/回归/序列）。
+支持:
+  - CIFAR-10/100（原流程完全不变）
+  - 走廊导航原始数据集（corridor, 离散/回归/序列）
+  - 阶段一派生任务（corridor_task, action3/junction_lr/stage4）
 
-v2 变更:
-  - 走廊训练改为 train/val/test 三划分
-  - 每个 epoch 仅评估 val，best_model 按 val_metric 保存
-  - 训练结束后可选对 test 做最终评估
-  - 新增 --img_h / --img_w / --corridor_hflip 参数
-  - 默认关闭走廊 RandomHorizontalFlip
-  - TensorBoard 标量: TrainLoss, ValLoss, TrainAcc, ValAcc 等
+v3 变更:
+  - 新增 --dataset corridor_task 分支
+  - 新增 --task_root / --task_name / --task_num_classes 参数
+  - 新增 --label_smoothing / --focal_gamma 参数
+  - 支持 CorridorTaskDataset / CorridorTaskSequenceDataset
 
-CIFAR-10 消融示例 (与原来完全一致):
+CIFAR-10:
     python train.py -T 8 --neuron_type APLIF --residual_mode ADD --seed 42 -epochs 151
-    python train.py --neuron_type LIF --residual_mode ADD -T 8 --seed 42
 
-走廊导航 离散分类 (3类: Left/Straight/Right):
+走廊导航原始 (3类):
     python train.py --dataset corridor --corridor_root ./data/corridor \\
         --mode discrete --action_set 3 --encoding rate -T 4 \\
         --class_balance weighted_sampler -b 32 -epochs 80
 
-走廊导航 连续回归 (angular_z):
-    python train.py --dataset corridor --corridor_root ./data/corridor \\
-        --mode regression --control_dim 1 --encoding framediff -T 1
+阶段一派生任务 (action3_balanced):
+    python train.py --dataset corridor_task \\
+        --task_root ./data/stage1/action3_balanced_v1 \\
+        --task_name action3_balanced --task_num_classes 3 \\
+        --encoding rate -T 4 --neuron_type APLIF --residual_mode ADD \\
+        --class_balance weighted_sampler -b 32 -epochs 80 \\
+        -enable_tensorboard --final_test
+
+阶段一派生任务 (junction_lr):
+    python train.py --dataset corridor_task \\
+        --task_root ./data/stage1/junction_lr_v1 \\
+        --task_name junction_lr --task_num_classes 2 \\
+        --encoding rate -T 8 -b 32 -epochs 60 --final_test
+
+阶段一派生任务 (stage4):
+    python train.py --dataset corridor_task \\
+        --task_root ./data/stage1/stage4_v1 \\
+        --task_name stage4 --task_num_classes 4 \\
+        --encoding rate -T 4 -b 32 -epochs 80 --final_test
 """
 
 import os
@@ -302,6 +318,90 @@ def build_corridor_dataset(args):
     return train_ds, val_ds, test_ds, num_out, 3, is_sequence, sampler
 
 
+def build_corridor_task_dataset(args):
+    """
+    构建阶段一派生任务数据集 (train / val / test)。
+    labels.csv 中 label_id 直接作为最终标签。
+
+    Returns:
+        train_ds, val_ds, test_ds, num_classes, in_channels,
+        is_sequence, sampler_or_None
+    """
+    from datasets.corridor_task_dataset import (
+        CorridorTaskDataset, CorridorTaskSequenceDataset)
+
+    img_h = args.img_h
+    img_w = args.img_w
+
+    # 训练增强
+    augments = [
+        torchvision.transforms.Resize((img_h, img_w)),
+    ]
+    if args.corridor_hflip:
+        augments.append(torchvision.transforms.RandomHorizontalFlip())
+        print("  ⚠ corridor_hflip=True: 已启用水平翻转增强")
+    augments.extend([
+        torchvision.transforms.ColorJitter(
+            brightness=0.2, contrast=0.2, saturation=0.2),
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Normalize([0.5]*3, [0.5]*3),
+    ])
+    train_transform = torchvision.transforms.Compose(augments)
+
+    eval_transform = torchvision.transforms.Compose([
+        torchvision.transforms.Resize((img_h, img_w)),
+        torchvision.transforms.ToTensor(),
+        torchvision.transforms.Normalize([0.5]*3, [0.5]*3),
+    ])
+
+    task_root = args.task_root
+    num_classes = args.task_num_classes
+    is_sequence = args.seq_len > 0
+    sampler = None
+
+    train_root = os.path.join(task_root, 'train')
+    val_root = os.path.join(task_root, 'val')
+    test_root = os.path.join(task_root, 'test')
+
+    if not os.path.isdir(train_root):
+        raise FileNotFoundError(
+            f"训练目录不存在: {train_root}\n"
+            f"请先运行 scripts/derive_stage1_datasets.py 派生数据")
+
+    has_val = os.path.isdir(val_root)
+    has_test = os.path.isdir(test_root)
+    if not has_val:
+        print("  ⚠ 未找到 val/ 目录，将使用 test/ 作为 val")
+        val_root = test_root
+
+    if is_sequence:
+        train_ds = CorridorTaskSequenceDataset(
+            root_dir=train_root,
+            seq_len=args.seq_len, stride=args.stride,
+            transforms=train_transform)
+        val_ds = CorridorTaskSequenceDataset(
+            root_dir=val_root,
+            seq_len=args.seq_len, stride=args.stride,
+            transforms=eval_transform)
+        test_ds = CorridorTaskSequenceDataset(
+            root_dir=test_root,
+            seq_len=args.seq_len, stride=args.stride,
+            transforms=eval_transform) if has_test else None
+    else:
+        train_ds = CorridorTaskDataset(
+            root_dir=train_root, transforms=train_transform)
+        val_ds = CorridorTaskDataset(
+            root_dir=val_root, transforms=eval_transform)
+        test_ds = CorridorTaskDataset(
+            root_dir=test_root, transforms=eval_transform) if has_test else None
+
+        # 类别平衡
+        if args.class_balance == 'weighted_sampler':
+            sampler = train_ds.get_weighted_sampler()
+
+    return train_ds, val_ds, test_ds, num_classes, 3, is_sequence, sampler
+
+
 # ============================================================================
 # 评估 helper (val / test 共用)
 # ============================================================================
@@ -420,7 +520,8 @@ def main():
                         choices=['standard', 'ADD'],
                         help='残差连接模式')
     parser.add_argument('--dataset', default='cifar10', type=str,
-                        choices=['cifar10', 'cifar100', 'corridor'],
+                        choices=['cifar10', 'cifar100', 'corridor',
+                                 'corridor_task'],
                         help='数据集')
     parser.add_argument('--num_classes', default=None, type=int,
                         help='分类数 (不指定则自动确定)')
@@ -482,6 +583,19 @@ def main():
                         help='走廊训练启用 RandomHorizontalFlip '
                              '(默认关闭, 因 Left/Right 标签不会自动互换)')
 
+    # ======================== 阶段一派生任务参数 ========================
+    parser.add_argument('--task_root', default='./data/stage1/action3_balanced_v1',
+                        type=str,
+                        help='corridor_task 数据根目录 (含 train/val/test/)')
+    parser.add_argument('--task_name', default='action3_balanced', type=str,
+                        help='任务名 (用于实验命名: action3_balanced/junction_lr/stage4)')
+    parser.add_argument('--task_num_classes', default=3, type=int,
+                        help='corridor_task 类别数')
+    parser.add_argument('--label_smoothing', default=0.0, type=float,
+                        help='CrossEntropyLoss label smoothing')
+    parser.add_argument('--focal_gamma', default=0.0, type=float,
+                        help='Focal Loss gamma (0.0=禁用, >0=启用)')
+
     # ======================== 训练参数 ========================
     parser.add_argument('-device', default='cuda:0', help='训练设备')
     parser.add_argument('-b', default=8, type=int, help='batch size')
@@ -520,8 +634,9 @@ def main():
 
     args = parser.parse_args()
 
-    # 判断是否走廊训练
+    # 判断数据集类型
     is_corridor = (args.dataset == 'corridor')
+    is_corridor_task = (args.dataset == 'corridor_task')
 
     # ======================== 设置随机种子 ========================
     torch.manual_seed(args.seed)
@@ -532,7 +647,12 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
 
     # ======================== 生成实验标识 ========================
-    if is_corridor:
+    if is_corridor_task:
+        seq_tag = f"_seq{args.seq_len}" if args.seq_len > 0 else ""
+        exp_name = (f"corridor_task_{args.task_name}_"
+                    f"{args.neuron_type}_{args.residual_mode}_T{args.T}{seq_tag}")
+        out_base = os.path.join(args.out_dir, '..', 'corridor_task')
+    elif is_corridor:
         task_tag = f"{args.mode}_{args.action_set}cls" if args.mode == 'discrete' \
             else f"{args.mode}_dim{args.control_dim}"
         enc_tag = args.encoding
@@ -555,7 +675,19 @@ def main():
     print(f'  时间步 T:       {args.T}')
     print(f'  Seed:           {args.seed}')
     print(f'  数据集:         {args.dataset}')
-    if is_corridor:
+    if is_corridor_task:
+        print(f'  任务名:         {args.task_name}')
+        print(f'  类别数:         {args.task_num_classes}')
+        print(f'  数据根目录:     {args.task_root}')
+        print(f'  图像尺寸:       {args.img_h}×{args.img_w}')
+        print(f'  编码:           {args.encoding}')
+        if args.label_smoothing > 0:
+            print(f'  Label Smoothing: {args.label_smoothing}')
+        if args.focal_gamma > 0:
+            print(f'  Focal Gamma:    {args.focal_gamma}')
+        print(f'  序列长度:       {args.seq_len}' if args.seq_len > 0
+              else f'  训练模式:       单帧')
+    elif is_corridor:
         print(f'  走廊模式:       {args.mode}')
         print(f'  编码:           {args.encoding}')
         print(f'  动作集:         {args.action_set}类' if args.mode == 'discrete'
@@ -591,7 +723,11 @@ def main():
     val_dataset = None
     test_dataset = None
 
-    if is_corridor:
+    if is_corridor_task:
+        (train_dataset, val_dataset, test_dataset, num_out,
+         auto_in_channels, is_sequence, sampler) = build_corridor_task_dataset(args)
+        num_classes = num_out
+    elif is_corridor:
         (train_dataset, val_dataset, test_dataset, num_out,
          auto_in_channels, is_sequence, sampler) = build_corridor_dataset(args)
         num_classes = num_out
@@ -622,7 +758,20 @@ def main():
         writer = SummaryWriter(os.path.join(exp_out_dir, 'runs'))
 
     # ======================== 构建网络 ========================
-    if is_corridor:
+    if is_corridor_task:
+        from models.snn_corridor import build_corridor_net
+        net = build_corridor_net(
+            head_type='discrete',
+            num_actions=num_classes,
+            control_dim=1,
+            encoding=args.encoding,
+            T=args.T,
+            neuron_type=args.neuron_type,
+            residual_mode=args.residual_mode,
+            raw_in_channels=in_channels,
+            use_tanh=False,
+        )
+    elif is_corridor:
         from models.snn_corridor import build_corridor_net
         net = build_corridor_net(
             head_type=args.mode,
@@ -721,21 +870,27 @@ def main():
     # ======================== 损失函数 ========================
     loss_type = args.loss_type
     if loss_type == 'auto':
-        if is_corridor:
+        if is_corridor_task:
+            loss_type = 'ce'
+        elif is_corridor:
             loss_type = 'ce' if args.mode == 'discrete' else 'huber'
         else:
             loss_type = 'mse_onehot'
 
-    # CE class weights (corridor discrete + class_weight)
+    # CE class weights
     ce_weight = None
-    if is_corridor and args.mode == 'discrete' and \
+    if is_corridor_task and args.class_balance == 'class_weight' \
+            and not is_sequence:
+        ce_weight = train_dataset.get_class_weights().to(args.device)
+        print(f'  类别权重: {ce_weight.tolist()}')
+    elif is_corridor and args.mode == 'discrete' and \
             args.class_balance == 'class_weight' and not is_sequence:
         ce_weight = train_dataset.get_class_weights().to(args.device)
         print(f'  类别权重: {ce_weight.tolist()}')
 
     # CIFAR class weights (与原始设置一致)
     cifar_class_weights = None
-    if not is_corridor and args.dataset == 'cifar10':
+    if not is_corridor and not is_corridor_task and args.dataset == 'cifar10':
         cifar_class_weights = torch.FloatTensor([
             1.0, 1.0, 1.2, 2.0, 1.1, 1.5, 1.0, 1.0, 1.0, 1.0
         ]).to(args.device)
@@ -743,7 +898,9 @@ def main():
     ce_criterion = None
     huber_criterion = None
     if loss_type == 'ce':
-        ce_criterion = nn.CrossEntropyLoss(weight=ce_weight)
+        ce_criterion = nn.CrossEntropyLoss(
+            weight=ce_weight,
+            label_smoothing=args.label_smoothing)
     elif loss_type == 'huber':
         huber_criterion = nn.SmoothL1Loss(beta=0.1)
 
@@ -760,8 +917,10 @@ def main():
                 return (mse * cifar_class_weights.unsqueeze(0)).mean()
             return F.mse_loss(out, label_onehot)
 
-    is_discrete = (is_corridor and args.mode == 'discrete') or \
-                  (not is_corridor and args.task_type == 'classification')
+    is_discrete = is_corridor_task or \
+                  (is_corridor and args.mode == 'discrete') or \
+                  (not is_corridor and not is_corridor_task and
+                   args.task_type == 'classification')
 
     # ======================== config 快照 ========================
     os.makedirs(exp_out_dir, exist_ok=True)
@@ -775,7 +934,19 @@ def main():
         'seed': args.seed,
         'dataset': args.dataset,
     }
-    if is_corridor:
+    if is_corridor_task:
+        config.update({
+            'task_root': args.task_root,
+            'task_name': args.task_name,
+            'task_num_classes': args.task_num_classes,
+            'encoding': args.encoding,
+            'seq_len': args.seq_len,
+            'img_h': args.img_h,
+            'img_w': args.img_w,
+            'label_smoothing': args.label_smoothing,
+            'focal_gamma': args.focal_gamma,
+        })
+    elif is_corridor:
         config.update({
             'mode': args.mode,
             'encoding': args.encoding,
