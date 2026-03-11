@@ -1,0 +1,63 @@
+# ============================================================
+# corridor_export.py 配置文件
+# 用于从 ROS2 rosbag2 导出走廊导航数据集
+# ============================================================
+
+# --- ROS2 Bag 设置 ---
+bag:
+  image_topic: "/camera/color/image_raw"          # 图像话题
+  cmd_vel_topic: "/cmd_vel"                 # 速度指令话题
+  image_encoding: "auto"                    # auto / bgr8 / rgb8 / mono8
+
+# --- 图像输出 ---
+image:
+  format: "jpg"                             # jpg / png
+  jpg_quality: 95                           # jpg 压缩质量 (1-100)
+  resize: null                              # null=保持原始  或 [width, height] 如 [320, 240]
+  sample_interval_ms: 0                     # 最小帧间隔(ms), 0=不跳帧
+
+# --- cmd_vel 对齐策略 ---
+alignment:
+  method: "nearest"                         # nearest / linear_interp
+  max_time_diff_ms: 100                     # 最大允许时间差(ms)，超过则标记该帧无效
+                                            # nearest: 取时间戳最近的 cmd_vel
+                                            # linear_interp: 在前后两个 cmd_vel 之间线性插值
+
+# --- 动作离散化阈值 ---
+# 基于 geometry_msgs/Twist:
+#   linear.x  前进/后退速度 (m/s)
+#   angular.z 角速度 (rad/s)，左正右负
+action_thresholds:
+  forward:
+    linear_x_min: 0.05                      # linear.x >= 此值 且 |angular.z| < angular_z_max → Forward
+    angular_z_max: 0.3                      # 前进时允许的最大角速度绝对值
+  backward:
+    linear_x_max: -0.05                     # linear.x <= 此值 且 |angular.z| < angular_z_max → Backward
+    angular_z_max: 0.3
+  left:
+    angular_z_min: 0.3                      # angular.z >= 此值 → Left (左转)
+  right:
+    angular_z_max: -0.3                     # angular.z <= 此值 → Right (右转)
+  stop:
+    enabled: true                           # 是否启用 Stop 类别
+    linear_x_abs_max: 0.05                  # |linear.x| < 此值 且 |angular.z| < angular_z_abs_max → Stop
+    angular_z_abs_max: 0.3
+
+# --- 动作 ID 映射 (与 NavigationDataset 兼容) ---
+action_ids:
+  Forward: 0
+  Backward: 1
+  Left: 2
+  Right: 3
+  Stop: 4
+
+# --- 元数据 (写入 meta.json) ---
+meta:
+  corridor_width_m: 2.0                     # 走廊宽度 (米)
+  lighting: "fluorescent"                   # 光照条件: fluorescent / natural / mixed / dim
+  robot_id: "turtlebot3_burger"             # 小车型号/ID
+  camera_height_m: 0.15                     # 相机离地高度 (米)
+  camera_fov_deg: 60                        # 相机水平视场角 (度)
+  camera_resolution: [640, 480]             # 原始分辨率 [W, H]
+  location: "indoor_corridor"               # 场景描述
+  notes: ""                                 # 备注

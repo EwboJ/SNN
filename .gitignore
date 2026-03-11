@@ -1,0 +1,85 @@
+# Python 缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+myenv/
+conda_env/
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 训练输出文件
+## 模型权重/检查点
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.weights
+best_model.pth
+last_model.pth
+checkpoints/
+checkpoint-*/
+
+## TensorBoard 日志
+runs/
+lightning_logs/
+logs/
+log/
+
+## 训练结果
+results/
+output/
+outputs/
+experiments/
+
+# 数据集（绝对不要上传）
+data/
+# datasets/
+Data/
+*.npz
+*.npy
+*.hdf5
+*.h5
+*.pickle
+*.pkl
+
+# 配置文件（包含路径、API密钥等）
+*.local
+*.local.yaml
+*.local.json
+config_local.yaml
+.env
+
+# 临时文件
+temp/
+tmp/
+*.tmp
+*.temp
+*.log
+*.err
+*.out
+
+# Jupyter Notebook 临时文件
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# 环境配置文件
+environment.yaml
+requirements.txt  # 这个可以保留，但如果是生成的就忽略
+conda_env.yaml
+
+# 系统文件
+Thumbs.db
+.DS_Store
