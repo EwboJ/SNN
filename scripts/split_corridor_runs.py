@@ -408,79 +408,41 @@ def save_split_summary(dst_root, config, train_stats, val_stats, test_stats):
 
 
 # ============================================================================
-# 主流程
+# 可调用入口 (供 pipeline 调用)
 # ============================================================================
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='走廊导航 run 级别 train/val/test 划分 (v2)',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+def run_split(src_root, dst_root, split_mode='exact', group_by='junction_id,turn_dir',
+              train_per_group=5, val_per_group=1, test_per_group=1,
+              val_ratio=0.15, test_ratio=0.15,
+              min_frames=10, exclude=None, manifest_path=None,
+              copy_mode='symlink', seed=42, force=False, dry_run=False):
+    """
+    走廊导航 run 级别 train/val/test 划分核心函数 (供 pipeline 调用)。
 
-    # 路径
-    parser.add_argument('--src_root', type=str, default='./data/corridor_balanced',
-                        help='原始 run 目录的根路径')
-    parser.add_argument('--dst_root', type=str, default='./data/corridor',
-                        help='输出目录 (创建 train/ val/ test/)')
-    parser.add_argument('--manifest', type=str, default=None,
-                        help='可选 runs_manifest.csv 路径')
+    Returns:
+        dict: split_summary
+    """
+    group_keys = [k.strip() for k in group_by.split(',')]
+    exclude_set = set(exclude) if exclude else set()
 
-    # 划分模式
-    parser.add_argument('--split_mode', type=str, default='exact',
-                        choices=['exact', 'ratio'],
-                        help='划分模式: exact=每组精确数量, ratio=按比例')
-    parser.add_argument('--group_by', type=str, default='junction_id,turn_dir',
-                        help='分组键 (逗号分隔)')
-
-    # exact 模式参数
-    parser.add_argument('--train_per_group', type=int, default=5,
-                        help='[exact] 每组 train 的 run 数')
-    parser.add_argument('--val_per_group', type=int, default=1,
-                        help='[exact] 每组 val 的 run 数')
-    parser.add_argument('--test_per_group', type=int, default=1,
-                        help='[exact] 每组 test 的 run 数')
-
-    # ratio 模式参数
-    parser.add_argument('--val_ratio', type=float, default=0.15,
-                        help='[ratio] val 比例')
-    parser.add_argument('--test_ratio', type=float, default=0.15,
-                        help='[ratio] test 比例')
-
-    # 过滤
-    parser.add_argument('--min_frames', type=int, default=10,
-                        help='最小帧数阈值 (低于此值的 run 被跳过)')
-    parser.add_argument('--exclude', nargs='*', default=[],
-                        help='排除的 run 名称')
-
-    # 复制
-    parser.add_argument('--copy_mode', type=str, default='symlink',
-                        choices=['copy', 'symlink'],
-                        help='复制方式 (推荐 symlink 节省磁盘)')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='随机种子')
-    parser.add_argument('--force', action='store_true',
-                        help='覆盖已有目标目录')
-    parser.add_argument('--dry_run', action='store_true',
-                        help='仅预览，不实际复制')
-
-    args = parser.parse_args()
-    group_keys = [k.strip() for k in args.group_by.split(',')]
-    exclude_set = set(args.exclude) if args.exclude else set()
+    if not os.path.isdir(src_root):
+        raise FileNotFoundError(f"源目录不存在: {src_root}")
 
     # ======================== Banner ========================
     print('=' * 72)
     print('  走廊导航数据集划分 (v2)')
     print('=' * 72)
-    print(f'  源目录:       {os.path.abspath(args.src_root)}')
-    print(f'  目标目录:     {os.path.abspath(args.dst_root)}')
-    print(f'  划分模式:     {args.split_mode}')
+    print(f'  源目录:       {os.path.abspath(src_root)}')
+    print(f'  目标目录:     {os.path.abspath(dst_root)}')
+    print(f'  划分模式:     {split_mode}')
     print(f'  分组键:       {group_keys}')
-    if args.split_mode == 'exact':
-        print(f'  每组分配:     train={args.train_per_group}, '
-              f'val={args.val_per_group}, test={args.test_per_group}')
+    if split_mode == 'exact':
+        print(f'  每组分配:     train={train_per_group}, '
+              f'val={val_per_group}, test={test_per_group}')
     else:
-        print(f'  比例:         val={args.val_ratio}, test={args.test_ratio}')
-    print(f'  复制方式:     {args.copy_mode}')
-    print(f'  种子:         {args.seed}')
+        print(f'  比例:         val={val_ratio}, test={test_ratio}')
+    print(f'  复制方式:     {copy_mode}')
+    print(f'  种子:         {seed}')
     if exclude_set:
         print(f'  排除:         {exclude_set}')
     print('=' * 72)
@@ -488,21 +450,15 @@ def main():
     # ======================== [1] 扫描 ========================
     print(f'\n[1/5] 扫描有效 run...')
 
-    if not os.path.isdir(args.src_root):
-        print(f"  ✗ 源目录不存在: {args.src_root}")
-        sys.exit(1)
+    all_runs = find_valid_runs(src_root, min_frames=min_frames)
 
-    all_runs = find_valid_runs(args.src_root, min_frames=args.min_frames)
-
-    # 排除
     if exclude_set:
         before = len(all_runs)
         all_runs = [r for r in all_runs if r['name'] not in exclude_set]
         print(f"  排除 {before - len(all_runs)} 个 run")
 
     if not all_runs:
-        print("  ✗ 未找到有效 run!")
-        sys.exit(1)
+        raise RuntimeError("未找到有效 run!")
 
     print(f"  找到 {len(all_runs)} 个有效 run, "
           f"总帧数 {sum(r['frame_count'] for r in all_runs)}")
@@ -511,21 +467,19 @@ def main():
     print(f'\n[2/5] 按 {group_keys} 分组...')
 
     manifest = None
-    if args.manifest:
-        if not os.path.isfile(args.manifest):
-            print(f"  ✗ manifest 文件不存在: {args.manifest}")
-            sys.exit(1)
-        manifest = load_manifest(args.manifest)
+    if manifest_path:
+        if not os.path.isfile(manifest_path):
+            raise FileNotFoundError(f"manifest 文件不存在: {manifest_path}")
+        manifest = load_manifest(manifest_path)
         print(f"  从 manifest 加载 {len(manifest)} 条记录")
 
     groups = build_groups(all_runs, manifest, group_keys)
 
     if not groups:
-        print("  ✗ 无法解析任何 run 的分组信息!")
-        print("  请确保目录名格式为 J{id}_{left|right}_r{rep} "
-              "或 {left|right}{id}_bag{rep}")
-        print("  或提供 --manifest 文件")
-        sys.exit(1)
+        raise RuntimeError(
+            "无法解析任何 run 的分组信息! "
+            "请确保目录名格式为 J{id}_{left|right}_r{rep} "
+            "或 {left|right}{id}_bag{rep}，或提供 --manifest 文件")
 
     print(f"  共 {len(groups)} 个组:")
     for key in sorted(groups.keys()):
@@ -535,30 +489,29 @@ def main():
         print(f"    {key}: {len(grp)} runs, {frames} 帧  [{names}]")
 
     # ======================== [3] 划分 ========================
-    print(f'\n[3/5] 执行 {args.split_mode} 划分...')
+    print(f'\n[3/5] 执行 {split_mode} 划分...')
 
-    if args.split_mode == 'exact':
+    if split_mode == 'exact':
         train_runs, val_runs, test_runs = split_exact(
             groups,
-            train_n=args.train_per_group,
-            val_n=args.val_per_group,
-            test_n=args.test_per_group,
-            seed=args.seed)
+            train_n=train_per_group,
+            val_n=val_per_group,
+            test_n=test_per_group,
+            seed=seed)
     else:
         train_runs, val_runs, test_runs = split_ratio(
             groups,
-            val_ratio=args.val_ratio,
-            test_ratio=args.test_ratio,
-            seed=args.seed)
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=seed)
 
-    # 完整性检查: 同一 run 不能出现在多个 split
+    # 完整性检查
     all_names = set()
-    for split_name, runs in [('train', train_runs), ('val', val_runs),
-                              ('test', test_runs)]:
+    for sn, runs in [('train', train_runs), ('val', val_runs),
+                     ('test', test_runs)]:
         for r in runs:
             if r['name'] in all_names:
-                print(f"  ✗ 致命错误: run '{r['name']}' 出现在多个 split 中!")
-                sys.exit(1)
+                raise RuntimeError(f"致命错误: run '{r['name']}' 出现在多个 split 中!")
             all_names.add(r['name'])
 
     train_stats = compute_split_stats(train_runs, group_keys)
@@ -570,55 +523,52 @@ def main():
     print_split_info('TEST', test_stats, group_keys)
 
     # ======================== [4] 复制 ========================
-    if args.dry_run:
+    if dry_run:
         print(f'\n[4/5] [DRY RUN] 跳过复制')
     else:
-        print(f'\n[4/5] 复制 run (mode={args.copy_mode})...')
+        print(f'\n[4/5] 复制 run (mode={copy_mode})...')
 
-        # 检查目标目录
         for sub in ['train', 'val', 'test']:
-            sub_dir = os.path.join(args.dst_root, sub)
+            sub_dir = os.path.join(dst_root, sub)
             if os.path.exists(sub_dir):
-                if not args.force:
-                    ans = input(f"  ⚠ {sub_dir} 已存在，覆盖? [y/N] ").strip().lower()
-                    if ans not in ('y', 'yes'):
-                        print("  已取消。")
-                        sys.exit(0)
+                if not force:
+                    raise FileExistsError(
+                        f"{sub_dir} 已存在  (使用 --force 覆盖)")
                 shutil.rmtree(sub_dir)
 
-        for split_name, runs in [('train', train_runs), ('val', val_runs),
-                                  ('test', test_runs)]:
-            split_dir = os.path.join(args.dst_root, split_name)
+        for sn, runs in [('train', train_runs), ('val', val_runs),
+                         ('test', test_runs)]:
+            split_dir = os.path.join(dst_root, sn)
             os.makedirs(split_dir, exist_ok=True)
             for r in runs:
                 dst = os.path.join(split_dir, r['name'])
-                copy_run(r['path'], dst, args.copy_mode)
-                print(f"    [{split_name:5s}] {r['name']}")
+                copy_run(r['path'], dst, copy_mode)
+                print(f"    [{sn:5s}] {r['name']}")
 
     # ======================== [5] 保存元数据 ========================
     print(f'\n[5/5] 保存元数据...')
-    os.makedirs(args.dst_root, exist_ok=True)
+    os.makedirs(dst_root, exist_ok=True)
 
     config_out = {
-        'src_root': args.src_root,
-        'dst_root': args.dst_root,
-        'split_mode': args.split_mode,
+        'src_root': src_root,
+        'dst_root': dst_root,
+        'split_mode': split_mode,
         'group_by': group_keys,
-        'seed': args.seed,
-        'copy_mode': args.copy_mode,
+        'seed': seed,
+        'copy_mode': copy_mode,
         'exclude': list(exclude_set),
-        'min_frames': args.min_frames,
+        'min_frames': min_frames,
     }
-    if args.split_mode == 'exact':
-        config_out['train_per_group'] = args.train_per_group
-        config_out['val_per_group'] = args.val_per_group
-        config_out['test_per_group'] = args.test_per_group
+    if split_mode == 'exact':
+        config_out['train_per_group'] = train_per_group
+        config_out['val_per_group'] = val_per_group
+        config_out['test_per_group'] = test_per_group
     else:
-        config_out['val_ratio'] = args.val_ratio
-        config_out['test_ratio'] = args.test_ratio
+        config_out['val_ratio'] = val_ratio
+        config_out['test_ratio'] = test_ratio
 
-    save_split_manifest(args.dst_root, train_runs, val_runs, test_runs)
-    save_split_summary(args.dst_root, config_out, train_stats, val_stats,
+    save_split_manifest(dst_root, train_runs, val_runs, test_runs)
+    save_split_summary(dst_root, config_out, train_stats, val_stats,
                        test_stats)
 
     # ======================== 总结 ========================
@@ -676,17 +626,75 @@ def main():
 
     print(f'{"=" * 72}')
 
-    if args.dry_run:
+    if dry_run:
         print(f'  [DRY RUN] 以上为预览，未实际复制文件。')
-        print(f'  去掉 --dry_run 后重新运行即可执行。')
     else:
-        print(f'  输出目录: {os.path.abspath(args.dst_root)}')
-        print(f'\n  下一步训练命令:')
-        print(f'    python train.py --dataset corridor '
-              f'--corridor_root {args.dst_root} '
-              f'--mode discrete --action_set 3 -T 4 '
-              f'--class_balance weighted_sampler -b 32')
-    print(f'{"=" * 72}')
+        print(f'  输出目录: {os.path.abspath(dst_root)}')
+
+    summary = {
+        'config': config_out,
+        'train': train_stats,
+        'val': val_stats,
+        'test': test_stats,
+    }
+    return summary
+
+
+# ============================================================================
+# 主流程
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='走廊导航 run 级别 train/val/test 划分 (v2)',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    parser.add_argument('--src_root', type=str, default='./data/corridor_balanced',
+                        help='原始 run 目录的根路径')
+    parser.add_argument('--dst_root', type=str, default='./data/corridor',
+                        help='输出目录 (创建 train/ val/ test/)')
+    parser.add_argument('--manifest', type=str, default=None,
+                        help='可选 runs_manifest.csv 路径')
+    parser.add_argument('--split_mode', type=str, default='exact',
+                        choices=['exact', 'ratio'],
+                        help='划分模式')
+    parser.add_argument('--group_by', type=str, default='junction_id,turn_dir',
+                        help='分组键 (逗号分隔)')
+    parser.add_argument('--train_per_group', type=int, default=5)
+    parser.add_argument('--val_per_group', type=int, default=1)
+    parser.add_argument('--test_per_group', type=int, default=1)
+    parser.add_argument('--val_ratio', type=float, default=0.15)
+    parser.add_argument('--test_ratio', type=float, default=0.15)
+    parser.add_argument('--min_frames', type=int, default=10)
+    parser.add_argument('--exclude', nargs='*', default=[])
+    parser.add_argument('--copy_mode', type=str, default='symlink',
+                        choices=['copy', 'symlink'])
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--force', action='store_true',
+                        help='覆盖已有目标目录')
+    parser.add_argument('--dry_run', action='store_true',
+                        help='仅预览，不实际复制')
+
+    args = parser.parse_args()
+
+    run_split(
+        src_root=args.src_root,
+        dst_root=args.dst_root,
+        split_mode=args.split_mode,
+        group_by=args.group_by,
+        train_per_group=args.train_per_group,
+        val_per_group=args.val_per_group,
+        test_per_group=args.test_per_group,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        min_frames=args.min_frames,
+        exclude=args.exclude,
+        manifest_path=args.manifest,
+        copy_mode=args.copy_mode,
+        seed=args.seed,
+        force=args.force,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == '__main__':

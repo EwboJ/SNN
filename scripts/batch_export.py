@@ -99,8 +99,9 @@ def main():
     parser.add_argument("--config", type=str, default=None,
                         help="YAML 配置文件路径 (默认使用内置配置)")
     parser.add_argument("--split", type=float, default=0,
-                        help="train/test 拆分比例 (如 0.8 = 80%% 训练)，"
-                             "0 表示不拆分，全部导出到 output_dir 下")
+                        help="[已弃用] train/test 拆分比例 (如 0.8 = 80%% 训练)，"
+                             "0 表示不拆分。推荐使用 split_corridor_runs.py 或 "
+                             "corridor_dataset_pipeline.py 进行 train/val/test 划分")
     parser.add_argument("--dry_run", action="store_true",
                         help="仅打印计划，不实际导出")
     parser.add_argument("--skip_existing", action="store_true",

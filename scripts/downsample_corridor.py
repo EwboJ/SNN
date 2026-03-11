@@ -259,88 +259,59 @@ def process_run(run_name, src_run_dir, dst_run_dir, context_frames, stride,
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='走廊数据集智能降采样',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+def run_downsample(src_root, dst_root, context_frames=15, stride=3,
+                   copy_mode='copy', exclude=None, valid_only=True,
+                   force=False, dry_run=False):
+    """
+    智能降采样核心函数 (供 pipeline 调用)。
 
-    parser.add_argument('--src_root', type=str, default='./data/corridor_all',
-                        help='原始数据根目录')
-    parser.add_argument('--dst_root', type=str,
-                        default='./data/corridor_balanced',
-                        help='输出目录')
-    parser.add_argument('--context_frames', type=int, default=15,
-                        help='转弯上下文半径: 距最近 Left/Right ≤ N帧的 '
-                             'Forward 全保留 (30FPS 下 15帧≈0.5秒)')
-    parser.add_argument('--stride', type=int, default=3,
-                        help='远离转弯的 Forward 帧抽样步长 '
-                             '(3=每3帧取1, 即10FPS)')
-    parser.add_argument('--copy_mode', type=str, default='copy',
-                        choices=['copy', 'symlink'],
-                        help='图片复制方式')
-    parser.add_argument('--exclude', nargs='*', default=[''],
-                        help='排除的 run 名称列表')
-    parser.add_argument('--valid_only', type=lambda x:
-                        str(x).lower() in ('true', '1', 'yes'),
-                        default=True, help='是否丢弃 valid=0 帧')
-    parser.add_argument('--force', action='store_true',
-                        help='覆盖已有输出目录')
-    parser.add_argument('--dry_run', action='store_true',
-                        help='仅打印统计，不实际复制文件')
+    Returns:
+        dict: 汇总统计
+    """
+    if not os.path.isdir(src_root):
+        raise FileNotFoundError(f"源目录不存在: {src_root}")
 
-    args = parser.parse_args()
+    if os.path.exists(dst_root) and not dry_run:
+        if not force:
+            raise FileExistsError(
+                f"输出目录已存在: {dst_root}  (使用 --force 覆盖)")
+        shutil.rmtree(dst_root)
 
-    # 检查源目录
-    if not os.path.isdir(args.src_root):
-        print(f"错误: 源目录不存在: {args.src_root}")
-        sys.exit(1)
-
-    # 检查输出目录
-    if os.path.exists(args.dst_root) and not args.dry_run:
-        if not args.force:
-            ans = input(f"输出目录已存在: {args.dst_root}\n是否覆盖? [y/N] ")
-            if ans.strip().lower() not in ('y', 'yes'):
-                print("已取消。")
-                sys.exit(0)
-        shutil.rmtree(args.dst_root)
-
-    exclude_set = set(args.exclude) if args.exclude else set()
+    exclude_set = set(exclude) if exclude else set()
 
     print('=' * 75)
     print('  走廊数据智能降采样')
     print('=' * 75)
-    print(f'  源目录:           {os.path.abspath(args.src_root)}')
-    print(f'  输出目录:         {os.path.abspath(args.dst_root)}')
-    print(f'  转弯上下文半径:   {args.context_frames} 帧 '
-          f'(≈{args.context_frames/30:.1f}s @30FPS)')
-    print(f'  远直行抽样步长:   每 {args.stride} 帧取 1')
+    print(f'  源目录:           {os.path.abspath(src_root)}')
+    print(f'  输出目录:         {os.path.abspath(dst_root)}')
+    print(f'  转弯上下文半径:   {context_frames} 帧 '
+          f'(≈{context_frames/30:.1f}s @30FPS)')
+    print(f'  远直行抽样步长:   每 {stride} 帧取 1')
     print(f'  排除 run:         {exclude_set or "无"}')
-    print(f'  模式:             {"DRY RUN (不复制)" if args.dry_run else args.copy_mode}')
+    print(f'  模式:             {"DRY RUN (不复制)" if dry_run else copy_mode}')
     print('=' * 75)
 
-    # 处理每个 run
     all_stats = []
     total_before = defaultdict(int)
     total_after = defaultdict(int)
 
-    runs = sorted([d for d in os.listdir(args.src_root)
-                   if os.path.isdir(os.path.join(args.src_root, d))])
+    runs = sorted([d for d in os.listdir(src_root)
+                   if os.path.isdir(os.path.join(src_root, d))])
 
     for run_name in runs:
         if run_name in exclude_set:
             print(f"  [排除] {run_name}")
             continue
 
-        src_dir = os.path.join(args.src_root, run_name)
+        src_dir = os.path.join(src_root, run_name)
 
-        if args.dry_run:
-            # Dry run: 只统计不复制
+        if dry_run:
             lbl_path = os.path.join(src_dir, 'labels.csv')
             if not os.path.isfile(lbl_path):
                 continue
             rows = load_labels(lbl_path)
             keep_mask, reasons = downsample_run(
-                rows, args.context_frames, args.stride, args.valid_only)
+                rows, context_frames, stride, valid_only)
             before_dist = count_actions(rows)
             after_dist = count_actions(rows, keep_mask)
             n_before = sum(before_dist.values())
@@ -357,10 +328,10 @@ def main():
                 'reasons': dict(reason_counts),
             }
         else:
-            dst_dir = os.path.join(args.dst_root, run_name)
+            dst_dir = os.path.join(dst_root, run_name)
             stats = process_run(run_name, src_dir, dst_dir,
-                                args.context_frames, args.stride,
-                                args.copy_mode, args.valid_only)
+                                context_frames, stride,
+                                copy_mode, valid_only)
 
         if stats:
             all_stats.append(stats)
@@ -370,11 +341,13 @@ def main():
                 total_after[k] += v
 
     # ======================== 打印报告 ========================
+    n_total_before = sum(total_before.values())
+    n_total_after = sum(total_after.values())
+
     print(f'\n{"=" * 75}')
     print(f'  降采样结果')
     print(f'{"=" * 75}')
 
-    # 每个 run 的详情
     print(f'\n{"Run":22s} {"前":>5s} {"后":>5s} {"降%":>5s}  '
           f'{"Fwd前":>5s}→{"Fwd后":>5s}  {"L前":>4s}→{"L后":>4s}  '
           f'{"R前":>4s}→{"R后":>4s}  {"Stp前":>5s}→{"Stp后":>5s}')
@@ -388,10 +361,6 @@ def main():
               f"{b.get('Left',0):4d}→{a.get('Left',0):4d}  "
               f"{b.get('Right',0):4d}→{a.get('Right',0):4d}  "
               f"{b.get('Stop',0):5d}→{a.get('Stop',0):5d}")
-
-    # 汇总
-    n_total_before = sum(total_before.values())
-    n_total_after = sum(total_after.values())
 
     print('-' * 100)
     print(f'{"TOTAL":22s} {n_total_before:5d} {n_total_after:5d} '
@@ -422,13 +391,11 @@ def main():
         print(f'  {name:10s} {bv:8d} {bp:5.1f}%  →  {av:8d} {ap:5.1f}%')
     print(f'  {"Total":10s} {n_total_before:8d}        →  {n_total_after:8d}')
 
-    # 失衡比率
     min_class = min(after_left, after_right) if after_left > 0 and after_right > 0 else 1
     imbalance = after_straight / max(min_class, 1)
     print(f'\n  Straight/min(L,R) 失衡比: {imbalance:.2f}× '
           f'(目标 ≤1.5×, {"✅ 达标" if imbalance <= 1.5 else "⚠️ 仍偏高"})')
 
-    # 保留原因分布
     total_reasons = defaultdict(int)
     for s in all_stats:
         for k, v in s['reasons'].items():
@@ -439,14 +406,14 @@ def main():
         if total_reasons.get(r, 0) > 0:
             print(f'  {r:12s}: {total_reasons[r]:6d}')
 
-    # 保存汇总到 JSON
-    if not args.dry_run:
+    summary = None
+    if not dry_run:
         summary = {
             'config': {
-                'src_root': args.src_root,
-                'dst_root': args.dst_root,
-                'context_frames': args.context_frames,
-                'stride': args.stride,
+                'src_root': src_root,
+                'dst_root': dst_root,
+                'context_frames': context_frames,
+                'stride': stride,
                 'exclude': list(exclude_set),
             },
             'before': dict(total_before),
@@ -456,22 +423,65 @@ def main():
             'drop_rate': 1.0 - n_total_after / max(n_total_before, 1),
             'runs': [{k: v for k, v in s.items()} for s in all_stats],
         }
-        os.makedirs(args.dst_root, exist_ok=True)
-        with open(os.path.join(args.dst_root, 'downsample_summary.json'),
+        os.makedirs(dst_root, exist_ok=True)
+        with open(os.path.join(dst_root, 'downsample_summary.json'),
                   'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
-        print(f'\n  汇总已保存: {args.dst_root}/downsample_summary.json')
+        print(f'\n  汇总已保存: {dst_root}/downsample_summary.json')
 
     print(f'\n{"=" * 75}')
-    if args.dry_run:
+    if dry_run:
         print(f'  [DRY RUN] 以上为预估结果，未实际复制文件。')
-        print(f'  去掉 --dry_run 参数后重新运行即可执行。')
     else:
-        print(f'  降采样完成! 输出: {os.path.abspath(args.dst_root)}')
+        print(f'  降采样完成! 输出: {os.path.abspath(dst_root)}')
         print(f'  处理: {len(all_stats)} 个 run, '
               f'{n_total_before}→{n_total_after} 帧 '
               f'(保留 {100*n_total_after/max(n_total_before,1):.0f}%)')
     print(f'{"=" * 75}')
+
+    return summary
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='走廊数据集智能降采样',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    parser.add_argument('--src_root', type=str, default='./data/corridor_all',
+                        help='原始数据根目录')
+    parser.add_argument('--dst_root', type=str,
+                        default='./data/corridor_balanced',
+                        help='输出目录')
+    parser.add_argument('--context_frames', type=int, default=15,
+                        help='转弯上下文半径')
+    parser.add_argument('--stride', type=int, default=3,
+                        help='远离转弯的 Forward 帧抽样步长')
+    parser.add_argument('--copy_mode', type=str, default='copy',
+                        choices=['copy', 'symlink'],
+                        help='图片复制方式')
+    parser.add_argument('--exclude', nargs='*', default=[''],
+                        help='排除的 run 名称列表')
+    parser.add_argument('--valid_only', type=lambda x:
+                        str(x).lower() in ('true', '1', 'yes'),
+                        default=True, help='是否丢弃 valid=0 帧')
+    parser.add_argument('--force', action='store_true',
+                        help='覆盖已有输出目录')
+    parser.add_argument('--dry_run', action='store_true',
+                        help='仅打印统计，不实际复制文件')
+
+    args = parser.parse_args()
+
+    run_downsample(
+        src_root=args.src_root,
+        dst_root=args.dst_root,
+        context_frames=args.context_frames,
+        stride=args.stride,
+        copy_mode=args.copy_mode,
+        exclude=args.exclude,
+        valid_only=args.valid_only,
+        force=args.force,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == '__main__':
