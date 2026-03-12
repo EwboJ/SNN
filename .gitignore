@@ -30,6 +30,7 @@ conda_env/
 best_model.pth
 last_model.pth
 checkpoints/
+checkpoint/
 checkpoint-*/
 
 ## TensorBoard 日志
