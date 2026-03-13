@@ -457,4 +457,4 @@ python scripts/plot_results.py \
 
 ## License
 
-待补充
+本项目采用 [MIT License](LICENSE) 开源协议。
