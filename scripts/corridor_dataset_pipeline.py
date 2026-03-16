@@ -184,15 +184,25 @@ def stage_split(args):
     src = args.downsample_root \
         if 'downsample' in args._executed_stages else args.export_root
 
+    # straight_keep 默认使用不同的 group_by
+    group_by = args.group_by
+    if args.task_type == 'straight_keep' \
+            and group_by == 'junction_id,turn_dir':
+        group_by = 'segment_id,direction'
+        print(f'  ⓘ straight_keep 自动调整 group_by -> {group_by}')
+
     try:
         run_split(
             src_root=src,
             dst_root=args.split_root,
             split_mode=args.split_mode,
-            group_by=args.group_by,
+            group_by=group_by,
             train_per_group=args.train_per_group,
             val_per_group=args.val_per_group,
             test_per_group=args.test_per_group,
+            min_frames=args.min_frames,
+            exclude=args.exclude,
+            manifest_path=args.manifest_path,
             copy_mode=args.copy_mode,
             seed=args.seed,
             force=args.force,
@@ -491,10 +501,14 @@ def main():
                         help='划分模式')
     parser.add_argument('--group_by', type=str,
                         default='junction_id,turn_dir',
-                        help='分组键')
+                        help='分组键 (straight_keep 自动调整为 segment_id,direction)')
     parser.add_argument('--train_per_group', type=int, default=5)
     parser.add_argument('--val_per_group', type=int, default=1)
     parser.add_argument('--test_per_group', type=int, default=1)
+    parser.add_argument('--manifest_path', type=str, default=None,
+                        help='run manifest CSV 路径 (含 group 分组信息)')
+    parser.add_argument('--min_frames', type=int, default=10,
+                        help='最少帧数，低于该值的 run 将被跳过')
 
     # ---- Derive 参数 (junction/generic) ----
     parser.add_argument('--derive_task', type=str, default='all',
@@ -598,6 +612,15 @@ def main():
         print()
         print('  ⓘ straight_keep 数据默认不使用 downsample_corridor.py')
         print('    (turn-context 降采样规则不适合直行纠偏数据)')
+        print('  ⓘ 推荐使用 manifest 按 segment_id,direction,station_id,condition 分组划分')
+        if hasattr(args, 'manifest_path') and args.manifest_path:
+            print(f'    → 已指定 manifest: {args.manifest_path}')
+        else:
+            print('    → 未指定 manifest，将按 run 目录名自动推断分组')
+        if hasattr(args, 'odom_topic') and args.odom_topic:
+            print(f'  ⓘ odom 话题: {args.odom_topic}')
+        else:
+            print('  ⓘ odom 话题: /odom_raw (默认)')
     if tt == 'loop' and not args.loop_extract_windows:
         print()
         print('  ⓘ 若需提取稀疏事件窗口，请加 --loop_extract_windows')
