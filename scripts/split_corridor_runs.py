@@ -183,42 +183,73 @@ def parse_run_name(name):
 
 def load_manifest(manifest_path):
     """
-    从 runs_manifest.csv 加载元数据。
+    从 manifest CSV 加载元数据。
 
-    CSV 格式: run_name, junction_id, turn_dir, rep_id [, ...]
+    支持两种格式:
+      - junction 格式: run_name, junction_id, turn_dir, rep_id [, ...]
+      - straight_keep 格式: run_name, segment_id, direction, station_id,
+                            offset_cm, yaw_deg, target_speed_mps, rep_id
+
+    自动读取 CSV 全部字段，保留原始列名和值。
+    数值型字段尝试自动转换 (int -> float -> str)。
 
     Returns:
-        dict: {run_name: {junction_id, turn_dir, rep_id}}
+        tuple: (manifest_dict, field_names)
+          manifest_dict: {run_name: {field: value, ...}}
+          field_names: CSV 中除 run_name 外的所有列名 (保持原始顺序)
     """
     result = {}
+    field_names = []
     with open(manifest_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
+        if reader.fieldnames:
+            # 保留除 run_name 外的所有列名
+            field_names = [fn.strip() for fn in reader.fieldnames
+                          if fn.strip() != 'run_name']
         for row in reader:
             name = row['run_name'].strip()
-            result[name] = {
-                'junction_id': int(row['junction_id']),
-                'turn_dir': row['turn_dir'].strip().lower(),
-                'rep_id': int(row.get('rep_id', 0)),
-            }
-    return result
+            record = {}
+            for fn in field_names:
+                raw_val = row.get(fn, '').strip()
+                # 尝试自动类型转换
+                record[fn] = _auto_convert(raw_val)
+            result[name] = record
+    return result, field_names
+
+
+def _auto_convert(val_str):
+    """尝试将字符串转为 int / float，失败则保留 str"""
+    if val_str == '':
+        return val_str
+    try:
+        return int(val_str)
+    except ValueError:
+        pass
+    try:
+        return float(val_str)
+    except ValueError:
+        pass
+    return val_str.lower() if val_str.isalpha() else val_str
 
 
 # ============================================================================
 # 分组与划分
 # ============================================================================
 
-def build_groups(runs, manifest, group_keys):
+def build_groups(runs, manifest, group_keys, manifest_fields=None):
     """
     将 runs 按 group_keys 分组。
 
     Args:
         runs: find_valid_runs 结果
-        manifest: {run_name: {junction_id, turn_dir, rep_id}} or None
+        manifest: {run_name: {field: value}} or None
         group_keys: 如 ['junction_id', 'turn_dir']
+                    或 ['segment_id', 'direction', 'station_id']
+        manifest_fields: manifest 列名列表 (可选，用于检查 group_keys 合法性)
 
     Returns:
         groups: {group_key_tuple: [run_info, ...]}
-        所有 run_info 会增加 junction_id, turn_dir, rep_id 字段
+        所有 run_info 会增加 manifest 中对应的字段
     """
     groups = defaultdict(list)
     parse_fail = []
@@ -369,27 +400,36 @@ def print_split_info(name, stats, group_keys):
             print(f"      {gk}: {gv} runs")
 
 
-def save_split_manifest(dst_root, train_runs, val_runs, test_runs):
-    """保存 split_manifest.csv"""
+def save_split_manifest(dst_root, train_runs, val_runs, test_runs,
+                        manifest_fields=None):
+    """
+    保存 split_manifest.csv。
+    动态包含 manifest 中的所有字段列。
+    """
     path = os.path.join(dst_root, 'split_manifest.csv')
+
+    # 确定要输出的 manifest 字段
+    if manifest_fields:
+        extra_cols = manifest_fields
+    else:
+        # 回退到 junction 默认字段
+        extra_cols = ['junction_id', 'turn_dir', 'rep_id']
+
+    header = ['run_name', 'split'] + extra_cols + ['frame_count', 'valid_frames']
+
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow([
-            'run_name', 'split', 'junction_id', 'turn_dir',
-            'rep_id', 'frame_count', 'valid_frames'
-        ])
+        writer.writerow(header)
         for split_name, runs in [
             ('train', train_runs), ('val', val_runs), ('test', test_runs)
         ]:
             for r in sorted(runs, key=lambda x: x['name']):
-                writer.writerow([
-                    r['name'], split_name,
-                    r.get('junction_id', ''),
-                    r.get('turn_dir', ''),
-                    r.get('rep_id', ''),
-                    r['frame_count'],
-                    r.get('valid_frames', ''),
-                ])
+                row = [r['name'], split_name]
+                for col in extra_cols:
+                    row.append(r.get(col, ''))
+                row.append(r['frame_count'])
+                row.append(r.get('valid_frames', ''))
+                writer.writerow(row)
     print(f"  [✓] {path}")
 
 
@@ -467,13 +507,21 @@ def run_split(src_root, dst_root, split_mode='exact', group_by='junction_id,turn
     print(f'\n[2/5] 按 {group_keys} 分组...')
 
     manifest = None
+    manifest_fields = None   # manifest 中除 run_name 外的所有列名
     if manifest_path:
         if not os.path.isfile(manifest_path):
             raise FileNotFoundError(f"manifest 文件不存在: {manifest_path}")
-        manifest = load_manifest(manifest_path)
+        manifest, manifest_fields = load_manifest(manifest_path)
         print(f"  从 manifest 加载 {len(manifest)} 条记录")
+        print(f"  manifest 字段: {manifest_fields}")
+        # 检查 group_keys 是否包含在 manifest 字段中
+        missing_keys = [k for k in group_keys if k not in manifest_fields]
+        if missing_keys:
+            print(f"  ⚠ 分组键 {missing_keys} 不在 manifest 字段中!")
+            print(f"    可用字段: {manifest_fields}")
+            print(f"    将尝试从目录名解析缺失字段")
 
-    groups = build_groups(all_runs, manifest, group_keys)
+    groups = build_groups(all_runs, manifest, group_keys, manifest_fields)
 
     if not groups:
         raise RuntimeError(
@@ -567,7 +615,8 @@ def run_split(src_root, dst_root, split_mode='exact', group_by='junction_id,turn
         config_out['val_ratio'] = val_ratio
         config_out['test_ratio'] = test_ratio
 
-    save_split_manifest(dst_root, train_runs, val_runs, test_runs)
+    save_split_manifest(dst_root, train_runs, val_runs, test_runs,
+                        manifest_fields=manifest_fields)
     save_split_summary(dst_root, config_out, train_stats, val_stats,
                        test_stats)
 
