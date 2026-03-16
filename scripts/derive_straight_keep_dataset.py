@@ -84,6 +84,119 @@ def load_labels(csv_path, valid_only=True):
     return frames
 
 
+def read_odom_csv(odom_path):
+    """
+    读取 odom_raw.csv，返回里程计记录列表。
+
+    CSV 字段: timestamp_ns, x, y, yaw, linear_v, angular_w
+
+    若文件不存在则返回 None（而非空列表），以区分"无 odom"和"odom 为空"。
+
+    Returns:
+        list of dict 或 None
+    """
+    if not os.path.isfile(odom_path):
+        return None
+
+    records = []
+    try:
+        with open(odom_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                records.append({
+                    'timestamp_ns': int(row['timestamp_ns']),
+                    'x': float(row.get('x', '0')),
+                    'y': float(row.get('y', '0')),
+                    'yaw': float(row.get('yaw', '0')),
+                    'linear_v': float(row.get('linear_v', '0')),
+                    'angular_w': float(row.get('angular_w', '0')),
+                })
+    except Exception as e:
+        print(f"  ⚠ 读取 odom_raw.csv 失败: {e}")
+        return None
+
+    return records if records else None
+
+
+def compute_odom_stats(odom_records, t_start_ns=None, t_end_ns=None):
+    """
+    从 odom 记录中计算统计量（可选按时间窗口裁剪）。
+
+    Args:
+        odom_records: read_odom_csv 返回的列表
+        t_start_ns: 起始时间戳 (纳秒)，None 则不裁剪
+        t_end_ns:   结束时间戳 (纳秒)，None 则不裁剪
+
+    Returns:
+        dict: odom 统计结果
+    """
+    if not odom_records:
+        return None
+
+    # 按时间窗口裁剪
+    recs = odom_records
+    if t_start_ns is not None:
+        recs = [r for r in recs if r['timestamp_ns'] >= t_start_ns]
+    if t_end_ns is not None:
+        recs = [r for r in recs if r['timestamp_ns'] <= t_end_ns]
+
+    if len(recs) < 2:
+        return None
+
+    # 时间跨度
+    dt_s = (recs[-1]['timestamp_ns'] - recs[0]['timestamp_ns']) / 1e9
+    if dt_s <= 0:
+        return None
+
+    # 相对 yaw 变化 (累计绝对变化量)
+    yaw_vals = [r['yaw'] for r in recs]
+    yaw_abs_change = 0.0
+    for i in range(1, len(yaw_vals)):
+        dy = yaw_vals[i] - yaw_vals[i - 1]
+        # 处理 yaw 环绕 (-π, π)
+        while dy > math.pi:
+            dy -= 2 * math.pi
+        while dy < -math.pi:
+            dy += 2 * math.pi
+        yaw_abs_change += abs(dy)
+
+    yaw_net_change = yaw_vals[-1] - yaw_vals[0]
+    # 处理环绕
+    while yaw_net_change > math.pi:
+        yaw_net_change -= 2 * math.pi
+    while yaw_net_change < -math.pi:
+        yaw_net_change += 2 * math.pi
+
+    # 路径长度
+    path_length = 0.0
+    for i in range(1, len(recs)):
+        dx = recs[i]['x'] - recs[i - 1]['x']
+        dy_pos = recs[i]['y'] - recs[i - 1]['y']
+        path_length += math.sqrt(dx * dx + dy_pos * dy_pos)
+
+    # 平均角速度 proxy
+    angular_w_vals = [r['angular_w'] for r in recs]
+    angular_w_mean = sum(angular_w_vals) / len(angular_w_vals)
+    angular_w_abs_mean = sum(abs(w) for w in angular_w_vals) / len(angular_w_vals)
+
+    # yaw 范围
+    yaw_min = min(yaw_vals)
+    yaw_max = max(yaw_vals)
+
+    return {
+        'odom_points': len(recs),
+        'odom_duration_s': round(dt_s, 3),
+        'yaw_net_change_rad': round(yaw_net_change, 6),
+        'yaw_abs_change_rad': round(yaw_abs_change, 6),
+        'yaw_range_rad': round(yaw_max - yaw_min, 6),
+        'yaw_min_rad': round(yaw_min, 6),
+        'yaw_max_rad': round(yaw_max, 6),
+        'path_length_m': round(path_length, 4),
+        'angular_w_mean': round(angular_w_mean, 6),
+        'angular_w_abs_mean': round(angular_w_abs_mean, 6),
+    }
+
+
 def ns_to_ms(ns):
     """纳秒转毫秒"""
     return ns / 1e6
@@ -208,7 +321,8 @@ def copy_image(src, dst, mode='copy'):
         shutil.copy2(src, dst)
 
 
-def write_derived_run(out_dir, frames_out, src_img_dir, copy_mode):
+def write_derived_run(out_dir, frames_out, src_img_dir, copy_mode,
+                      odom_stats=None):
     """
     写出一个派生 run: images/ + labels.csv + meta.json。
 
@@ -263,6 +377,14 @@ def write_derived_run(out_dir, frames_out, src_img_dir, copy_mode):
         },
         'phase_distribution': dict(phase_dist),
     }
+
+    # odom 统计（若 odom_stats 通过 kwargs 传入）
+    if odom_stats is not None:
+        meta['odom_available'] = True
+        meta['odom_stats'] = odom_stats
+    else:
+        meta['odom_available'] = False
+
     with open(os.path.join(out_dir, 'meta.json'), 'w',
               encoding='utf-8') as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
@@ -280,6 +402,7 @@ def process_run(run_name, run_dir, split, args):
 
     Returns:
         (frames_out, info_dict) 或 (None, reason_str)
+        info_dict 中若存在 odom，会增加 'odom_stats' 字段
     """
     # 读取
     csv_path = os.path.join(run_dir, 'labels.csv')
@@ -349,6 +472,17 @@ def process_run(run_name, run_dir, split, args):
         'az_mean': round(az_mean, 4),
         'az_abs_mean': round(az_abs_mean, 4),
     }
+
+    # ---- odom 附加统计 (可选，不影响 phase 判定) ----
+    odom_path = os.path.join(run_dir, 'odom_raw.csv')
+    odom_records = read_odom_csv(odom_path)
+    if odom_records is not None:
+        # 用输出帧的时间窗口裁剪 odom
+        t_start = frames_out[0]['timestamp_ns']
+        t_end = frames_out[-1]['timestamp_ns']
+        odom_st = compute_odom_stats(odom_records, t_start, t_end)
+        if odom_st is not None:
+            info['odom_stats'] = odom_st
 
     return frames_out, info
 
@@ -462,7 +596,9 @@ def run_derive_straight_keep(src_root, dst_root,
             shutil.rmtree(out_run_dir)
 
         src_img_dir = os.path.join(r['run_dir'], 'images')
-        n_out = write_derived_run(out_run_dir, result, src_img_dir, copy_mode)
+        run_odom_stats = info.get('odom_stats', None) if isinstance(info, dict) else None
+        n_out = write_derived_run(out_run_dir, result, src_img_dir, copy_mode,
+                                 odom_stats=run_odom_stats)
 
         # 统计
         st = split_stats[sp]
@@ -483,11 +619,17 @@ def run_derive_straight_keep(src_root, dst_root,
         })
 
         corr_pct = 100 * info['correcting'] / max(info['output_frames'], 1)
+        odom_tag = ''
+        if 'odom_stats' in info:
+            os_ = info['odom_stats']
+            odom_tag = (f'  odom: Δyaw={os_["yaw_net_change_rad"]:+.3f}rad '
+                        f'path={os_["path_length_m"]:.2f}m')
         print(f'  [{sp:5s}] {rn:30s}: {n_out:4d} 帧  '
               f'(Corr={info["correcting"]}/{corr_pct:.0f}% '
               f'Settl={info["settled"]} '
               f'|w|={info["az_abs_mean"]:.3f} '
-              f'θ_s={info["w_settle_threshold"]:.3f})')
+              f'θ_s={info["w_settle_threshold"]:.3f})'
+              f'{odom_tag}')
 
     # ======================== 保存元数据 ========================
     print('\n[3/3] 保存元数据...')
@@ -566,6 +708,41 @@ def run_derive_straight_keep(src_root, dst_root,
             w.writerows(skipped)
         print(f'  [✓] skipped_runs.csv ({len(skipped)} runs)')
 
+    # ======================== odom 汇总 ========================
+    # 统计多少 run 有 odom 信息
+    odom_run_count = sum(1 for d in run_details if 'odom_stats' in d)
+    odom_summary = None
+    if odom_run_count > 0:
+        # 汇总所有有 odom 的 run 的统计
+        yaw_nets = [d['odom_stats']['yaw_net_change_rad']
+                    for d in run_details if 'odom_stats' in d]
+        yaw_abs_changes = [d['odom_stats']['yaw_abs_change_rad']
+                           for d in run_details if 'odom_stats' in d]
+        path_lengths = [d['odom_stats']['path_length_m']
+                        for d in run_details if 'odom_stats' in d]
+        angular_w_abs_means = [d['odom_stats']['angular_w_abs_mean']
+                               for d in run_details if 'odom_stats' in d]
+
+        odom_summary = {
+            'odom_available_runs': odom_run_count,
+            'odom_total_runs': len(run_details),
+            'yaw_net_change_rad': {
+                'mean': round(sum(yaw_nets) / len(yaw_nets), 6),
+                'min': round(min(yaw_nets), 6),
+                'max': round(max(yaw_nets), 6),
+            },
+            'yaw_abs_change_rad_mean': round(
+                sum(yaw_abs_changes) / len(yaw_abs_changes), 6),
+            'path_length_m': {
+                'mean': round(sum(path_lengths) / len(path_lengths), 4),
+                'min': round(min(path_lengths), 4),
+                'max': round(max(path_lengths), 4),
+            },
+            'angular_w_abs_mean_avg': round(
+                sum(angular_w_abs_means) / len(angular_w_abs_means), 6),
+        }
+        summary['odom_summary'] = odom_summary
+
     # ======================== 总结 ========================
     print(f'\n{"=" * 72}')
     print(f'  派生完成!')
@@ -586,6 +763,24 @@ def run_derive_straight_keep(src_root, dst_root,
     print(f'  Total:  {total_runs:3d} runs  {total_frames:5d} 帧')
     if skipped:
         print(f'  跳过:   {len(skipped)} runs')
+
+    # odom 汇总打印
+    if odom_summary:
+        print(f'\n  ── Odom 统计 ({odom_run_count}/{len(run_details)} runs 含 odom) ──')
+        yn = odom_summary['yaw_net_change_rad']
+        pl = odom_summary['path_length_m']
+        print(f'    yaw 净变化:     '
+              f'mean={yn["mean"]:+.4f}rad  '
+              f'range=[{yn["min"]:+.4f}, {yn["max"]:+.4f}]')
+        print(f'    yaw 累计变化:   '
+              f'mean={odom_summary["yaw_abs_change_rad_mean"]:.4f}rad')
+        print(f'    路径长度:       '
+              f'mean={pl["mean"]:.3f}m  '
+              f'range=[{pl["min"]:.3f}, {pl["max"]:.3f}]')
+        print(f'    平均|angular_w|: '
+              f'{odom_summary["angular_w_abs_mean_avg"]:.4f} rad/s')
+    elif len(run_details) > 0:
+        print(f'\n  ── Odom: 无 (所有 run 均未找到 odom_raw.csv) ──')
 
     print(f'\n  输出目录: {os.path.abspath(dst_root)}/')
     for sp in SPLITS:
