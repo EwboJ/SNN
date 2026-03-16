@@ -3,13 +3,14 @@
 corridor_export.py — 从 ROS2 rosbag2 导出走廊导航数据集
 =========================================================
 # -------- 终端 3：录制 rosbag2 --------
-ros2 bag record /camera/image_raw /cmd_vel -o corridor_bag1
+ros2 bag record /camera/image_raw /cmd_vel /odom_raw -o corridor_bag1
 
 功能:
   1) 从 rosbag2 (.db3) 按时间戳排序导出图像帧 (jpg/png)
   2) 每帧匹配最近的 /cmd_vel，支持最近邻 / 线性插值 / 最大允许时间差
   3) 将 cmd_vel 离散化为动作标签 (Forward/Left/Right/Backward/Stop)
   4) 输出 labels.csv + meta.json
+  5) 可选导出 /odom_raw → odom_raw.csv (用于直行纠偏分析)
 
 依赖:
   pip install rosbags numpy opencv-python pyyaml
@@ -23,6 +24,7 @@ ros2 bag record /camera/image_raw /cmd_vel -o corridor_bag1
     ├── images/            # 按时间戳排序的图像帧
     ├── labels.csv         # image_name, action_id, action_name, timestamp_ns,
     │                      #   linear_x, angular_z, time_diff_ms, valid
+    ├── odom_raw.csv       # (可选) timestamp_ns, x, y, yaw, linear_v, angular_w
     └── meta.json          # 元数据 + 配置快照 + 统计信息
 """
 
@@ -31,6 +33,7 @@ import sys
 import csv
 import json
 import argparse
+import math
 import bisect
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +59,7 @@ DEFAULT_CONFIG = {
     "bag": {
         "image_topic": "/camera/color/image_raw",
         "cmd_vel_topic": "/cmd_vel",
+        "odom_topic": "/odom_raw",
         "image_encoding": "auto",
     },
     "image": {
@@ -118,13 +122,16 @@ def load_config(config_path: Optional[str]) -> dict:
 # ==============================================================
 #  从 ROS2 bag 读取消息
 # ==============================================================
-def read_bag_messages(bag_path: str, image_topic: str, cmd_vel_topic: str):
+def read_bag_messages(bag_path: str, image_topic: str, cmd_vel_topic: str,
+                      odom_topic: str = "/odom_raw"):
     """
     读取 rosbag2，返回:
       image_msgs: list of (timestamp_ns, image_ndarray)
       cmd_vel_msgs: list of (timestamp_ns, linear_x, linear_y, angular_z)
+      odom_msgs: list of (timestamp_ns, x, y, yaw, linear_v, angular_w)
 
-    image_msgs 和 cmd_vel_msgs 均按 timestamp_ns 升序排列。
+    所有列表均按 timestamp_ns 升序排列。
+    若 bag 中无 odom topic，odom_msgs 返回空列表（仅 warning）。
     """
     if not HAS_ROSBAGS:
         print("[ERROR] 未安装 rosbags，请运行: pip install rosbags")
@@ -132,6 +139,7 @@ def read_bag_messages(bag_path: str, image_topic: str, cmd_vel_topic: str):
 
     image_msgs = []
     cmd_vel_msgs = []
+    odom_msgs = []
 
     with Reader(bag_path) as reader:
         # 打印 bag 中所有话题
@@ -145,6 +153,7 @@ def read_bag_messages(bag_path: str, image_topic: str, cmd_vel_topic: str):
         # 筛选连接
         img_conns = [c for c in reader.connections if c.topic == image_topic]
         vel_conns = [c for c in reader.connections if c.topic == cmd_vel_topic]
+        odom_conns = [c for c in reader.connections if c.topic == odom_topic]
 
         if not img_conns:
             print(f"[ERROR] 未找到图像话题: {image_topic}")
@@ -153,8 +162,11 @@ def read_bag_messages(bag_path: str, image_topic: str, cmd_vel_topic: str):
         if not vel_conns:
             print(f"[WARNING] 未找到速度话题: {cmd_vel_topic}")
             print(f"  将只导出图像，所有帧标记为 unlabeled。")
+        if not odom_conns:
+            print(f"[WARNING] 未找到里程计话题: {odom_topic}")
+            print(f"  将跳过 odom_raw.csv 导出。")
 
-        all_conns = img_conns + vel_conns
+        all_conns = img_conns + vel_conns + odom_conns
 
         for conn, timestamp, rawdata in reader.messages(connections=all_conns):
             msg = deserialize_cdr(rawdata, conn.msgtype)
@@ -170,12 +182,19 @@ def read_bag_messages(bag_path: str, image_topic: str, cmd_vel_topic: str):
                 az = float(msg.angular.z)
                 cmd_vel_msgs.append((timestamp, lx, ly, az))
 
+            elif conn.topic == odom_topic:
+                odom_data = _extract_odom(msg, timestamp)
+                if odom_data is not None:
+                    odom_msgs.append(odom_data)
+
     # 按时间戳排序
     image_msgs.sort(key=lambda x: x[0])
     cmd_vel_msgs.sort(key=lambda x: x[0])
+    odom_msgs.sort(key=lambda x: x[0])
 
     print(f"\n[INFO] 图像帧数: {len(image_msgs)}")
     print(f"[INFO] cmd_vel 消息数: {len(cmd_vel_msgs)}")
+    print(f"[INFO] odom 消息数: {len(odom_msgs)}")
 
     if image_msgs:
         dt = (image_msgs[-1][0] - image_msgs[0][0]) / 1e9
@@ -184,7 +203,58 @@ def read_bag_messages(bag_path: str, image_topic: str, cmd_vel_topic: str):
             avg_fps = (len(image_msgs) - 1) / dt if dt > 0 else 0
             print(f"[INFO] 平均帧率: {avg_fps:.1f} FPS")
 
-    return image_msgs, cmd_vel_msgs
+    return image_msgs, cmd_vel_msgs, odom_msgs
+
+
+def _extract_odom(msg, timestamp: int) -> Optional[tuple]:
+    """
+    从 nav_msgs/Odometry 消息中提取 (timestamp_ns, x, y, yaw, linear_v, angular_w)。
+
+    支持:
+      - nav_msgs/msg/Odometry (标准)
+      - geometry_msgs/msg/PoseStamped (仅位姿, 速度设为 0)
+    """
+    try:
+        # nav_msgs/Odometry
+        pose = msg.pose.pose
+        x = float(pose.position.x)
+        y = float(pose.position.y)
+
+        # 四元数 → yaw
+        q = pose.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny, cosy)
+
+        # 速度
+        try:
+            twist = msg.twist.twist
+            linear_v = float(twist.linear.x)
+            angular_w = float(twist.angular.z)
+        except AttributeError:
+            linear_v = 0.0
+            angular_w = 0.0
+
+        return (timestamp, x, y, yaw, linear_v, angular_w)
+    except AttributeError:
+        # 非标准消息格式
+        pass
+
+    try:
+        # geometry_msgs/PoseStamped
+        pose = msg.pose
+        x = float(pose.position.x)
+        y = float(pose.position.y)
+        q = pose.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny, cosy)
+        return (timestamp, x, y, yaw, 0.0, 0.0)
+    except AttributeError:
+        pass
+
+    print(f"[WARNING] odom 消息解析失败 (ts={timestamp})")
+    return None
 
 
 def _decode_image(msg) -> Optional[np.ndarray]:
@@ -486,9 +556,36 @@ def write_labels_csv(output_dir: str, saved_frames: List[tuple],
 # ==============================================================
 #  写入 meta.json
 # ==============================================================
+def write_odom_csv(output_dir: str, odom_msgs: List[tuple]) -> int:
+    """
+    写入 odom_raw.csv。
+
+    CSV 列: timestamp_ns, x, y, yaw, linear_v, angular_w
+
+    Returns:
+        int: 写入行数
+    """
+    if not odom_msgs:
+        print("[INFO] 无 odom 数据，跳过 odom_raw.csv")
+        return 0
+
+    csv_path = os.path.join(output_dir, "odom_raw.csv")
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(["timestamp_ns", "x", "y", "yaw",
+                         "linear_v", "angular_w"])
+        for (ts, x, y, yaw, lv, aw) in odom_msgs:
+            writer.writerow([ts, f"{x:.6f}", f"{y:.6f}", f"{yaw:.6f}",
+                             f"{lv:.6f}", f"{aw:.6f}"])
+
+    print(f"[INFO] odom_raw.csv → {csv_path}  ({len(odom_msgs)} 条)")
+    return len(odom_msgs)
+
+
 def write_meta_json(output_dir: str, cfg: dict, stats: dict,
-                    bag_path: str, saved_frames: List[tuple]):
-    """写入 meta.json，包含配置快照 + 统计信息"""
+                    bag_path: str, saved_frames: List[tuple],
+                    odom_count: int = 0):
+    """写入 meta.json，包含配置快照 + 统计信息 + odom 信息"""
     meta = dict(cfg["meta"])
     meta["export_time"] = datetime.now().isoformat()
     meta["bag_path"] = os.path.abspath(bag_path)
@@ -505,10 +602,17 @@ def write_meta_json(output_dir: str, cfg: dict, stats: dict,
     else:
         meta["duration_seconds"] = 0
 
+    # odom 信息
+    odom_topic = cfg["bag"].get("odom_topic", "/odom_raw")
+    meta["odom_available"] = odom_count > 0
+    meta["odom_topic"] = odom_topic
+    meta["odom_count"] = odom_count
+
     # 配置快照
     meta["config_snapshot"] = {
         "image_topic": cfg["bag"]["image_topic"],
         "cmd_vel_topic": cfg["bag"]["cmd_vel_topic"],
+        "odom_topic": odom_topic,
         "alignment_method": cfg["alignment"]["method"],
         "max_time_diff_ms": cfg["alignment"]["max_time_diff_ms"],
         "action_thresholds": cfg["action_thresholds"],
@@ -536,7 +640,9 @@ def run_export(bag_path: str, output_dir: str, cfg: dict):
     # 1) 读取 bag
     image_topic = cfg["bag"]["image_topic"]
     cmd_vel_topic = cfg["bag"]["cmd_vel_topic"]
-    image_msgs, cmd_vel_msgs = read_bag_messages(bag_path, image_topic, cmd_vel_topic)
+    odom_topic = cfg["bag"].get("odom_topic", "/odom_raw")
+    image_msgs, cmd_vel_msgs, odom_msgs = read_bag_messages(
+        bag_path, image_topic, cmd_vel_topic, odom_topic)
 
     if not image_msgs:
         print("[ERROR] 未读取到任何图像帧，请检查话题名称。")
@@ -570,11 +676,17 @@ def run_export(bag_path: str, output_dir: str, cfg: dict):
     # 4) 写入 labels.csv
     stats = write_labels_csv(output_dir, saved_frames, aligned, cfg)
 
-    # 5) 写入 meta.json
-    write_meta_json(output_dir, cfg, stats, bag_path, saved_frames)
+    # 5) 写入 odom_raw.csv
+    odom_count = write_odom_csv(output_dir, odom_msgs)
+
+    # 6) 写入 meta.json
+    write_meta_json(output_dir, cfg, stats, bag_path, saved_frames,
+                    odom_count=odom_count)
 
     print(f"\n{'=' * 60}")
     print(f"  导出完成! 输出目录: {output_dir}")
+    if odom_count > 0:
+        print(f"  odom: {odom_count} 条 → odom_raw.csv")
     print(f"  下一步: python verify_alignment.py --data {output_dir}")
     print(f"{'=' * 60}")
 
@@ -617,6 +729,8 @@ def main():
                         help="覆盖图像话题名称")
     parser.add_argument("--cmd-vel-topic", type=str, default=None,
                         help="覆盖 cmd_vel 话题名称")
+    parser.add_argument("--odom-topic", type=str, default=None,
+                        help="里程计话题名称 (默认 /odom_raw)")
     parser.add_argument("--align", type=str, choices=["nearest", "linear_interp"],
                         default=None, help="对齐方法")
     parser.add_argument("--max-diff", type=float, default=None,
@@ -638,6 +752,8 @@ def main():
         cfg["bag"]["image_topic"] = args.image_topic
     if args.cmd_vel_topic:
         cfg["bag"]["cmd_vel_topic"] = args.cmd_vel_topic
+    if args.odom_topic:
+        cfg["bag"]["odom_topic"] = args.odom_topic
     if args.align:
         cfg["alignment"]["method"] = args.align
     if args.max_diff is not None:

@@ -102,6 +102,8 @@ def main():
                         help="[已弃用] train/test 拆分比例 (如 0.8 = 80%% 训练)，"
                              "0 表示不拆分。推荐使用 split_corridor_runs.py 或 "
                              "corridor_dataset_pipeline.py 进行 train/val/test 划分")
+    parser.add_argument("--odom_topic", type=str, default=None,
+                        help="里程计话题名称 (默认 /odom_raw)")
     parser.add_argument("--dry_run", action="store_true",
                         help="仅打印计划，不实际导出")
     parser.add_argument("--skip_existing", action="store_true",
@@ -187,6 +189,8 @@ def main():
         try:
             import copy
             cfg = copy.deepcopy(cfg_template)
+            if args.odom_topic:
+                cfg["bag"]["odom_topic"] = args.odom_topic
             os.makedirs(out_path, exist_ok=True)
             run_export(bag_path, out_path, cfg)
             success += 1

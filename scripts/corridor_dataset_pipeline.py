@@ -120,6 +120,8 @@ def stage_export(args):
         export_argv.extend(['--img_h', str(args.img_h)])
     if getattr(args, 'img_w', None):
         export_argv.extend(['--img_w', str(args.img_w)])
+    if getattr(args, 'odom_topic', None):
+        export_argv.extend(['--odom_topic', args.odom_topic])
     if args.force:
         export_argv.append('--force')
 
@@ -472,6 +474,8 @@ def main():
                         help='导出图片高度 (None=原始)')
     parser.add_argument('--img_w', type=int, default=None,
                         help='导出图片宽度 (None=原始)')
+    parser.add_argument('--odom_topic', type=str, default=None,
+                        help='里程计话题名称 (默认 /odom_raw)')
 
     # ---- Downsample 参数 (junction/generic) ----
     parser.add_argument('--context_frames', type=int, default=15,
