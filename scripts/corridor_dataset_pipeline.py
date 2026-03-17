@@ -4,7 +4,7 @@
 支持不同数据类型 (--task_type) 选择不同处理流程:
 
   junction:       export -> downsample -> split -> derive (stage1)
-  straight_keep:  export -> split -> derive_straight_keep
+  straight_keep:  export -> (auto manifest) -> split -> derive_straight_keep
   loop:           export -> split [-> extract_windows]
   generic:        export -> downsample -> split -> derive (同 junction)
 
@@ -12,8 +12,28 @@
   # junction 全流程
   python scripts/corridor_dataset_pipeline.py --task_type junction --mode all --bag_dir ./data/bags --force
 
-  # straight_keep (默认跳过 downsample)
-  python scripts/corridor_dataset_pipeline.py --task_type straight_keep --mode all --bag_dir ./data/bags --force
+  # straight_keep: 从 bag 一键全流程
+  python scripts/corridor_dataset_pipeline.py \\
+      --task_type straight_keep --mode all \\
+      --bag_dir ./data/straight_keep_bags \\
+      --auto_build_manifest \\
+      --group_by segment_id,condition \\
+      --split_mode ratio --val_ratio 0.2 --test_ratio 0.2 \\
+      --copy_mode symlink --force
+
+  # straight_keep: 从已 export 数据开始
+  python scripts/corridor_dataset_pipeline.py \\
+      --task_type straight_keep --mode all --skip_export \\
+      --export_root ./data/straight_keep_all \\
+      --auto_build_manifest \\
+      --group_by segment_id,condition \\
+      --split_mode ratio --val_ratio 0.2 --test_ratio 0.2 \\
+      --copy_mode symlink --force
+
+  # straight_keep: 只自动生成 manifest
+  python scripts/corridor_dataset_pipeline.py \\
+      --task_type straight_keep --build_manifest_only \\
+      --export_root ./data/straight_keep_all
 
   # loop (导出+划分+提取窗口)
   python scripts/corridor_dataset_pipeline.py --task_type loop --mode all --loop_extract_windows --force
@@ -23,6 +43,7 @@
 
 各阶段独立脚本仍可单独使用:
   - corridor_export.py / batch_export.py
+  - scripts/build_straight_keep_manifest.py
   - scripts/downsample_corridor.py
   - scripts/split_corridor_runs.py
   - scripts/derive_stage1_datasets.py
@@ -188,10 +209,23 @@ def stage_split(args):
     group_by = args.group_by
     if args.task_type == 'straight_keep' \
             and group_by == 'junction_id,turn_dir':
-        group_by = 'segment_id,direction'
+        group_by = 'segment_id,condition'
         print(f'  ⓘ straight_keep 自动调整 group_by -> {group_by}')
 
+    # manifest 来源打印
+    manifest_src = getattr(args, '_manifest_source', 'none')
+    if args.manifest_path:
+        print(f'  ⓘ manifest 来源: {manifest_src}')
+        print(f'    {args.manifest_path}')
+
     try:
+        # 收集 split_mode=ratio 的额外参数
+        extra_kw = {}
+        if hasattr(args, 'val_ratio'):
+            extra_kw['val_ratio'] = args.val_ratio
+        if hasattr(args, 'test_ratio'):
+            extra_kw['test_ratio'] = args.test_ratio
+
         run_split(
             src_root=src,
             dst_root=args.split_root,
@@ -206,6 +240,7 @@ def stage_split(args):
             copy_mode=args.copy_mode,
             seed=args.seed,
             force=args.force,
+            **extra_kw,
         )
         print(f'\n  ✓ Split 完成 -> {os.path.abspath(args.split_root)}')
         return True
@@ -329,11 +364,79 @@ def _print_stage_header(name, desc):
 
 
 # ============================================================================
+# Manifest 自动构建 (straight_keep 专用)
+# ============================================================================
+
+def stage_build_manifest(args):
+    """
+    阶段: 从 straight_keep run 目录名自动生成 manifest CSV。
+
+    仅在以下条件全部满足时自动执行:
+      - task_type == 'straight_keep'
+      - manifest_path 未被用户显式指定
+      - auto_build_manifest 为 True
+
+    Returns:
+        bool: 是否成功
+    """
+    _print_stage_header('BUILD_MANIFEST', '自动生成 straight_keep manifest')
+
+    try:
+        from scripts.build_straight_keep_manifest import build_manifest
+    except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from build_straight_keep_manifest import build_manifest
+
+    # manifest 输入源: 优先使用 export_root
+    manifest_src_root = args.export_root
+    if not os.path.isdir(manifest_src_root):
+        print(f'  ⚠ export_root 不存在: {manifest_src_root}')
+        print(f'    请先执行 export 或用 --export_root 指定数据目录')
+        return False
+
+    # manifest 输出路径
+    if getattr(args, 'manifest_root', None):
+        out_dir = args.manifest_root
+    else:
+        out_dir = os.path.dirname(os.path.abspath(args.split_root))
+
+    manifest_name = getattr(args, 'manifest_name',
+                            'straight_keep_manifest.csv')
+    out_csv = os.path.join(out_dir, manifest_name)
+
+    allow_unknown = getattr(args, 'allow_unknown_manifest', False)
+
+    try:
+        records, skipped = build_manifest(
+            src_root=manifest_src_root,
+            out_csv=out_csv,
+            allow_unknown=allow_unknown,
+        )
+
+        if not records:
+            print(f'  ✗ 未找到任何有效 run，manifest 生成失败')
+            return False
+
+        # 自动设置 manifest_path
+        args.manifest_path = out_csv
+        args._manifest_source = 'auto'
+        args._manifest_generated = True
+
+        print(f'\n  ✓ 已自动生成 manifest: {out_csv}')
+        print(f'    有效 run: {len(records)}, 跳过: {len(skipped)}')
+        return True
+    except Exception as e:
+        print(f'  ✗ Manifest 生成失败: {e}')
+        return False
+
+
+# ============================================================================
 # 阶段函数映射
 # ============================================================================
 
 STAGE_FUNCS = {
     'export':                stage_export,
+    'build_manifest':        stage_build_manifest,
     'downsample':            stage_downsample,
     'split':                 stage_split,
     'derive':                stage_derive,
@@ -501,14 +604,35 @@ def main():
                         help='划分模式')
     parser.add_argument('--group_by', type=str,
                         default='junction_id,turn_dir',
-                        help='分组键 (straight_keep 自动调整为 segment_id,direction)')
+                        help='分组键 (straight_keep 自动调整为 '
+                             'segment_id,condition)')
     parser.add_argument('--train_per_group', type=int, default=5)
     parser.add_argument('--val_per_group', type=int, default=1)
     parser.add_argument('--test_per_group', type=int, default=1)
+    parser.add_argument('--val_ratio', type=float, default=0.15,
+                        help='验证集比例 (split_mode=ratio 时生效)')
+    parser.add_argument('--test_ratio', type=float, default=0.15,
+                        help='测试集比例 (split_mode=ratio 时生效)')
     parser.add_argument('--manifest_path', type=str, default=None,
-                        help='run manifest CSV 路径 (含 group 分组信息)')
+                        help='run manifest CSV 路径 '
+                             '(含 group 分组信息，显式指定则跳过自动构建)')
     parser.add_argument('--min_frames', type=int, default=10,
                         help='最少帧数，低于该值的 run 将被跳过')
+
+    # ---- Manifest 自动构建参数 (straight_keep) ----
+    parser.add_argument('--auto_build_manifest', action='store_true',
+                        help='straight_keep: split 前自动从 run 名生成 '
+                             'manifest CSV')
+    parser.add_argument('--manifest_root', type=str, default=None,
+                        help='manifest 输出目录 '
+                             '(默认放在 split_root 的上一级)')
+    parser.add_argument('--manifest_name', type=str,
+                        default='straight_keep_manifest.csv',
+                        help='manifest 输出文件名')
+    parser.add_argument('--allow_unknown_manifest', action='store_true',
+                        help='manifest 构建时遇到无法解析的目录跳过而不报错')
+    parser.add_argument('--build_manifest_only', action='store_true',
+                        help='只生成 manifest 后退出，不继续执行后续阶段')
 
     # ---- Derive 参数 (junction/generic) ----
     parser.add_argument('--derive_task', type=str, default='all',
@@ -566,6 +690,28 @@ def main():
     # ======================== 按 task_type 设置默认路径 ========================
     apply_task_type_defaults(args)
 
+    # ======================== manifest 追踪字段 ========================
+    args._manifest_source = 'none'    # 'user' / 'auto' / 'none'
+    args._manifest_generated = False
+    if args.manifest_path:
+        args._manifest_source = 'user'
+
+    # ======================== build_manifest_only 模式 ========================
+    if args.build_manifest_only:
+        if args.task_type != 'straight_keep':
+            print('  ⚠ --build_manifest_only 仅适用于 '
+                  'task_type=straight_keep，已忽略')
+        else:
+            # 强制开启 auto_build_manifest
+            args.auto_build_manifest = True
+            ok = stage_build_manifest(args)
+            if ok:
+                print(f'\n  ✓ Manifest 已生成: {args.manifest_path}')
+                print(f'  (--build_manifest_only 模式，不继续后续阶段)')
+            else:
+                print(f'\n  ✗ Manifest 生成失败')
+            return
+
     # ======================== 确定执行阶段 ========================
     args._executed_stages = []   # 用于 split 判断输入源
     stages = resolve_stages(args)
@@ -612,11 +758,23 @@ def main():
         print()
         print('  ⓘ straight_keep 数据默认不使用 downsample_corridor.py')
         print('    (turn-context 降采样规则不适合直行纠偏数据)')
-        print('  ⓘ 推荐使用 manifest 按 segment_id,direction,station_id,condition 分组划分')
-        if hasattr(args, 'manifest_path') and args.manifest_path:
-            print(f'    → 已指定 manifest: {args.manifest_path}')
+        # manifest 信息
+        if args.manifest_path:
+            print(f'  ⓘ manifest: {args.manifest_path} '
+                  f'(来源: {args._manifest_source})')
+        elif args.auto_build_manifest:
+            print('  ⓘ manifest: 将在 split 前自动生成 '
+                  '(--auto_build_manifest)')
         else:
-            print('    → 未指定 manifest，将按 run 目录名自动推断分组')
+            print('  ⓘ manifest: 未指定')
+            print('    → 推荐: --auto_build_manifest '
+                  '--group_by segment_id,condition')
+        # group_by 信息
+        effective_group = args.group_by
+        if effective_group == 'junction_id,turn_dir':
+            effective_group = 'segment_id,condition (自动调整)'
+        print(f'  ⓘ group_by: {effective_group}')
+        # odom 信息
         if hasattr(args, 'odom_topic') and args.odom_topic:
             print(f'  ⓘ odom 话题: {args.odom_topic}')
         else:
@@ -634,6 +792,16 @@ def main():
     # ======================== 执行 ========================
     t0 = time.time()
     results = {}
+
+    # straight_keep: 在 split 前自动构建 manifest
+    # 将 build_manifest 插入到 stages 中 split 的前面
+    if (tt == 'straight_keep'
+            and args.auto_build_manifest
+            and not args.manifest_path
+            and 'split' in stages):
+        split_idx = stages.index('split')
+        stages.insert(split_idx, 'build_manifest')
+        print(f'\n  ⓘ 已自动插入 build_manifest 阶段 (split 前)')
 
     for stage in stages:
         ts = time.time()
@@ -683,6 +851,15 @@ def main():
             'downsample_root': args.downsample_root,
             'split_root': args.split_root,
             'derive_root': args.derive_root,
+        },
+        'manifest': {
+            'auto_build_manifest': getattr(
+                args, 'auto_build_manifest', False),
+            'manifest_path': args.manifest_path,
+            'manifest_generated': getattr(
+                args, '_manifest_generated', False),
+            'manifest_source': getattr(
+                args, '_manifest_source', 'none'),
         },
     }
 
