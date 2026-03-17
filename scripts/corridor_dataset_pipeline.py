@@ -123,10 +123,9 @@ def stage_export(args):
         return False
 
     try:
-        sys.path.insert(0, os.path.dirname(
-            os.path.dirname(os.path.abspath(__file__))))
         from scripts.batch_export import main as batch_export_main
     except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         try:
             from batch_export import main as batch_export_main
         except ImportError:
