@@ -32,6 +32,7 @@ import sys
 import argparse
 import time
 import re
+import shutil
 from collections import defaultdict
 
 from corridor_export import load_config, run_export
@@ -104,6 +105,12 @@ def main():
                              "corridor_dataset_pipeline.py 进行 train/val/test 划分")
     parser.add_argument("--odom_topic", type=str, default=None,
                         help="里程计话题名称 (默认 /odom_raw)")
+    parser.add_argument("--img_h", type=int, default=None,
+                        help="导出图片高度 (None=原始尺寸)")
+    parser.add_argument("--img_w", type=int, default=None,
+                        help="导出图片宽度 (None=原始尺寸)")
+    parser.add_argument("--force", action="store_true",
+                        help="覆盖已有输出目录 (先删再导)")
     parser.add_argument("--dry_run", action="store_true",
                         help="仅打印计划，不实际导出")
     parser.add_argument("--skip_existing", action="store_true",
@@ -113,6 +120,21 @@ def main():
 
     # 加载配置
     cfg_template = load_config(args.config)
+
+    # 应用 resize
+    if args.img_w and args.img_h:
+        cfg_template["image"]["resize"] = [args.img_w, args.img_h]
+
+    # 应用 odom_topic 到模板 (每个 bag 会 deepcopy)
+    if args.odom_topic:
+        cfg_template["bag"]["odom_topic"] = args.odom_topic
+
+    # 参数打印
+    resize_cfg = cfg_template["image"].get("resize")
+    odom_cfg = cfg_template["bag"].get("odom_topic", "/odom_raw")
+    print(f"[INFO] Resize:      {f'{resize_cfg[0]}x{resize_cfg[1]} (WxH)' if resize_cfg else '不启用 (保持原始尺寸)'}")
+    print(f"[INFO] Odom topic:  {odom_cfg}")
+    print(f"[INFO] Force 覆盖:  {'是' if args.force else '否'}")
 
     # 扫描所有 bag
     bags = find_bags(args.bag_dir)
@@ -181,16 +203,18 @@ def main():
         print(f"  [{i}/{len(export_plan)}] {tag} {name}")
         print(f"{'─'*70}")
 
-        if args.skip_existing and os.path.exists(out_path):
-            print(f"  [SKIP] 输出目录已存在: {out_path}")
-            skipped += 1
-            continue
+        if os.path.exists(out_path):
+            if args.force:
+                print(f"  [FORCE] 删除已有目录: {out_path}")
+                shutil.rmtree(out_path)
+            elif args.skip_existing:
+                print(f"  [SKIP] 输出目录已存在: {out_path}")
+                skipped += 1
+                continue
 
         try:
             import copy
             cfg = copy.deepcopy(cfg_template)
-            if args.odom_topic:
-                cfg["bag"]["odom_topic"] = args.odom_topic
             os.makedirs(out_path, exist_ok=True)
             run_export(bag_path, out_path, cfg)
             success += 1
