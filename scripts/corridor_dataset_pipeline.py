@@ -122,15 +122,18 @@ def stage_export(args):
         print(f'  请用 --bag_dir 指定 rosbag 文件目录')
         return False
 
+    # batch_export 内部 import corridor_export (位于项目根目录),
+    # 需要同时把 scripts/ 和项目根目录加入 sys.path
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    for p in (scripts_dir, project_root):
+        if p not in sys.path:
+            sys.path.insert(0, p)
     try:
-        from scripts.batch_export import main as batch_export_main
-    except ImportError:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        try:
-            from batch_export import main as batch_export_main
-        except ImportError:
-            print('  ✗ 无法导入 batch_export.py')
-            return False
+        from batch_export import main as batch_export_main
+    except ImportError as e:
+        print(f'  ✗ 无法导入 batch_export.py: {e}')
+        return False
 
     export_argv = [
         '--bag_dir', args.bag_dir,
