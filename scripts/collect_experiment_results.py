@@ -63,6 +63,11 @@ SUMMARY_FIELDS = [
     'best_val_mae',
     'test_acc',
     'test_mae',
+    'test_rmse',
+    'correcting_mae',
+    'correcting_rmse',
+    'settled_mae',
+    'settled_rmse',
     'test_loss',
     'test_spike_rate',
     'test_sparsity',
@@ -80,7 +85,8 @@ MD_FIELDS_CLS = [
 # Markdown 表格展示的精简列 (回归任务)
 MD_FIELDS_REG = [
     'exp_name', 'neuron_type', 'residual_mode', 'T',
-    'best_val_mae', 'test_mae', 'test_loss',
+    'best_val_mae', 'test_mae', 'test_rmse',
+    'correcting_mae', 'settled_mae',
     'test_spike_rate', 'test_sparsity',
 ]
 
@@ -90,6 +96,11 @@ FIELD_FMT = {
     'best_val_mae': '.4f',
     'test_acc': '.4f',
     'test_mae': '.4f',
+    'test_rmse': '.4f',
+    'correcting_mae': '.4f',
+    'correcting_rmse': '.4f',
+    'settled_mae': '.4f',
+    'settled_rmse': '.4f',
     'test_loss': '.4f',
     'test_spike_rate': '.4f',
     'test_sparsity': '.4f',
@@ -189,7 +200,7 @@ def read_experiment(exp_dir):
         record['exp_name'] = ftm.get('exp_name', exp_name)
 
         # 测试指标
-        for key in ('test_acc', 'test_mae', 'test_loss',
+        for key in ('test_acc', 'test_mae', 'test_rmse', 'test_loss',
                      'test_spike_rate', 'test_sparsity',
                      'test_spikes_per_image', 'test_samples'):
             if key in ftm:
@@ -199,6 +210,17 @@ def read_experiment(exp_dir):
         for key in ('best_val_acc', 'best_val_mae', 'best_epoch'):
             if key in ftm:
                 record[key] = ftm[key]
+
+        # phase_stats (straight_keep_reg 回归任务)
+        ps = ftm.get('phase_stats')
+        if ps and isinstance(ps, dict):
+            for phase, prefix in (('Correcting', 'correcting'),
+                                  ('Settled', 'settled')):
+                pdata = ps.get(phase, {})
+                if isinstance(pdata, dict):
+                    for metric in ('mae', 'rmse'):
+                        if metric in pdata:
+                            record[f'{prefix}_{metric}'] = pdata[metric]
 
         # config
         if 'config' in ftm:
@@ -407,6 +429,11 @@ def write_markdown(out_md, records, is_regression=False):
         'best_val_mae': 'Val MAE',
         'test_acc': 'Test Acc',
         'test_mae': 'Test MAE',
+        'test_rmse': 'Test RMSE',
+        'correcting_mae': 'Corr MAE',
+        'correcting_rmse': 'Corr RMSE',
+        'settled_mae': 'Settl MAE',
+        'settled_rmse': 'Settl RMSE',
         'test_loss': 'Test Loss',
         'test_spike_rate': 'Spike Rate',
         'test_sparsity': 'Sparsity',
@@ -559,6 +586,10 @@ def collect_results(exp_root, out_csv=None, out_md=None,
         print_top_k(records, 'test_acc', k=top_k, ascending=False)
     if has_regression and top_k > 0:
         print_top_k(records, 'test_mae', k=top_k, ascending=True)
+        # RMSE Top-K (若有)
+        has_rmse = any(r.get('test_rmse') is not None for r in records)
+        if has_rmse:
+            print_top_k(records, 'test_rmse', k=top_k, ascending=True)
 
     print(f'\n{"=" * 60}')
     return records
