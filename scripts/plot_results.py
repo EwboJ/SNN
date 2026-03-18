@@ -416,29 +416,58 @@ def main():
     ckpt = torch.load(args.ckpt, map_location='cpu', weights_only=False)
     cfg = ckpt.get('config', {}) if isinstance(ckpt, dict) else {}
 
-    mode = cfg.get('mode', 'discrete')
+    # 判断数据集类型
+    dataset_type = cfg.get('dataset', 'corridor')  # corridor / corridor_task / cifar10
+    is_corridor_task = (dataset_type == 'corridor_task')
+
     encoding = cfg.get('encoding', 'rate')
-    action_set = str(cfg.get('action_set', '3'))
     T = cfg.get('T', 4)
     neuron_type = cfg.get('neuron_type', 'APLIF')
     residual_mode = cfg.get('residual_mode', 'ADD')
-    control_dim = cfg.get('control_dim', 1)
-    num_actions = 3 if action_set == '3' else 5
-    is_discrete = (mode == 'discrete')
     epoch = ckpt.get('epoch', '?') if isinstance(ckpt, dict) else '?'
-    exp_name = f"{neuron_type}_{residual_mode}_T{T}"
 
-    names_3 = ['Left', 'Straight', 'Right']
-    names_5 = ['Forward', 'Backward', 'Left', 'Right', 'Stop']
-    class_names = names_3 if action_set == '3' else names_5
+    # corridor_task 已知任务 -> 类名映射表
+    _TASK_CLASS_NAMES = {
+        'action3_balanced': ['Left', 'Straight', 'Right'],
+        'junction_lr':      ['Left', 'Right'],
+        'stage4':           ['Follow', 'Approach', 'Turn', 'Recover'],
+    }
 
-    print(f'  Config: {exp_name}, mode={mode}, encoding={encoding}, '
-          f'epoch={epoch}')
+    if is_corridor_task:
+        # corridor_task: 从 config 读取 task_name / task_num_classes
+        task_name = cfg.get('task_name', 'action3_balanced')
+        num_actions = cfg.get('task_num_classes', cfg.get('num_classes', 3))
+        mode = 'discrete'  # corridor_task 都是离散分类
+        control_dim = 1
+        action_set = str(num_actions)  # 兼容字段
+        exp_name = f"{task_name}_{neuron_type}_{residual_mode}_T{T}"
+        # 优先按 task_name 查表，未知任务则自动生成
+        class_names = _TASK_CLASS_NAMES.get(
+            task_name,
+            [f'class_{i}' for i in range(num_actions)])
+    else:
+        mode = cfg.get('mode', 'discrete')
+        action_set = str(cfg.get('action_set', '3'))
+        control_dim = cfg.get('control_dim', 1)
+        num_actions = cfg.get('num_classes', 3 if action_set == '3' else 5)
+        exp_name = f"{neuron_type}_{residual_mode}_T{T}"
+        names_3 = ['Left', 'Straight', 'Right']
+        names_5 = ['Forward', 'Backward', 'Left', 'Right', 'Stop']
+        class_names = names_3 if action_set == '3' else names_5
+
+    is_discrete = (mode == 'discrete')
+
+    print(f'  Config: {exp_name}, dataset={dataset_type}, mode={mode}, '
+          f'encoding={encoding}, epoch={epoch}')
+    if is_corridor_task:
+        print(f'  dataset_type : {dataset_type}')
+        print(f'  task_name    : {task_name}')
+        print(f'  num_actions  : {num_actions}')
+        print(f'  class_names  : {class_names}')
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
     from models.snn_corridor import build_corridor_net
-    from datasets.corridor_dataset import CorridorDataset
 
     net = build_corridor_net(
         head_type=mode, num_actions=num_actions, control_dim=control_dim,
@@ -455,7 +484,6 @@ def main():
 
     # ---- 数据集 ----
     print('\n[2/5] 加载测试数据...')
-    # 从 checkpoint config 读取图像尺寸，兼容旧版默认 32x32
     img_h = cfg.get('img_h', 32)
     img_w = cfg.get('img_w', 32)
     transform = torchvision.transforms.Compose([
@@ -463,12 +491,22 @@ def main():
         torchvision.transforms.ToTensor(),
         torchvision.transforms.Normalize([0.5]*3, [0.5]*3),
     ])
-    test_ds = CorridorDataset(
-        root_dir=args.data_root, mode=mode, control_dim=control_dim,
-        valid_only=True, action_set=action_set, transforms=transform)
+
+    if is_corridor_task:
+        from datasets.corridor_task_dataset import CorridorTaskDataset
+        test_ds = CorridorTaskDataset(
+            root_dir=args.data_root, transforms=transform,
+            print_stats=True)
+    else:
+        from datasets.corridor_dataset import CorridorDataset
+        test_ds = CorridorDataset(
+            root_dir=args.data_root, mode=mode, control_dim=control_dim,
+            valid_only=True, action_set=action_set, transforms=transform)
+
     loader = data.DataLoader(test_ds, batch_size=args.batch_size,
                              shuffle=False, num_workers=0)
     print(f'  [✓] 测试集: {len(test_ds)} 帧')
+    print(f'  [✓] 类名: {class_names}')
 
     # ---- 推理 ----
     print('\n[3/5] 推理...')
