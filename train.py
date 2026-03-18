@@ -403,6 +403,160 @@ def build_corridor_task_dataset(args):
 
 
 # ============================================================================
+# Regression 专用: final_test 增强评估
+# ============================================================================
+
+def _run_regression_final_test(net, loader, is_sequence, args):
+    """
+    Regression 模式下的增强 final_test 评估。
+
+    在常规 MAE 之外, 额外统计:
+      - RMSE (全局)
+      - 若 DataLoader 的 Dataset 支持 return_meta 且含 phase 字段:
+        - Correcting 阶段 MAE / RMSE
+        - Settled    阶段 MAE / RMSE
+
+    不改变训练主循环, 仅在 final_test 阶段被调用。
+
+    Returns:
+        dict: {
+            test_rmse, phase_available,
+            phase_stats: {Correcting: {mae, rmse, count},
+                          Settled:    {mae, rmse, count}}
+        }
+    """
+    import math
+    from collections import defaultdict
+
+    net.eval()
+
+    # ---------- 检查 dataset 是否支持 return_meta ----------
+    ds = loader.dataset
+    has_meta = hasattr(ds, 'return_meta')
+    old_return_meta = None
+    if has_meta:
+        old_return_meta = ds.return_meta
+        ds.return_meta = True    # 临时开启
+
+    # ---------- 收集所有预测与标签 ----------
+    all_errors = []              # (pred - label) 逐样本
+    phase_errors = defaultdict(list)   # phase -> list of abs_error
+    phase_sq_errors = defaultdict(list)
+
+    with torch.no_grad():
+        for batch in loader:
+            if has_meta and len(batch) == 3:
+                frame, label, meta = batch
+            else:
+                frame, label = batch[:2]
+                meta = None
+
+            frame = frame.float().to(args.device)
+            label = label.to(args.device)
+
+            if is_sequence:
+                B, L = frame.shape[0], frame.shape[1]
+                if hasattr(net, 'reset_state'):
+                    net.reset_state()
+                for t in range(L):
+                    out_t = net(frame[:, t])
+                    err = (out_t - label[:, t].float()).cpu()
+                    for i in range(B):
+                        e = err[i].item()
+                        all_errors.append(e)
+                        if meta is not None:
+                            # meta 是 list[dict] 或 list[list[dict]]
+                            ph = _extract_phase(meta, i, t)
+                            if ph:
+                                phase_errors[ph].append(abs(e))
+                                phase_sq_errors[ph].append(e * e)
+                    if args.encoding == 'rate' and hasattr(net, 'backbone'):
+                        functional.reset_net(net.backbone)
+            else:
+                out_fr = net(frame)
+                err = (out_fr - label.float()).cpu()
+                B = err.shape[0]
+                for i in range(B):
+                    e = err[i].item()
+                    all_errors.append(e)
+                    if meta is not None:
+                        ph = _extract_phase(meta, i)
+                        if ph:
+                            phase_errors[ph].append(abs(e))
+                            phase_sq_errors[ph].append(e * e)
+                functional.reset_net(net)
+
+    # ---------- 恢复 return_meta ----------
+    if has_meta and old_return_meta is not None:
+        ds.return_meta = old_return_meta
+
+    # ---------- 全局 RMSE ----------
+    n = len(all_errors)
+    mse = sum(e * e for e in all_errors) / max(n, 1)
+    rmse = math.sqrt(mse)
+
+    # ---------- Phase 统计 ----------
+    phase_available = len(phase_errors) > 0
+    phase_stats = {}
+    for ph in ('Correcting', 'Settled'):
+        if ph in phase_errors:
+            cnt = len(phase_errors[ph])
+            mae = sum(phase_errors[ph]) / max(cnt, 1)
+            p_mse = sum(phase_sq_errors[ph]) / max(cnt, 1)
+            p_rmse = math.sqrt(p_mse)
+            phase_stats[ph] = {
+                'mae': round(mae, 6),
+                'rmse': round(p_rmse, 6),
+                'count': cnt,
+            }
+    # 其余未知 phase
+    for ph in phase_errors:
+        if ph not in phase_stats:
+            cnt = len(phase_errors[ph])
+            mae = sum(phase_errors[ph]) / max(cnt, 1)
+            p_mse = sum(phase_sq_errors[ph]) / max(cnt, 1)
+            p_rmse = math.sqrt(p_mse)
+            phase_stats[ph] = {
+                'mae': round(mae, 6),
+                'rmse': round(p_rmse, 6),
+                'count': cnt,
+            }
+
+    return {
+        'test_rmse': round(rmse, 6),
+        'phase_available': phase_available,
+        'phase_stats': phase_stats if phase_available else {},
+    }
+
+
+def _extract_phase(meta, sample_idx, seq_t=None):
+    """
+    从 meta 中提取 phase 字符串。
+
+    meta 格式取决于 Dataset:
+      - 单帧: list[dict], meta[sample_idx]['phase']
+      - 序列: list[list[dict]], meta[sample_idx][seq_t]['phase']
+      - 或者 dict of lists (DataLoader collate)
+    """
+    try:
+        if isinstance(meta, dict):
+            # DataLoader default_collate: dict of lists
+            phases = meta.get('phase', None)
+            if phases is not None:
+                ph = phases[sample_idx]
+                return str(ph) if ph else ''
+        elif isinstance(meta, (list, tuple)):
+            item = meta[sample_idx]
+            if isinstance(item, dict):
+                return str(item.get('phase', ''))
+            elif isinstance(item, (list, tuple)) and seq_t is not None:
+                return str(item[seq_t].get('phase', ''))
+    except (IndexError, KeyError, TypeError):
+        pass
+    return ''
+
+
+# ============================================================================
 # 评估 helper (val / test 共用)
 # ============================================================================
 def run_evaluation(net, loader, compute_loss, is_discrete, is_sequence,
@@ -1261,6 +1415,28 @@ def main():
         print(f'  Spikes/Img:    {test_result["avg_spk_img"]:.0f}')
         print(f'  Samples:       {test_result["samples"]}')
 
+        # ---- Regression 增强: RMSE + Phase 统计 ----
+        reg_extra = {}
+        if not is_discrete:
+            print(f'\n  [Regression 增强评估]')
+            reg_result = _run_regression_final_test(
+                net, test_data_loader, is_sequence, args)
+            reg_extra['test_rmse'] = reg_result['test_rmse']
+            print(f'  Test RMSE:     {reg_result["test_rmse"]:.4f}')
+
+            if reg_result['phase_available']:
+                reg_extra['phase_available'] = True
+                reg_extra['phase_stats'] = reg_result['phase_stats']
+                print(f'  Phase 统计:')
+                for ph, st in reg_result['phase_stats'].items():
+                    print(f'    {ph:12s}  '
+                          f'MAE={st["mae"]:.4f}  '
+                          f'RMSE={st["rmse"]:.4f}  '
+                          f'n={st["count"]}')
+            else:
+                reg_extra['phase_available'] = False
+                print(f'  Phase 信息: 不可用 (dataset 无 phase 元数据)')
+
         # 保存 final_test_metrics.json
         test_metrics = {
             'exp_name': exp_name,
@@ -1275,6 +1451,9 @@ def main():
                 max_val_acc if is_discrete else min_val_mae, 6),
             'config': config,
         }
+        # 合并 regression 增强字段
+        test_metrics.update(reg_extra)
+
         test_json_path = os.path.join(exp_out_dir, 'final_test_metrics.json')
         with open(test_json_path, 'w', encoding='utf-8') as f:
             json.dump(test_metrics, f, indent=2, ensure_ascii=False)
