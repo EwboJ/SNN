@@ -134,7 +134,8 @@ class SpikeMonitor:
 # ============================================================================
 # 1. Prediction vs Ground Truth
 # ============================================================================
-def plot_prediction_vs_gt(preds, labels, out_dir, exp_name, mae, rmse):
+def plot_prediction_vs_gt(preds, labels, out_dir, exp_name, mae, rmse,
+                         zero_mae=None, zero_rmse=None):
     """预测 vs 真值散点图"""
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -149,8 +150,11 @@ def plot_prediction_vs_gt(preds, labels, out_dir, exp_name, mae, rmse):
             'r--', linewidth=1.5, alpha=0.7, label='Ideal')
     ax.set_xlabel('Ground Truth (angular_z)', fontsize=12)
     ax.set_ylabel('Prediction', fontsize=12)
-    ax.set_title(f'Prediction vs GT — {exp_name}\n'
-                 f'MAE={mae:.4f}  RMSE={rmse:.4f}', fontsize=13)
+    title = (f'Prediction vs GT — {exp_name}\n'
+             f'MAE={mae:.4f}  RMSE={rmse:.4f}')
+    if zero_mae is not None and zero_rmse is not None:
+        title += f'\nZeroBaseline MAE={zero_mae:.4f}  RMSE={zero_rmse:.4f}'
+    ax.set_title(title, fontsize=13)
     ax.legend(fontsize=10)
     ax.set_aspect('equal', 'box')
 
@@ -677,6 +681,11 @@ def main():
             break
     monitor2.remove()
 
+    # Zero Baseline: 预测全零
+    zero_preds = np.zeros_like(labels_arr)
+    zero_baseline_mae = float(np.mean(np.abs(zero_preds - labels_arr)))
+    zero_baseline_rmse = float(np.sqrt(np.mean((zero_preds - labels_arr) ** 2)))
+
     print(f'  MAE:            {mae:.6f}')
     print(f'  RMSE:           {rmse:.6f}')
     print(f'  Max |Error|:    {max_abs_error:.6f}')
@@ -686,6 +695,19 @@ def main():
     print(f'  Sparsity:       {sparsity:.2%}')
     print(f'  Spikes/Image:   {spk_per_img:.0f}')
     print(f'  Total Frames:   {total_frames}')
+
+    print(f'\n  ── Zero Baseline 对比 ──')
+    print(f'  模型 MAE:       {mae:.6f}   |  Zero MAE:  {zero_baseline_mae:.6f}')
+    print(f'  模型 RMSE:      {rmse:.6f}   |  Zero RMSE: {zero_baseline_rmse:.6f}')
+    mae_improve = ((zero_baseline_mae - mae) / zero_baseline_mae * 100
+                   if zero_baseline_mae > 0 else 0)
+    rmse_improve = ((zero_baseline_rmse - rmse) / zero_baseline_rmse * 100
+                    if zero_baseline_rmse > 0 else 0)
+    print(f'  MAE 改善:       {mae_improve:+.1f}%')
+    print(f'  RMSE 改善:      {rmse_improve:+.1f}%')
+    if mae_improve < 15:
+        print(f'  ⚠ 警告: 模型可能退化为近零输出 '
+              f'(MAE 仅优于 zero baseline {mae_improve:.1f}%)')
 
     # Phase 统计
     phase_stats = {}
@@ -717,7 +739,8 @@ def main():
 
     # 5.1 Prediction vs GT
     plot_prediction_vs_gt(
-        all_preds, all_labels, args.out_dir, exp_name, mae, rmse)
+        all_preds, all_labels, args.out_dir, exp_name, mae, rmse,
+        zero_mae=zero_baseline_mae, zero_rmse=zero_baseline_rmse)
 
     # 5.2 Residual Histogram
     plot_residual_hist(residuals.tolist(), args.out_dir, exp_name)
@@ -755,6 +778,8 @@ def main():
         'epoch': epoch,
         'test_mae': round(mae, 6),
         'test_rmse': round(rmse, 6),
+        'zero_baseline_mae': round(zero_baseline_mae, 6),
+        'zero_baseline_rmse': round(zero_baseline_rmse, 6),
         'max_abs_error': round(max_abs_error, 6),
         'mean_abs_pred': round(mean_abs_pred, 6),
         'mean_abs_gt': round(mean_abs_gt, 6),
