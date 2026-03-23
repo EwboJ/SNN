@@ -791,10 +791,14 @@ def run_derive_straight_keep(src_root, dst_root,
             print(f'    {sp}/ ({n} runs)')
 
     print(f'\n  下一步训练命令:')
-    print(f'    python train.py --dataset corridor_task '
-          f'--task_root {dst_root} '
-          f'--task_name straight_keep_reg '
-          f'--mode regression ...')
+    print(f'    python train.py --dataset corridor \\\n'
+          f'        --corridor_root {dst_root} \\\n'
+          f'        --mode regression --control_dim 1 \\\n'
+          f'        --neuron_type APLIF --residual_mode ADD \\\n'
+          f'        -T 8 --encoding rate --loss_type huber \\\n'
+          f'        --img_h 32 --img_w 96 \\\n'
+          f'        -b 32 -epochs 100 \\\n'
+          f'        -enable_tensorboard --final_test')
     print(f'{"=" * 72}')
 
     return summary
