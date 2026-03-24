@@ -64,6 +64,10 @@ SUMMARY_FIELDS = [
     'test_acc',
     'test_mae',
     'test_rmse',
+    'zero_baseline_mae',
+    'zero_baseline_rmse',
+    'mae_gain_vs_zero_pct',
+    'rmse_gain_vs_zero_pct',
     'correcting_mae',
     'correcting_rmse',
     'settled_mae',
@@ -86,6 +90,7 @@ MD_FIELDS_CLS = [
 MD_FIELDS_REG = [
     'exp_name', 'neuron_type', 'residual_mode', 'T',
     'best_val_mae', 'test_mae', 'test_rmse',
+    'mae_gain_vs_zero_pct', 'rmse_gain_vs_zero_pct',
     'correcting_mae', 'settled_mae',
     'test_spike_rate', 'test_sparsity',
 ]
@@ -97,6 +102,10 @@ FIELD_FMT = {
     'test_acc': '.4f',
     'test_mae': '.4f',
     'test_rmse': '.4f',
+    'zero_baseline_mae': '.4f',
+    'zero_baseline_rmse': '.4f',
+    'mae_gain_vs_zero_pct': '.2f',
+    'rmse_gain_vs_zero_pct': '.2f',
     'correcting_mae': '.4f',
     'correcting_rmse': '.4f',
     'settled_mae': '.4f',
@@ -202,7 +211,8 @@ def read_experiment(exp_dir):
         # 测试指标
         for key in ('test_acc', 'test_mae', 'test_rmse', 'test_loss',
                      'test_spike_rate', 'test_sparsity',
-                     'test_spikes_per_image', 'test_samples'):
+                     'test_spikes_per_image', 'test_samples',
+                     'zero_baseline_mae', 'zero_baseline_rmse'):
             if key in ftm:
                 record[key] = ftm[key]
 
@@ -285,6 +295,30 @@ def read_experiment(exp_dir):
         return None
 
     record['source'] = '+'.join(sources)
+
+    # ---- 计算 zero baseline 增益百分比 ----
+    t_mae = record.get('test_mae')
+    z_mae = record.get('zero_baseline_mae')
+    if t_mae is not None and z_mae is not None:
+        try:
+            z_mae_f = float(z_mae)
+            if z_mae_f > 0:
+                record['mae_gain_vs_zero_pct'] = round(
+                    (z_mae_f - float(t_mae)) / z_mae_f * 100, 2)
+        except (ValueError, TypeError):
+            pass
+
+    t_rmse = record.get('test_rmse')
+    z_rmse = record.get('zero_baseline_rmse')
+    if t_rmse is not None and z_rmse is not None:
+        try:
+            z_rmse_f = float(z_rmse)
+            if z_rmse_f > 0:
+                record['rmse_gain_vs_zero_pct'] = round(
+                    (z_rmse_f - float(t_rmse)) / z_rmse_f * 100, 2)
+        except (ValueError, TypeError):
+            pass
+
     return record
 
 
@@ -430,6 +464,10 @@ def write_markdown(out_md, records, is_regression=False):
         'test_acc': 'Test Acc',
         'test_mae': 'Test MAE',
         'test_rmse': 'Test RMSE',
+        'zero_baseline_mae': 'Zero MAE',
+        'zero_baseline_rmse': 'Zero RMSE',
+        'mae_gain_vs_zero_pct': 'MAE Gain%',
+        'rmse_gain_vs_zero_pct': 'RMSE Gain%',
         'correcting_mae': 'Corr MAE',
         'correcting_rmse': 'Corr RMSE',
         'settled_mae': 'Settl MAE',
