@@ -244,8 +244,15 @@ def read_experiment(exp_dir):
             record['exp_name'] = met.get('exp_name', exp_name)
 
         # 从 metrics.json 填充 (仅在尚未有值时)
+        # 键名映射: metrics.json 中的字段名 → 汇总表字段名
         field_map = {
             'accuracy': 'test_acc',
+            'test_accuracy': 'test_acc',
+            'test_mae': 'test_mae',
+            'test_rmse': 'test_rmse',
+            'test_loss': 'test_loss',
+            'zero_baseline_mae': 'zero_baseline_mae',
+            'zero_baseline_rmse': 'zero_baseline_rmse',
             'avg_spike_rate': 'test_spike_rate',
             'sparsity': 'test_sparsity',
             'spikes_per_image': 'test_spikes_per_image',
@@ -254,6 +261,16 @@ def read_experiment(exp_dir):
         for src_key, dst_key in field_map.items():
             if src_key in met and dst_key not in record:
                 record[dst_key] = met[src_key]
+
+        # 直接同名字段 (config 类信息)
+        direct_fields = [
+            'neuron_type', 'residual_mode', 'T', 'dataset',
+            'task_name', 'img_h', 'img_w', 'seq_len', 'stride',
+            'mode', 'encoding',
+        ]
+        for f in direct_fields:
+            if f in met and f not in record:
+                record[f] = met[f]
 
     # ---- 3) best_model.ckpt ----
     ckpt_path = os.path.join(exp_dir, 'best_model.ckpt')
