@@ -387,6 +387,82 @@ def plot_per_class_metrics(per_class, out_dir):
 
 
 # ============================================================================
+# 5. 逐样本预测导出
+# ============================================================================
+def export_predictions_csv(test_ds, all_preds, all_labels, all_probs,
+                           sample_spike_rates, class_names, num_actions,
+                           out_dir):
+    """
+    导出逐样本预测结果到 predictions.csv 和 errors_only.csv。
+    """
+    optional_fields = ['junction_id', 'turn_dir', 'stage', 'segment_id']
+    has_fields = []
+    samples = test_ds.samples if hasattr(test_ds, 'samples') else None
+    if samples and len(samples) > 0:
+        for f in optional_fields:
+            if f in samples[0]:
+                has_fields.append(f)
+
+    # 构建表头
+    header = ['sample_id', 'run_name', 'frame_idx',
+              'true_label', 'pred_label', 'correct']
+    header += [f'prob_{i}' for i in range(num_actions)]
+    header += ['spike_rate', 'split']
+    header += has_fields
+
+    rows = []
+    for i in range(len(all_labels)):
+        sample = samples[i] if samples and i < len(samples) else {}
+
+        # run_name
+        run_name = sample.get('run_name', '')
+        if not run_name and 'run_dir' in sample:
+            run_name = os.path.basename(sample['run_dir'])
+
+        # frame_idx: 从图片文件名提取
+        frame_idx = ''
+        img_path = sample.get('img_path', '')
+        if img_path:
+            frame_idx = os.path.splitext(os.path.basename(img_path))[0]
+
+        true_label = all_labels[i]
+        pred_label = all_preds[i]
+        correct = 1 if true_label == pred_label else 0
+
+        row = [i, run_name, frame_idx, true_label, pred_label, correct]
+        # 概率
+        for c in range(num_actions):
+            row.append(f'{all_probs[i][c]:.6f}')
+        # spike_rate
+        sr = sample_spike_rates[i] if i < len(sample_spike_rates) else 0.0
+        row.append(f'{sr:.6f}')
+        # split
+        row.append('test')
+        # 可选 metadata
+        for f in has_fields:
+            row.append(sample.get(f, ''))
+
+        rows.append(row)
+
+    # predictions.csv
+    pred_path = os.path.join(out_dir, 'predictions.csv')
+    with open(pred_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+    print(f'  [✓] {pred_path} ({len(rows)} samples)')
+
+    # errors_only.csv
+    error_rows = [r for r in rows if r[5] == 0]
+    err_path = os.path.join(out_dir, 'errors_only.csv')
+    with open(err_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(error_rows)
+    print(f'  [✓] {err_path} ({len(error_rows)} errors)')
+
+
+# ============================================================================
 # 主流程
 # ============================================================================
 def main():
@@ -514,6 +590,8 @@ def main():
     monitor.register(net)
 
     all_preds, all_labels = [], []
+    all_probs = []
+    sample_spike_rates = []
     total_spikes, total_frames = 0, 0
     all_spike_rates = []
 
@@ -527,11 +605,18 @@ def main():
                 preds = out.argmax(1).cpu().numpy()
                 all_preds.extend(preds.tolist())
                 all_labels.extend(labels.numpy().tolist())
+                probs = F.softmax(out, dim=1).cpu().numpy()
+                all_probs.append(probs)
 
+            batch_sr = monitor.avg_rate()
             total_spikes += monitor.total_spikes()
             total_frames += images.shape[0]
-            all_spike_rates.append(monitor.avg_rate())
+            all_spike_rates.append(batch_sr)
+            sample_spike_rates.extend([batch_sr] * images.shape[0])
             functional.reset_net(net)
+
+    if is_discrete and all_probs:
+        all_probs = np.concatenate(all_probs, axis=0)
 
     group_rates = monitor.group_rates()
     monitor.remove()
@@ -574,6 +659,11 @@ def main():
                 'support': int(sup[i]),
             })
         plot_per_class_metrics(per_class, args.out_dir)
+
+        # 4d. 逐样本预测导出
+        export_predictions_csv(
+            test_ds, all_preds, all_labels, all_probs,
+            sample_spike_rates, class_names, num_actions, args.out_dir)
 
     # 4b. Spike 分析
     plot_spike_analysis(group_rates, spikes_per_img, accuracy,
