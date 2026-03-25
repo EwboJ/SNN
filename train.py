@@ -723,6 +723,9 @@ def main():
                         help='spike rate 正则系数')
     parser.add_argument('-target_rate', default=0.1, type=float,
                         help='目标平均脉冲发放率')
+    parser.add_argument('--framediff_gain', default=1.0, type=float,
+                        help='framediff 编码增益系数，放大帧差信号以提升'
+                             '脉冲发放率 (推荐 5.0~15.0)')
     parser.add_argument('--v_max', default=0.22, type=float,
                         help='最大线速度 (m/s)')
     parser.add_argument('--w_max', default=2.84, type=float,
@@ -835,6 +838,8 @@ def main():
         print(f'  数据根目录:     {args.task_root}')
         print(f'  图像尺寸:       {args.img_h}×{args.img_w}')
         print(f'  编码:           {args.encoding}')
+        if args.encoding == 'framediff':
+            print(f'  帧差增益:       {args.framediff_gain}')
         if args.label_smoothing > 0:
             print(f'  Label Smoothing: {args.label_smoothing}')
         if args.focal_gamma > 0:
@@ -844,6 +849,8 @@ def main():
     elif is_corridor:
         print(f'  走廊模式:       {args.mode}')
         print(f'  编码:           {args.encoding}')
+        if args.encoding == 'framediff':
+            print(f'  帧差增益:       {args.framediff_gain}')
         print(f'  动作集:         {args.action_set}类' if args.mode == 'discrete'
               else f'  控制维度:       {args.control_dim}')
         print(f'  图像尺寸:       {args.img_h}×{args.img_w}')
@@ -924,6 +931,7 @@ def main():
             residual_mode=args.residual_mode,
             raw_in_channels=in_channels,
             use_tanh=False,
+            framediff_gain=args.framediff_gain,
         )
     elif is_corridor:
         from models.snn_corridor import build_corridor_net
@@ -939,6 +947,7 @@ def main():
             use_tanh=(args.mode == 'regression'),
             v_max=args.v_max,
             w_max=args.w_max,
+            framediff_gain=args.framediff_gain,
         )
     else:
         net = resnet110(
@@ -1099,6 +1108,7 @@ def main():
             'img_w': args.img_w,
             'label_smoothing': args.label_smoothing,
             'focal_gamma': args.focal_gamma,
+            'framediff_gain': args.framediff_gain,
         })
     elif is_corridor:
         config.update({
@@ -1110,6 +1120,7 @@ def main():
             'img_h': args.img_h,
             'img_w': args.img_w,
             'corridor_hflip': args.corridor_hflip,
+            'framediff_gain': args.framediff_gain,
         })
 
     # ======================== 训练循环 ========================

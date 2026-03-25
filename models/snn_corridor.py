@@ -52,10 +52,11 @@ class FrameDiffEncoder(nn.Module):
     首帧时 prev_frame 为 None → 差分为 0 → 输出全零。
     """
 
-    def __init__(self, in_channels: int = 3):
+    def __init__(self, in_channels: int = 3, gain: float = 1.0):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = in_channels * 2  # pos + neg
+        self.gain = gain
         # prev_frame 用 register_buffer 以便 .to(device) 能自动移动
         self.register_buffer('prev_frame', None)
 
@@ -97,7 +98,10 @@ class FrameDiffEncoder(nn.Module):
         # 更新 prev_frame
         self.prev_frame = x.detach().clone()
 
-        return torch.cat([diff_pos, diff_neg], dim=1)
+        out = torch.cat([diff_pos, diff_neg], dim=1)
+        if self.gain != 1.0:
+            out = out * self.gain
+        return out
 
 
 # ============================================================================
@@ -193,6 +197,7 @@ class CorridorPolicyNet(nn.Module):
         v_max: float = 0.22,
         w_max: float = 2.84,
         dropout: float = 0.3,
+        **kwargs,
     ):
         """
         Args:
@@ -206,6 +211,7 @@ class CorridorPolicyNet(nn.Module):
             v_max: 最大线速度 (m/s)
             w_max: 最大角速度 (rad/s)
             dropout: head 的 dropout 概率
+            **kwargs: framediff_gain 等额外参数
         """
         super().__init__()
         assert head_type in ('discrete', 'regression')
@@ -214,11 +220,13 @@ class CorridorPolicyNet(nn.Module):
         self.head_type = head_type
         self.encoding = encoding
         self.raw_in_channels = raw_in_channels
+        self.kwargs = kwargs
 
         # ===== 编码器 =====
         self.frame_diff_encoder = None
         if encoding == 'framediff':
-            self.frame_diff_encoder = FrameDiffEncoder(raw_in_channels)
+            self.frame_diff_encoder = FrameDiffEncoder(
+                raw_in_channels, gain=kwargs.get('framediff_gain', 1.0))
 
         # ===== Backbone (去掉原始 fc, 保留特征提取) =====
         self.backbone = backbone
@@ -412,6 +420,7 @@ def build_corridor_net(
     w_max: float = 2.84,
     dropout: float = 0.3,
     pretrained_backbone: Optional[str] = None,
+    framediff_gain: float = 1.0,
 ) -> CorridorPolicyNet:
     """
     构建走廊导航策略网络的便捷工厂函数。
@@ -431,6 +440,9 @@ def build_corridor_net(
         dropout: head 的 dropout
         pretrained_backbone: 预训练 backbone 的 checkpoint 路径
             会自动加载 model_state_dict 中 backbone 相关的权重
+        framediff_gain: 帧差编码增益系数，放大帧差值以提升脉冲发放率
+            APLIF 的自适应抑制项导致有效阈值 > v_threshold，
+            帧差值太小时神经元无法发放。推荐值: 5.0~15.0
 
     Returns:
         CorridorPolicyNet 实例
@@ -438,11 +450,6 @@ def build_corridor_net(
     # 确定 backbone 的输入通道
     if encoding == 'framediff':
         backbone_in_channels = raw_in_channels * 2  # 6 通道
-        if T != 1:
-            import warnings
-            warnings.warn(
-                f"framediff 模式推荐 T=1 (当前 T={T})，"
-                f"因为帧差编码已经隐含了时间信息。")
     else:
         backbone_in_channels = raw_in_channels
 
@@ -493,6 +500,7 @@ def build_corridor_net(
         v_max=v_max,
         w_max=w_max,
         dropout=dropout,
+        framediff_gain=framediff_gain,
     )
 
     return net
