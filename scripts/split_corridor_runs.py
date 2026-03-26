@@ -10,6 +10,7 @@
 划分策略:
     exact 模式: 每组精确指定 train/val/test 数量 (默认 5+1+1)
     ratio 模式: 按比例随机划分 (兼容旧版)
+    fixed 模式: 从 CSV 文件直接指定每个 run 的 split (不随机)
 
 用法:
     # 精确模式 (推荐)
@@ -32,6 +33,12 @@
         --dst_root ./data/corridor \\
         --manifest runs_manifest.csv \\
         --split_mode exact
+
+    # 固定划分 (从 CSV 指定)
+    python scripts/split_corridor_runs.py \\
+        --src_root ./data/corridor_balanced \\
+        --dst_root ./data/corridor \\
+        --fixed_split_csv ./data/fixed_split.csv
 
 输出:
     <dst_root>/
@@ -354,6 +361,103 @@ def split_ratio(groups, val_ratio, test_ratio, seed):
 
 
 # ============================================================================
+# 固定划分 (fixed split)
+# ============================================================================
+
+def load_fixed_split_csv(csv_path):
+    """
+    读取固定划分 CSV 文件。
+
+    CSV 至少包含 run_name, split 两列。
+    split 只能为 train / val / test。
+
+    Returns:
+        dict: {run_name: split_str}
+    """
+    mapping = {}
+    valid_splits = {'train', 'val', 'test'}
+
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError(f"fixed_split_csv 为空: {csv_path}")
+        # 检查必要列
+        for col in ['run_name', 'split']:
+            if col not in reader.fieldnames:
+                raise ValueError(
+                    f"fixed_split_csv 缺少 '{col}' 列: {csv_path}\n"
+                    f"  实际列名: {reader.fieldnames}")
+
+        for i, row in enumerate(reader, 1):
+            name = row['run_name'].strip()
+            split = row['split'].strip().lower()
+            if not name:
+                print(f"  ⚠ fixed_split_csv 第 {i} 行: run_name 为空，跳过")
+                continue
+            if split not in valid_splits:
+                raise ValueError(
+                    f"fixed_split_csv 第 {i} 行: "
+                    f"split='{split}' 无效 (只能为 train/val/test)")
+            if name in mapping:
+                raise ValueError(
+                    f"fixed_split_csv 中 run '{name}' 重复出现!\n"
+                    f"  第一次: split={mapping[name]}\n"
+                    f"  第二次: split={split}")
+            mapping[name] = split
+
+    return mapping
+
+
+def apply_fixed_split(all_runs, fixed_mapping):
+    """
+    按固定映射分配 train/val/test。
+
+    一致性检查:
+      1. run 不允许重复出现在多个 split
+      2. 所有有效 run 必须被分配
+      3. fixed_split_csv 中的 run_name 必须都存在于 src_root
+
+    Returns:
+        (train_runs, val_runs, test_runs)
+    """
+    train_runs, val_runs, test_runs = [], [], []
+    run_name_set = {r['name'] for r in all_runs}
+
+    # 检查 CSV 中的 run 是否都存在
+    csv_names = set(fixed_mapping.keys())
+    missing_in_src = csv_names - run_name_set
+    if missing_in_src:
+        print(f"\n  ⚠ fixed_split_csv 中以下 run 在 src_root 中不存在:")
+        for n in sorted(missing_in_src):
+            print(f"    - {n}")
+        raise RuntimeError(
+            f"fixed_split_csv 中 {len(missing_in_src)} 个 run "
+            f"在 src_root 中不存在")
+
+    # 检查所有有效 run 是否都被分配
+    unassigned = run_name_set - csv_names
+    if unassigned:
+        print(f"\n  ⚠ 以下 {len(unassigned)} 个有效 run 未在 "
+              f"fixed_split_csv 中出现:")
+        for n in sorted(unassigned):
+            print(f"    - {n}")
+        raise RuntimeError(
+            f"{len(unassigned)} 个有效 run 未被分配到任何 split")
+
+    # 分配
+    for run in all_runs:
+        split = fixed_mapping[run['name']]
+        if split == 'train':
+            train_runs.append(run)
+        elif split == 'val':
+            val_runs.append(run)
+        elif split == 'test':
+            test_runs.append(run)
+
+    return train_runs, val_runs, test_runs
+
+
+# ============================================================================
 # 统计与输出
 # ============================================================================
 
@@ -455,6 +559,7 @@ def run_split(src_root, dst_root, split_mode='exact', group_by='junction_id,turn
               train_per_group=5, val_per_group=1, test_per_group=1,
               val_ratio=0.15, test_ratio=0.15,
               min_frames=10, exclude=None, manifest_path=None,
+              fixed_split_csv=None,
               copy_mode='symlink', seed=42, force=False, dry_run=False):
     """
     走廊导航 run 级别 train/val/test 划分核心函数 (供 pipeline 调用)。
@@ -468,21 +573,28 @@ def run_split(src_root, dst_root, split_mode='exact', group_by='junction_id,turn
     if not os.path.isdir(src_root):
         raise FileNotFoundError(f"源目录不存在: {src_root}")
 
+    # 判断是否使用固定划分
+    use_fixed = fixed_split_csv is not None
+
     # ======================== Banner ========================
     print('=' * 72)
     print('  走廊导航数据集划分 (v2)')
     print('=' * 72)
     print(f'  源目录:       {os.path.abspath(src_root)}')
     print(f'  目标目录:     {os.path.abspath(dst_root)}')
-    print(f'  划分模式:     {split_mode}')
-    print(f'  分组键:       {group_keys}')
-    if split_mode == 'exact':
-        print(f'  每组分配:     train={train_per_group}, '
-              f'val={val_per_group}, test={test_per_group}')
+    if use_fixed:
+        print(f'  划分模式:     fixed (从 CSV 指定)')
+        print(f'  固定划分文件: {os.path.abspath(fixed_split_csv)}')
     else:
-        print(f'  比例:         val={val_ratio}, test={test_ratio}')
+        print(f'  划分模式:     {split_mode}')
+        print(f'  分组键:       {group_keys}')
+        if split_mode == 'exact':
+            print(f'  每组分配:     train={train_per_group}, '
+                  f'val={val_per_group}, test={test_per_group}')
+        else:
+            print(f'  比例:         val={val_ratio}, test={test_ratio}')
+        print(f'  种子:         {seed}')
     print(f'  复制方式:     {copy_mode}')
-    print(f'  种子:         {seed}')
     if exclude_set:
         print(f'  排除:         {exclude_set}')
     print('=' * 72)
@@ -503,55 +615,96 @@ def run_split(src_root, dst_root, split_mode='exact', group_by='junction_id,turn
     print(f"  找到 {len(all_runs)} 个有效 run, "
           f"总帧数 {sum(r['frame_count'] for r in all_runs)}")
 
-    # ======================== [2] 分组 ========================
-    print(f'\n[2/5] 按 {group_keys} 分组...')
-
+    # ======================== [2] 分组 / 固定划分加载 ========================
     manifest = None
     manifest_fields = None   # manifest 中除 run_name 外的所有列名
-    if manifest_path:
-        if not os.path.isfile(manifest_path):
-            raise FileNotFoundError(f"manifest 文件不存在: {manifest_path}")
-        manifest, manifest_fields = load_manifest(manifest_path)
-        print(f"  从 manifest 加载 {len(manifest)} 条记录")
-        print(f"  manifest 字段: {manifest_fields}")
-        # 检查 group_keys 是否包含在 manifest 字段中
-        missing_keys = [k for k in group_keys if k not in manifest_fields]
-        if missing_keys:
-            print(f"  ⚠ 分组键 {missing_keys} 不在 manifest 字段中!")
-            print(f"    可用字段: {manifest_fields}")
-            print(f"    将尝试从目录名解析缺失字段")
+    fixed_mapping = None
 
-    groups = build_groups(all_runs, manifest, group_keys, manifest_fields)
-
-    if not groups:
-        raise RuntimeError(
-            "无法解析任何 run 的分组信息! "
-            "请确保目录名格式为 J{id}_{left|right}_r{rep} "
-            "或 {left|right}{id}_bag{rep}，或提供 --manifest 文件")
-
-    print(f"  共 {len(groups)} 个组:")
-    for key in sorted(groups.keys()):
-        grp = groups[key]
-        frames = sum(r['frame_count'] for r in grp)
-        names = ', '.join(r['name'] for r in sorted(grp, key=lambda x: x['name']))
-        print(f"    {key}: {len(grp)} runs, {frames} 帧  [{names}]")
+    if use_fixed:
+        print(f'\n[2/5] 加载固定划分文件...')
+        if not os.path.isfile(fixed_split_csv):
+            raise FileNotFoundError(
+                f"fixed_split_csv 文件不存在: {fixed_split_csv}")
+        fixed_mapping = load_fixed_split_csv(fixed_split_csv)
+        print(f"  加载 {len(fixed_mapping)} 条划分记录")
+        # 统计各 split 数量
+        from collections import Counter
+        split_counts = Counter(fixed_mapping.values())
+        for sp in ['train', 'val', 'test']:
+            print(f"    {sp}: {split_counts.get(sp, 0)} runs")
+    else:
+        print(f'\n[2/5] 按 {group_keys} 分组...')
+        if manifest_path:
+            if not os.path.isfile(manifest_path):
+                raise FileNotFoundError(
+                    f"manifest 文件不存在: {manifest_path}")
+            manifest, manifest_fields = load_manifest(manifest_path)
+            print(f"  从 manifest 加载 {len(manifest)} 条记录")
+            print(f"  manifest 字段: {manifest_fields}")
+            # 检查 group_keys 是否包含在 manifest 字段中
+            missing_keys = [k for k in group_keys
+                            if k not in manifest_fields]
+            if missing_keys:
+                print(f"  ⚠ 分组键 {missing_keys} 不在 manifest 字段中!")
+                print(f"    可用字段: {manifest_fields}")
+                print(f"    将尝试从目录名解析缺失字段")
 
     # ======================== [3] 划分 ========================
-    print(f'\n[3/5] 执行 {split_mode} 划分...')
+    if use_fixed:
+        print(f'\n[3/5] 执行固定划分 (fixed)...')
 
-    if split_mode == 'exact':
-        train_runs, val_runs, test_runs = split_exact(
-            groups,
-            train_n=train_per_group,
-            val_n=val_per_group,
-            test_n=test_per_group,
-            seed=seed)
+        # 如有 manifest，先加载以便后续写 split_manifest.csv 带完整字段
+        if manifest_path and os.path.isfile(manifest_path):
+            manifest, manifest_fields = load_manifest(manifest_path)
+            # 把 manifest 信息合并到 run 上
+            for run in all_runs:
+                if manifest and run['name'] in manifest:
+                    run.update(manifest[run['name']])
+        else:
+            # 无 manifest 时尝试从目录名解析
+            for run in all_runs:
+                parsed = parse_run_name(run['name'])
+                if parsed:
+                    run['junction_id'] = parsed[0]
+                    run['turn_dir'] = parsed[1]
+                    run['rep_id'] = parsed[2]
+
+        train_runs, val_runs, test_runs = apply_fixed_split(
+            all_runs, fixed_mapping)
+        print(f"  [✓] 固定划分完成")
     else:
-        train_runs, val_runs, test_runs = split_ratio(
-            groups,
-            val_ratio=val_ratio,
-            test_ratio=test_ratio,
-            seed=seed)
+        groups = build_groups(all_runs, manifest, group_keys,
+                              manifest_fields)
+
+        if not groups:
+            raise RuntimeError(
+                "无法解析任何 run 的分组信息! "
+                "请确保目录名格式为 J{id}_{left|right}_r{rep} "
+                "或 {left|right}{id}_bag{rep}，或提供 --manifest 文件")
+
+        print(f"  共 {len(groups)} 个组:")
+        for key in sorted(groups.keys()):
+            grp = groups[key]
+            frames = sum(r['frame_count'] for r in grp)
+            names = ', '.join(
+                r['name'] for r in sorted(grp, key=lambda x: x['name']))
+            print(f"    {key}: {len(grp)} runs, {frames} 帧  [{names}]")
+
+        print(f'\n[3/5] 执行 {split_mode} 划分...')
+
+        if split_mode == 'exact':
+            train_runs, val_runs, test_runs = split_exact(
+                groups,
+                train_n=train_per_group,
+                val_n=val_per_group,
+                test_n=test_per_group,
+                seed=seed)
+        else:
+            train_runs, val_runs, test_runs = split_ratio(
+                groups,
+                val_ratio=val_ratio,
+                test_ratio=test_ratio,
+                seed=seed)
 
     # 完整性检查
     all_names = set()
@@ -600,14 +753,16 @@ def run_split(src_root, dst_root, split_mode='exact', group_by='junction_id,turn
     config_out = {
         'src_root': src_root,
         'dst_root': dst_root,
-        'split_mode': split_mode,
+        'split_mode': 'fixed' if use_fixed else split_mode,
         'group_by': group_keys,
         'seed': seed,
         'copy_mode': copy_mode,
         'exclude': list(exclude_set),
         'min_frames': min_frames,
     }
-    if split_mode == 'exact':
+    if use_fixed:
+        config_out['fixed_split_csv'] = os.path.abspath(fixed_split_csv)
+    elif split_mode == 'exact':
         config_out['train_per_group'] = train_per_group
         config_out['val_per_group'] = val_per_group
         config_out['test_per_group'] = test_per_group
@@ -721,6 +876,9 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--force', action='store_true',
                         help='覆盖已有目标目录')
+    parser.add_argument('--fixed_split_csv', type=str, default=None,
+                        help='固定划分 CSV 文件路径 '
+                             '(至少含 run_name, split 列)')
     parser.add_argument('--dry_run', action='store_true',
                         help='仅预览，不实际复制')
 
@@ -739,6 +897,7 @@ def main():
         min_frames=args.min_frames,
         exclude=args.exclude,
         manifest_path=args.manifest,
+        fixed_split_csv=args.fixed_split_csv,
         copy_mode=args.copy_mode,
         seed=args.seed,
         force=args.force,
