@@ -2,25 +2,34 @@
 统一任务数据集核查可视化脚本
 ========================================
 支持核查：
-  - junction_lr_v1    (二分类: Left/Right)
-  - stage4_v1         (四分类: Follow/Approach/Turn/Recover)
-  - action3_balanced_v1 (三分类)
+  - junction_lr_v1      (二分类: Left/Right)
+  - stage3_v1           (三阶段: Approach/Turn/Recover)
+  - stage4_v1           (四阶段: Follow/Approach/Turn/Recover)
+  - action3_balanced_v1 (三分类: Left/Straight/Right)
   - straight_keep_reg_v1 (回归: angular_z, Correcting/Settled)
-  - loop_sparse/*     (junction_windows / stage_windows / sparse_follow)
+  - loop_sparse/*       (junction_windows / stage_windows / sparse_follow)
 
 对每个任务数据集：
   1. 随机抽若干 run
   2. 拼接连续帧 strip 预览图
-  3. 标注 label_name / action_name / phase / t_rel_ms
-  4. angular_z 时间轴图
-  5. 输出 preview png + summary json
+  3. 标注 label_name / phase / t_rel_ms / angular_z
+  4. angular_z 时间轴图 (phase 背景色)
+  5. 输出 preview png + verify_summary.json
 
 用法：
-  # 自动检测任务类型
+  # 自动检测任务类型 (junction_lr)
   python scripts/verify_task_datasets.py \\
       --data_root ./data/stage1/junction_lr_v1
 
-  # 核查 straight_keep
+  # 核查 stage3 三阶段
+  python scripts/verify_task_datasets.py \\
+      --data_root ./data/stage1/stage3_v1
+
+  # 核查 stage4 四阶段
+  python scripts/verify_task_datasets.py \\
+      --data_root ./data/stage1/stage4_v1
+
+  # 核查 straight_keep 回归
   python scripts/verify_task_datasets.py \\
       --data_root ./data/straight_keep/straight_keep_reg_v1
 
@@ -30,7 +39,7 @@
 
   # 指定 split 和数量
   python scripts/verify_task_datasets.py \\
-      --data_root ./data/stage1/stage4_v1 \\
+      --data_root ./data/stage1/stage3_v1 \\
       --split train --max_runs 8 --frames_per_run 30
 """
 
@@ -97,6 +106,7 @@ LABEL_COLORS = {
 
 KNOWN_TASKS = {
     'junction_lr':        {'type': 'classification', 'has_phase': True},
+    'stage3':             {'type': 'classification', 'has_phase': True},
     'stage4':             {'type': 'classification', 'has_phase': True},
     'action3':            {'type': 'classification', 'has_phase': True},
     'straight_keep_reg':  {'type': 'regression',     'has_phase': True},
@@ -403,8 +413,8 @@ def plot_timeline(run_info, task_type, out_path):
                s=12, zorder=3, alpha=0.8)
 
     # t=0 标记 (仅对 turn-based 任务)
-    if task_type in ('junction_lr', 'stage4', 'junction_windows',
-                     'stage_windows', 'action3'):
+    if task_type in ('junction_lr', 'stage3', 'stage4',
+                     'junction_windows', 'stage_windows', 'action3'):
         ax.axvline(x=0, color='red', linestyle='--', alpha=0.6,
                    label='t_turn_on')
 
@@ -518,7 +528,8 @@ def compute_run_stats(run_info, task_type):
 def main():
     parser = argparse.ArgumentParser(
         description='统一任务数据集核查可视化 '
-                    '(junction_lr / stage4 / straight_keep_reg / loop_sparse)',
+                    '(junction_lr / stage3 / stage4 / '
+                    'straight_keep_reg / loop_sparse)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--data_root', type=str, required=True,
                         help='任务数据集根目录 (含 train/val/test/)')
@@ -552,6 +563,7 @@ def main():
 
     type_label = {
         'junction_lr':        '路口二分类 (Left/Right)',
+        'stage3':             '三阶段分类 (Approach/Turn/Recover)',
         'stage4':             '四阶段分类 (Follow/Approach/Turn/Recover)',
         'action3':            '三分类 (Forward/Left/Right)',
         'straight_keep_reg':  '直行纠偏回归 (angular_z)',
@@ -642,6 +654,25 @@ def main():
     print(f'\n[4/4] 生成可视化...')
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # 按 split 汇总 label_distribution 和帧数
+    per_split_stats = {}
+    for sp in sorted(split_counts.keys()):
+        sp_label_dist = defaultdict(int)
+        sp_frames = 0
+        sp_runs = 0
+        for r in all_runs:
+            if r['split'] != sp:
+                continue
+            sp_runs += 1
+            sp_frames += len(r['frames'])
+            for fr in r['frames']:
+                sp_label_dist[fr.get('label_name', '')] += 1
+        per_split_stats[sp] = {
+            'runs': sp_runs,
+            'frames': sp_frames,
+            'label_distribution': dict(sp_label_dist),
+        }
+
     verify_summary = {
         'task': task_type,
         'task_type_info': task_info,
@@ -653,6 +684,7 @@ def main():
             'label_distribution': dict(global_label_dist),
             'phase_distribution': dict(global_phase_dist),
         },
+        'per_split': per_split_stats,
         'runs_checked': [],
     }
 
@@ -701,6 +733,10 @@ def main():
     if task_type == 'junction_lr':
         print(f'    - preview: 每个 run 的标签应该一致 (全 Left 或全 Right)')
         print(f'    - timeline: angular_z 在 t=0 附近应有对应方向的变化')
+    elif task_type == 'stage3':
+        print(f'    - phase 条: Approach→Turn→Recover 三段是否连贯 (应无 Follow)')
+        print(f'    - timeline: angular_z 在 Turn 阶段应有明显变化')
+        print(f'    - label 条: 三类颜色分布是否与 phase 一致')
     elif task_type == 'stage4':
         print(f'    - phase 条: Follow→Approach→Turn→Recover 是否连贯')
         print(f'    - timeline: angular_z 在 Turn 阶段应有明显变化')
