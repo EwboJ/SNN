@@ -643,18 +643,119 @@ def derive_stage4(run_info, turn_event, args):
 
 
 # ============================================================================
+# Stage3: 三阶段 (Approach / Turn / Recover)
+# ============================================================================
+
+STAGE3_LABELS = {'Approach': 0, 'Turn': 1, 'Recover': 2}
+
+
+def derive_stage3(run_info, turn_event, args):
+    """
+    三阶段分类派生 — 丢弃 Follow, 只保留 Approach/Turn/Recover.
+
+    复用 classify_phase_stage4() 做阶段判定.
+
+    Returns:
+        (frames_out, info_dict) 或 (None, reason_str)
+    """
+    if turn_event is None:
+        return None, '无 turn 事件'
+
+    frames = run_info['frames']
+    t_on = turn_event['t_turn_on_ns']
+    t_off = turn_event['t_turn_off_ns']
+
+    # stage3 专用参数 (fallback 到通用参数)
+    pre_ms = getattr(args, 'stage3_pre_turn_ms', None) or args.pre_turn_ms
+    recover_ms = getattr(args, 'stage3_recover_ms', None) or args.recover_ms
+    margin_ms = getattr(args, 'stage3_turn_margin_ms', 300)
+    max_approach = getattr(args, 'stage3_max_approach_frames', 0)
+    max_turn = getattr(args, 'stage3_max_turn_frames', 0)
+    max_recover = getattr(args, 'stage3_max_recover_frames', 0)
+    policy = getattr(args, 'stage3_sample_policy', 'tail')
+
+    buckets = {'Approach': [], 'Turn': [], 'Recover': []}
+
+    for fr in frames:
+        if fr['action_name'] == 'Backward':
+            continue
+
+        phase = classify_phase_stage4(
+            fr['timestamp_ns'], t_on, t_off,
+            pre_ms, recover_ms, margin_ms)
+
+        # 丢弃 Follow 和超出范围
+        if phase is None or phase == 'Follow':
+            continue
+
+        t_rel = ns_to_ms(fr['timestamp_ns']) - ns_to_ms(t_on)
+
+        out = {
+            'image_name': fr['image_name'],
+            'label_id': STAGE3_LABELS[phase],
+            'label_name': phase,
+            'timestamp_ns': fr['timestamp_ns'],
+            'linear_x': fr['linear_x'],
+            'angular_z': fr['angular_z'],
+            'valid': fr['valid'],
+            'orig_action_id': fr['action_id'],
+            'orig_action_name': fr['action_name'],
+            'run_name': run_info['run_name'],
+            'split': run_info['split'],
+            't_rel_ms': round(t_rel, 1),
+            'phase': phase,
+        }
+        buckets[phase].append(out)
+
+    # 裁剪前数量
+    raw_counts = {k: len(v) for k, v in buckets.items()}
+
+    # 按阶段裁剪
+    phase_policies = {
+        'Approach': (policy, max_approach),      # 默认 tail, 保留靠近 Turn 的
+        'Turn': ('uniform', max_turn),           # 均匀采样
+        'Recover': ('uniform', max_recover),     # 均匀采样
+    }
+
+    for phase, (ph_policy, ph_max) in phase_policies.items():
+        if ph_max > 0 and len(buckets[phase]) > ph_max:
+            buckets[phase] = _sample_phase(
+                buckets[phase], ph_max, ph_policy)
+
+    # 裁剪后数量
+    derived_counts = {k: len(v) for k, v in buckets.items()}
+
+    result = []
+    for phase in ['Approach', 'Turn', 'Recover']:
+        result.extend(buckets[phase])
+    result.sort(key=lambda x: x['timestamp_ns'])
+
+    if not result:
+        return None, '所有阶段均为空'
+
+    info = {
+        'raw_counts': raw_counts,
+        'derived_counts': derived_counts,
+        **derived_counts,
+    }
+    return result, info
+
+
+# ============================================================================
 # 统一派生调度
 # ============================================================================
 
 TASK_FUNCS = {
     'action3_balanced': derive_action3_balanced,
     'junction_lr': derive_junction_lr,
+    'stage3': derive_stage3,
     'stage4': derive_stage4,
 }
 
 TASK_LABEL_NAMES = {
     'action3_balanced': {0: 'Left', 1: 'Straight', 2: 'Right'},
     'junction_lr': {0: 'Left', 1: 'Right'},
+    'stage3': {0: 'Approach', 1: 'Turn', 2: 'Recover'},
     'stage4': {0: 'Follow', 1: 'Approach', 2: 'Turn', 3: 'Recover'},
 }
 
@@ -733,8 +834,8 @@ def process_task(task_name, all_runs, turn_events, args):
             if info.get('trimmed'):
                 trim_log.append(f'    {rn}: {info["before"]} → {info["after"]}')
 
-        # stage4 v2: 记录每 run 原始/派生阶段长度
-        if task_name == 'stage4' and isinstance(info, dict):
+        # stage3/stage4: 记录每 run 原始/派生阶段长度
+        if task_name in ('stage3', 'stage4') and isinstance(info, dict):
             rd['raw_counts'] = info.get('raw_counts', {})
             rd['derived_counts'] = info.get('derived_counts', {})
 
@@ -817,6 +918,40 @@ def process_task(task_name, all_runs, turn_events, args):
                 for rd in run_details),
         }
         summary['straight_trim_summary'] = trim_summary
+
+    # stage3 额外统计
+    if task_name == 'stage3':
+        s3_params = {
+            'stage3_pre_turn_ms': getattr(
+                args, 'stage3_pre_turn_ms', None) or args.pre_turn_ms,
+            'stage3_recover_ms': getattr(
+                args, 'stage3_recover_ms', None) or args.recover_ms,
+            'stage3_turn_margin_ms': getattr(
+                args, 'stage3_turn_margin_ms', 300),
+            'stage3_max_approach_frames': getattr(
+                args, 'stage3_max_approach_frames', 0),
+            'stage3_max_turn_frames': getattr(
+                args, 'stage3_max_turn_frames', 0),
+            'stage3_max_recover_frames': getattr(
+                args, 'stage3_max_recover_frames', 0),
+            'stage3_sample_policy': getattr(
+                args, 'stage3_sample_policy', 'tail'),
+        }
+        summary['stage3'] = s3_params
+
+        # 每阶段裁剪前后汇总
+        phase_trim = {'Approach': [0, 0], 'Turn': [0, 0],
+                      'Recover': [0, 0]}
+        for rd in run_details:
+            raw = rd.get('raw_counts', {})
+            derived = rd.get('derived_counts', {})
+            for ph in phase_trim:
+                phase_trim[ph][0] += raw.get(ph, 0)
+                phase_trim[ph][1] += derived.get(ph, 0)
+        summary['stage3']['phase_trim_summary'] = {
+            ph: {'raw': v[0], 'derived': v[1]}
+            for ph, v in phase_trim.items()
+        }
 
     # stage4 v2 额外统计
     if task_name == 'stage4':
@@ -903,7 +1038,7 @@ def main():
                         help='派生输出根目录')
     parser.add_argument('--task', type=str, default='all',
                         choices=['action3_balanced', 'junction_lr',
-                                 'stage4', 'all'],
+                                 'stage3', 'stage4', 'all'],
                         help='要派生的任务')
     parser.add_argument('--valid_only', type=lambda x:
                         str(x).lower() in ('true', '1', 'yes'),
@@ -928,6 +1063,24 @@ def main():
                         help='Follow 阶段最多保留帧数')
     parser.add_argument('--straight_ratio_cap', type=float, default=1.8,
                         help='action3: Straight / min(Left,Right) 上限')
+
+    # Stage3 专用
+    s3 = parser.add_argument_group('Stage3 参数')
+    s3.add_argument('--stage3_pre_turn_ms', type=float, default=None,
+                    help='stage3 专用 pre_turn_ms (默认沿用 --pre_turn_ms)')
+    s3.add_argument('--stage3_recover_ms', type=float, default=None,
+                    help='stage3 专用 recover_ms (默认沿用 --recover_ms)')
+    s3.add_argument('--stage3_turn_margin_ms', type=float, default=300,
+                    help='Turn 边界前后 margin (ms)')
+    s3.add_argument('--stage3_max_approach_frames', type=int, default=0,
+                    help='Approach 最多帧 (0=不限)')
+    s3.add_argument('--stage3_max_turn_frames', type=int, default=0,
+                    help='Turn 最多帧 (0=不限)')
+    s3.add_argument('--stage3_max_recover_frames', type=int, default=0,
+                    help='Recover 最多帧 (0=不限)')
+    s3.add_argument('--stage3_sample_policy', type=str, default='tail',
+                    choices=['tail', 'uniform', 'uniform_tail'],
+                    help='阶段裁剪策略')
 
     # Stage4 v2 专用
     s4 = parser.add_argument_group('Stage4 v2 参数')
@@ -977,6 +1130,18 @@ def main():
           f'recover={args.recover_ms}ms')
     print(f'  Follow: 最多 {args.max_follow_frames} 帧')
     print(f'  Straight 上限: {args.straight_ratio_cap}x × min(L,R)')
+    # stage3 参数
+    if args.task in ('stage3', 'all'):
+        s3_pre = args.stage3_pre_turn_ms or args.pre_turn_ms
+        s3_rec = args.stage3_recover_ms or args.recover_ms
+        print(f'  ── Stage3 ──')
+        print(f'  S3 pre_turn:     {s3_pre}ms')
+        print(f'  S3 recover:      {s3_rec}ms')
+        print(f'  S3 margin:       {args.stage3_turn_margin_ms}ms')
+        print(f'  S3 max_approach: {args.stage3_max_approach_frames}')
+        print(f'  S3 max_turn:     {args.stage3_max_turn_frames}')
+        print(f'  S3 max_recover:  {args.stage3_max_recover_frames}')
+        print(f'  S3 policy:       {args.stage3_sample_policy}')
     # stage4 v2 参数
     if args.task in ('stage4', 'all'):
         s4_pre = args.stage4_pre_turn_ms or args.pre_turn_ms
