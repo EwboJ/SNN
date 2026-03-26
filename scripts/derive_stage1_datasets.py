@@ -490,10 +490,59 @@ def derive_junction_lr(run_info, turn_event, args):
 STAGE4_LABELS = {'Follow': 0, 'Approach': 1, 'Turn': 2, 'Recover': 3}
 
 
+def _sample_phase(frames, max_frames, policy='tail'):
+    """
+    按策略对单阶段帧列表做裁剪/抽样。
+
+    policy:
+      tail:         保留尾部 (最靠近下一阶段)
+      uniform:      均匀抽样
+      uniform_tail: 前半均匀 + 后半全保留
+
+    Returns:
+        list: 裁剪后的帧列表 (保持时间顺序)
+    """
+    if not frames or max_frames <= 0:
+        return frames
+    if len(frames) <= max_frames:
+        return frames
+
+    # 按时间排序
+    frames_sorted = sorted(frames, key=lambda x: x['timestamp_ns'])
+    n = len(frames_sorted)
+
+    if policy == 'tail':
+        return frames_sorted[n - max_frames:]
+
+    elif policy == 'uniform':
+        indices = [round(i * (n - 1) / (max_frames - 1))
+                   for i in range(max_frames)] if max_frames > 1 else [n - 1]
+        return [frames_sorted[i] for i in indices]
+
+    elif policy == 'uniform_tail':
+        # 后半部分全保留, 前半均匀
+        tail_n = max_frames // 2
+        head_n = max_frames - tail_n
+        tail_part = frames_sorted[n - tail_n:]
+        head_pool = frames_sorted[:n - tail_n]
+        if head_pool and head_n > 0:
+            step = max(1, len(head_pool) // head_n)
+            head_part = head_pool[::step][:head_n]
+        else:
+            head_part = []
+        return head_part + tail_part
+
+    else:
+        # fallback: tail
+        return frames_sorted[n - max_frames:]
+
+
 def derive_stage4(run_info, turn_event, args):
     """
-    四阶段分类派生。
-    Follow 只保留离 Approach 最近的 max_follow_frames 帧。
+    四阶段分类派生 (v2).
+
+    每阶段分别收集, 按 stage4_max_xxx_frames 裁剪,
+    裁剪策略由 stage4_sample_policy 控制.
 
     Returns:
         (frames_out, info_dict) 或 (None, reason_str)
@@ -504,7 +553,19 @@ def derive_stage4(run_info, turn_event, args):
     frames = run_info['frames']
     t_on = turn_event['t_turn_on_ns']
     t_off = turn_event['t_turn_off_ns']
-    margin_ms = 300  # Turn 边界 margin
+
+    # v2 参数 (兼容旧版: 若无 stage4_ 参数则 fallback)
+    pre_ms = getattr(args, 'stage4_pre_turn_ms', None) or args.pre_turn_ms
+    recover_ms = getattr(args, 'stage4_recover_ms', None) or args.recover_ms
+    margin_ms = getattr(args, 'stage4_turn_margin_ms', 300)
+    max_follow = getattr(args, 'stage4_max_follow_frames',
+                         args.max_follow_frames)
+    max_approach = getattr(args, 'stage4_max_approach_frames', 0)
+    max_turn = getattr(args, 'stage4_max_turn_frames', 0)
+    max_recover = getattr(args, 'stage4_max_recover_frames', 0)
+    policy = getattr(args, 'stage4_sample_policy', 'tail')
+    drop_no_follow = getattr(args, 'stage4_drop_runs_without_follow', False)
+    min_follow = getattr(args, 'stage4_min_follow_frames', 0)
 
     buckets = {'Follow': [], 'Approach': [], 'Turn': [], 'Recover': []}
 
@@ -514,9 +575,9 @@ def derive_stage4(run_info, turn_event, args):
 
         phase = classify_phase_stage4(
             fr['timestamp_ns'], t_on, t_off,
-            args.pre_turn_ms, args.recover_ms, margin_ms)
+            pre_ms, recover_ms, margin_ms)
         if phase is None:
-            continue  # 超出 recover 窗口
+            continue
 
         t_rel = ns_to_ms(fr['timestamp_ns']) - ns_to_ms(t_on)
 
@@ -537,12 +598,33 @@ def derive_stage4(run_info, turn_event, args):
         }
         buckets[phase].append(out)
 
-    # Follow: 只保留离 Approach 最近的 max_follow_frames 帧
-    follow = buckets['Follow']
-    if len(follow) > args.max_follow_frames:
-        # 按时间降序, 保留最晚的 (最靠近 Approach)
-        follow.sort(key=lambda x: x['timestamp_ns'], reverse=True)
-        buckets['Follow'] = follow[:args.max_follow_frames]
+    # 记录裁剪前数量
+    raw_counts = {k: len(v) for k, v in buckets.items()}
+
+    # drop_runs_without_follow 检查
+    if drop_no_follow and raw_counts['Follow'] == 0:
+        return None, '无 Follow 帧 (已启用 drop_runs_without_follow)'
+
+    # min_follow 检查
+    if min_follow > 0 and raw_counts['Follow'] < min_follow:
+        return None, (f'Follow 帧不足: '
+                      f'{raw_counts["Follow"]} < {min_follow}')
+
+    # 按阶段裁剪
+    phase_policies = {
+        'Follow': ('tail', max_follow),      # Follow 默认 tail
+        'Approach': (policy, max_approach),
+        'Turn': ('uniform', max_turn),       # Turn 默认 uniform
+        'Recover': ('uniform', max_recover), # Recover 默认 uniform
+    }
+
+    for phase, (ph_policy, ph_max) in phase_policies.items():
+        if ph_max > 0 and len(buckets[phase]) > ph_max:
+            buckets[phase] = _sample_phase(
+                buckets[phase], ph_max, ph_policy)
+
+    # 裁剪后数量
+    derived_counts = {k: len(v) for k, v in buckets.items()}
 
     result = []
     for phase in ['Follow', 'Approach', 'Turn', 'Recover']:
@@ -552,7 +634,11 @@ def derive_stage4(run_info, turn_event, args):
     if not result:
         return None, '所有阶段均为空'
 
-    info = {k: len(v) for k, v in buckets.items()}
+    info = {
+        'raw_counts': raw_counts,
+        'derived_counts': derived_counts,
+        **derived_counts,
+    }
     return result, info
 
 
@@ -647,6 +733,11 @@ def process_task(task_name, all_runs, turn_events, args):
             if info.get('trimmed'):
                 trim_log.append(f'    {rn}: {info["before"]} → {info["after"]}')
 
+        # stage4 v2: 记录每 run 原始/派生阶段长度
+        if task_name == 'stage4' and isinstance(info, dict):
+            rd['raw_counts'] = info.get('raw_counts', {})
+            rd['derived_counts'] = info.get('derived_counts', {})
+
         run_details.append(rd)
 
         for fr in result:
@@ -727,6 +818,46 @@ def process_task(task_name, all_runs, turn_events, args):
         }
         summary['straight_trim_summary'] = trim_summary
 
+    # stage4 v2 额外统计
+    if task_name == 'stage4':
+        s4_params = {
+            'stage4_pre_turn_ms': getattr(
+                args, 'stage4_pre_turn_ms', None) or args.pre_turn_ms,
+            'stage4_recover_ms': getattr(
+                args, 'stage4_recover_ms', None) or args.recover_ms,
+            'stage4_turn_margin_ms': getattr(
+                args, 'stage4_turn_margin_ms', 300),
+            'stage4_max_follow_frames': getattr(
+                args, 'stage4_max_follow_frames', args.max_follow_frames),
+            'stage4_max_approach_frames': getattr(
+                args, 'stage4_max_approach_frames', 0),
+            'stage4_max_turn_frames': getattr(
+                args, 'stage4_max_turn_frames', 0),
+            'stage4_max_recover_frames': getattr(
+                args, 'stage4_max_recover_frames', 0),
+            'stage4_sample_policy': getattr(
+                args, 'stage4_sample_policy', 'tail'),
+            'stage4_drop_runs_without_follow': getattr(
+                args, 'stage4_drop_runs_without_follow', False),
+            'stage4_min_follow_frames': getattr(
+                args, 'stage4_min_follow_frames', 0),
+        }
+        summary['stage4_v2'] = s4_params
+
+        # 每阶段裁剪前后汇总
+        phase_trim = {'Follow': [0, 0], 'Approach': [0, 0],
+                      'Turn': [0, 0], 'Recover': [0, 0]}
+        for rd in run_details:
+            raw = rd.get('raw_counts', {})
+            derived = rd.get('derived_counts', {})
+            for ph in phase_trim:
+                phase_trim[ph][0] += raw.get(ph, 0)
+                phase_trim[ph][1] += derived.get(ph, 0)
+        summary['stage4_v2']['phase_trim_summary'] = {
+            ph: {'raw': v[0], 'derived': v[1]}
+            for ph, v in phase_trim.items()
+        }
+
     with open(os.path.join(task_dir, 'dataset_summary.json'), 'w',
               encoding='utf-8') as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
@@ -798,6 +929,31 @@ def main():
     parser.add_argument('--straight_ratio_cap', type=float, default=1.8,
                         help='action3: Straight / min(Left,Right) 上限')
 
+    # Stage4 v2 专用
+    s4 = parser.add_argument_group('Stage4 v2 参数')
+    s4.add_argument('--stage4_pre_turn_ms', type=float, default=None,
+                    help='stage4 专用 pre_turn_ms (默认沿用 --pre_turn_ms)')
+    s4.add_argument('--stage4_recover_ms', type=float, default=None,
+                    help='stage4 专用 recover_ms (默认沿用 --recover_ms)')
+    s4.add_argument('--stage4_turn_margin_ms', type=float, default=300,
+                    help='Turn 边界前后 margin (ms)')
+    s4.add_argument('--stage4_max_follow_frames', type=int, default=None,
+                    help='Follow 最多帧 (默认沿用 --max_follow_frames)')
+    s4.add_argument('--stage4_max_approach_frames', type=int, default=0,
+                    help='Approach 最多帧 (0=不限)')
+    s4.add_argument('--stage4_max_turn_frames', type=int, default=0,
+                    help='Turn 最多帧 (0=不限)')
+    s4.add_argument('--stage4_max_recover_frames', type=int, default=0,
+                    help='Recover 最多帧 (0=不限)')
+    s4.add_argument('--stage4_sample_policy', type=str, default='tail',
+                    choices=['tail', 'uniform', 'uniform_tail'],
+                    help='阶段裁剪策略')
+    s4.add_argument('--stage4_drop_runs_without_follow',
+                    action='store_true',
+                    help='跳过无 Follow 的 run')
+    s4.add_argument('--stage4_min_follow_frames', type=int, default=0,
+                    help='Follow 最少帧数 (不足则跳过)')
+
     # 输出
     parser.add_argument('--copy_mode', type=str, default='copy',
                         choices=['copy', 'symlink'],
@@ -821,6 +977,22 @@ def main():
           f'recover={args.recover_ms}ms')
     print(f'  Follow: 最多 {args.max_follow_frames} 帧')
     print(f'  Straight 上限: {args.straight_ratio_cap}x × min(L,R)')
+    # stage4 v2 参数
+    if args.task in ('stage4', 'all'):
+        s4_pre = args.stage4_pre_turn_ms or args.pre_turn_ms
+        s4_rec = args.stage4_recover_ms or args.recover_ms
+        s4_fol = args.stage4_max_follow_frames or args.max_follow_frames
+        print(f'  ── Stage4 v2 ──')
+        print(f'  S4 pre_turn:  {s4_pre}ms')
+        print(f'  S4 recover:   {s4_rec}ms')
+        print(f'  S4 margin:    {args.stage4_turn_margin_ms}ms')
+        print(f'  S4 max_follow:   {s4_fol}')
+        print(f'  S4 max_approach: {args.stage4_max_approach_frames}')
+        print(f'  S4 max_turn:     {args.stage4_max_turn_frames}')
+        print(f'  S4 max_recover:  {args.stage4_max_recover_frames}')
+        print(f'  S4 policy:       {args.stage4_sample_policy}')
+        print(f'  S4 drop_no_fol:  {args.stage4_drop_runs_without_follow}')
+        print(f'  S4 min_follow:   {args.stage4_min_follow_frames}')
     print(f'  注意:   输入源已降采样, 不做二次激进抽样')
     print('=' * 70)
 
