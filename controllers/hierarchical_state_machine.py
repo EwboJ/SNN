@@ -1,0 +1,430 @@
+"""
+走廊导航层级状态机（与 ROS2 解耦，可离线/在线共用）
+=====================================================
+
+本模块只负责状态逻辑与角速度决策，不依赖 ROS2。
+可被 replay 脚本和后续在线节点共同调用。
+
+核心状态：
+  - BOOT
+  - STRAIGHTKEEP
+  - APPROACH
+  - TURN
+  - RECOVER
+
+输入 update() 的标准格式：
+{
+  "stage3": {
+    "pred_stage": "...",
+    "confidence": 0.0,
+    "probs": {"Approach": ..., "Turn": ..., "Recover": ...}
+  },
+  "junction_lr": {
+    "pred_label": "...",
+    "confidence": 0.0,
+    "probs": {"Left": ..., "Right": ...}
+  },
+  "straight_keep": {
+    "omega_cmd_raw": 0.0
+  }
+}
+"""
+
+from __future__ import annotations
+
+from collections import Counter, deque
+from copy import deepcopy
+from enum import Enum
+from typing import Any, Dict, Optional
+
+
+class NavState(Enum):
+    """导航状态枚举。"""
+    BOOT = 'BOOT'
+    STRAIGHTKEEP = 'STRAIGHTKEEP'
+    APPROACH = 'APPROACH'
+    TURN = 'TURN'
+    RECOVER = 'RECOVER'
+
+
+class HierarchicalNavigatorStateMachine:
+    """
+    走廊层级导航状态机。
+
+    设计要点：
+    1) 所有状态转移都使用窗口投票或连续计数，避免逐帧抖动。
+    2) junction 方向仅在进入 TURN 时锁存，TURN 期间不可修改。
+    3) RECOVER 通过线性混合逐步恢复 straight_keep 控制权。
+    """
+
+    def __init__(
+        self,
+        stage_window_size: int = 7,
+        stage_enter_turn_votes: int = 5,
+        stage_exit_turn_votes: int = 5,
+        junction_window_size: int = 5,
+        junction_lock_votes: int = 4,
+        recover_min_steps: int = 8,
+        boot_steps: int = 6,
+        straightkeep_suppress_in_turn: bool = True,
+        recover_blend_steps: int = 12,
+        # 可选控制参数（未在强制列表中，但便于工程接入）
+        left_turn_omega: float = 1.2,
+        right_turn_omega: float = -1.2,
+    ) -> None:
+        # 参数做安全裁剪，避免异常配置导致状态机不可用
+        self.stage_window_size = max(1, int(stage_window_size))
+        self.stage_enter_turn_votes = max(1, int(stage_enter_turn_votes))
+        self.stage_exit_turn_votes = max(1, int(stage_exit_turn_votes))
+        self.junction_window_size = max(1, int(junction_window_size))
+        self.junction_lock_votes = max(1, int(junction_lock_votes))
+        self.recover_min_steps = max(1, int(recover_min_steps))
+        self.boot_steps = max(0, int(boot_steps))
+        self.straightkeep_suppress_in_turn = bool(straightkeep_suppress_in_turn)
+        self.recover_blend_steps = max(1, int(recover_blend_steps))
+
+        self.left_turn_omega = float(left_turn_omega)
+        self.right_turn_omega = float(right_turn_omega)
+
+        # 历史窗口（用于投票迟滞）
+        self._stage_hist = deque(maxlen=self.stage_window_size)
+        self._junction_hist = deque(maxlen=self.junction_window_size)
+
+        self.reset()
+
+    def reset(self) -> None:
+        """
+        重置状态机。
+        建议每个 run 开始前调用一次。
+        """
+        self.state: NavState = NavState.BOOT
+        self.locked_turn_dir: Optional[str] = None
+        self.global_step: int = 0
+        self.state_step: int = 0
+        self._recover_support_count: int = 0
+        self._stage_hist.clear()
+        self._junction_hist.clear()
+
+    @staticmethod
+    def _safe_float(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _normalize_stage_name(name: Any) -> Optional[str]:
+        if name is None:
+            return None
+        s = str(name).strip().lower()
+        mapping = {
+            'approach': 'Approach',
+            'turn': 'Turn',
+            'recover': 'Recover',
+        }
+        return mapping.get(s, None)
+
+    @staticmethod
+    def _normalize_turn_dir(name: Any) -> Optional[str]:
+        if name is None:
+            return None
+        s = str(name).strip().lower()
+        mapping = {
+            'left': 'Left',
+            'l': 'Left',
+            'right': 'Right',
+            'r': 'Right',
+        }
+        return mapping.get(s, None)
+
+    @staticmethod
+    def _argmax_key(d: Any) -> Optional[str]:
+        if not isinstance(d, dict) or not d:
+            return None
+        best_k = None
+        best_v = None
+        for k, v in d.items():
+            try:
+                vf = float(v)
+            except Exception:
+                continue
+            if best_v is None or vf > best_v:
+                best_v = vf
+                best_k = str(k)
+        return best_k
+
+    def _parse_stage_pred(self, stage_out: Dict[str, Any]) -> Optional[str]:
+        # 优先 pred_stage，其次 probs argmax，其次 pred_id 兜底
+        stage_name = self._normalize_stage_name(stage_out.get('pred_stage'))
+        if stage_name:
+            return stage_name
+
+        k = self._argmax_key(stage_out.get('probs'))
+        stage_name = self._normalize_stage_name(k)
+        if stage_name:
+            return stage_name
+
+        pid = stage_out.get('pred_id', None)
+        id_map = {0: 'Approach', 1: 'Turn', 2: 'Recover'}
+        try:
+            return id_map.get(int(pid), None)
+        except Exception:
+            return None
+
+    def _parse_junction_pred(self, junction_out: Dict[str, Any]) -> Optional[str]:
+        # 优先 pred_label，其次 probs argmax，其次 pred_id 兜底
+        turn_dir = self._normalize_turn_dir(junction_out.get('pred_label'))
+        if turn_dir:
+            return turn_dir
+
+        k = self._argmax_key(junction_out.get('probs'))
+        turn_dir = self._normalize_turn_dir(k)
+        if turn_dir:
+            return turn_dir
+
+        pid = junction_out.get('pred_id', None)
+        id_map = {0: 'Left', 1: 'Right'}
+        try:
+            return id_map.get(int(pid), None)
+        except Exception:
+            return None
+
+    def _majority_threshold(self) -> int:
+        return self.stage_window_size // 2 + 1
+
+    def _get_stage_counts(self) -> Counter:
+        return Counter(self._stage_hist)
+
+    def _get_junction_counts(self) -> Counter:
+        return Counter(self._junction_hist)
+
+    def _get_stage_majority(self, counts: Counter) -> Optional[str]:
+        # 固定优先级保证可复现（同票时不随机）
+        order = ('Approach', 'Turn', 'Recover')
+        best_label = None
+        best_count = -1
+        for lb in order:
+            c = int(counts.get(lb, 0))
+            if c > best_count:
+                best_count = c
+                best_label = lb
+        if best_count >= self._majority_threshold():
+            return best_label
+        return None
+
+    def _get_junction_locked_candidate(self, counts: Counter) -> Optional[str]:
+        # Left/Right 任一满足锁存票数即可
+        left_c = int(counts.get('Left', 0))
+        right_c = int(counts.get('Right', 0))
+        if left_c >= self.junction_lock_votes and left_c >= right_c:
+            return 'Left'
+        if right_c >= self.junction_lock_votes and right_c > left_c:
+            return 'Right'
+        return None
+
+    def _fixed_turn_omega(self, turn_dir: Optional[str]) -> float:
+        if turn_dir == 'Left':
+            return self.left_turn_omega
+        if turn_dir == 'Right':
+            return self.right_turn_omega
+        return 0.0
+
+    def _transition(self, to_state: NavState, reason: str) -> Dict[str, Any]:
+        from_state = self.state
+        self.state = to_state
+        self.state_step = 0
+        return {
+            'from': from_state.name,
+            'to': to_state.name,
+            'reason': reason,
+        }
+
+    def update(self, module_outputs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        更新状态机并输出当前控制结果。
+
+        Args:
+            module_outputs: 三个子模块当前帧输出。
+
+        Returns:
+            dict:
+              - state
+              - locked_turn_dir
+              - omega_cmd_final
+              - submodule_outputs
+              - debug
+        """
+        # ===== 1) 读取输入并做安全兜底 =====
+        stage_out = deepcopy(module_outputs.get('stage3', {}) or {})
+        junction_out = deepcopy(module_outputs.get('junction_lr', {}) or {})
+        straight_out = deepcopy(module_outputs.get('straight_keep', {}) or {})
+
+        stage_pred = self._parse_stage_pred(stage_out)
+        junction_pred = self._parse_junction_pred(junction_out)
+        omega_raw = self._safe_float(straight_out.get('omega_cmd_raw', 0.0), 0.0)
+
+        # ===== 2) 更新时间步与历史窗口 =====
+        self.global_step += 1
+        self.state_step += 1
+
+        if stage_pred is not None:
+            self._stage_hist.append(stage_pred)
+
+        # 仅在 APPROACH 缓存 junction 方向，避免旧窗口污染
+        if self.state == NavState.APPROACH:
+            if junction_pred is not None:
+                self._junction_hist.append(junction_pred)
+        elif self.state in (NavState.BOOT, NavState.STRAIGHTKEEP):
+            self._junction_hist.clear()
+
+        stage_counts = self._get_stage_counts()
+        junction_counts = self._get_junction_counts()
+        stage_majority = self._get_stage_majority(stage_counts)
+        junction_candidate = self._get_junction_locked_candidate(junction_counts)
+
+        approach_votes = int(stage_counts.get('Approach', 0))
+        turn_votes = int(stage_counts.get('Turn', 0))
+        recover_votes = int(stage_counts.get('Recover', 0))
+        majority_thr = self._majority_threshold()
+        enter_turn_thr = max(majority_thr, self.stage_enter_turn_votes)
+
+        transition_info = None
+
+        # ===== 3) 状态转移逻辑（含迟滞） =====
+        if self.state == NavState.BOOT:
+            # BOOT 预热完成后进入 STRAIGHTKEEP
+            if self.state_step >= self.boot_steps:
+                transition_info = self._transition(
+                    NavState.STRAIGHTKEEP,
+                    f'boot_steps_reached({self.boot_steps})'
+                )
+
+        elif self.state == NavState.STRAIGHTKEEP:
+            # 进入直行时清除本次转弯锁存
+            self.locked_turn_dir = None
+            self._recover_support_count = 0
+            # STRAIGHTKEEP -> APPROACH: stage3 Approach 多数投票
+            if approach_votes >= majority_thr:
+                transition_info = self._transition(
+                    NavState.APPROACH,
+                    f'approach_votes({approach_votes}) >= majority({majority_thr})'
+                )
+                # 新一次接近路口，重新累计 junction 投票
+                self._junction_hist.clear()
+
+        elif self.state == NavState.APPROACH:
+            # APPROACH -> TURN: Turn 投票达到阈值 + junction 满足锁存条件
+            if turn_votes >= enter_turn_thr and junction_candidate is not None:
+                self.locked_turn_dir = junction_candidate
+                transition_info = self._transition(
+                    NavState.TURN,
+                    f'turn_votes({turn_votes}) >= enter_turn_thr({enter_turn_thr}) '
+                    f'and junction_lock={junction_candidate}'
+                )
+                self._recover_support_count = 0
+            else:
+                # 若长时间未形成 Turn，可回到 STRAIGHTKEEP（避免卡在 APPROACH）
+                if self.state_step >= self.stage_window_size and approach_votes < majority_thr:
+                    transition_info = self._transition(
+                        NavState.STRAIGHTKEEP,
+                        'approach_not_stable_fallback_to_straightkeep'
+                    )
+                    self._junction_hist.clear()
+
+        elif self.state == NavState.TURN:
+            # TURN 期间方向锁存不可改写（关键约束）
+            if stage_pred == 'Recover':
+                self._recover_support_count += 1
+            else:
+                self._recover_support_count = 0
+
+            # TURN -> RECOVER: 需要连续 Recover 支持
+            if self._recover_support_count >= self.stage_exit_turn_votes:
+                transition_info = self._transition(
+                    NavState.RECOVER,
+                    f'consecutive_recover({self._recover_support_count}) '
+                    f'>= exit_turn_votes({self.stage_exit_turn_votes})'
+                )
+
+        elif self.state == NavState.RECOVER:
+            # RECOVER 保持至少 recover_min_steps，且 Turn 不再占多数后回到 STRAIGHTKEEP
+            if self.state_step >= self.recover_min_steps and turn_votes < majority_thr:
+                transition_info = self._transition(
+                    NavState.STRAIGHTKEEP,
+                    f'recover_stable(state_step={self.state_step}, turn_votes={turn_votes})'
+                )
+                self.locked_turn_dir = None
+                self._recover_support_count = 0
+                self._junction_hist.clear()
+
+        # ===== 4) 计算最终角速度输出 =====
+        turn_omega = self._fixed_turn_omega(self.locked_turn_dir)
+        recover_alpha = 1.0
+
+        if self.state == NavState.BOOT:
+            omega_cmd_final = 0.0
+        elif self.state in (NavState.STRAIGHTKEEP, NavState.APPROACH):
+            # 直行和接近阶段，主要采用 straight_keep 输出
+            omega_cmd_final = omega_raw
+        elif self.state == NavState.TURN:
+            # TURN 阶段按锁存方向执行固定转向控制
+            if self.straightkeep_suppress_in_turn:
+                omega_cmd_final = turn_omega
+            else:
+                # 非抑制模式下给少量 straight_keep 权重
+                omega_cmd_final = 0.7 * turn_omega + 0.3 * omega_raw
+        elif self.state == NavState.RECOVER:
+            # RECOVER 阶段线性混合: 从 turn 控制逐步过渡到 straight_keep
+            recover_alpha = min(1.0, self.state_step / float(self.recover_blend_steps))
+            omega_cmd_final = (1.0 - recover_alpha) * turn_omega + recover_alpha * omega_raw
+        else:
+            omega_cmd_final = omega_raw
+
+        # ===== 5) 组织调试输出 =====
+        debug = {
+            'global_step': self.global_step,
+            'state_step': self.state_step,
+            'stage_pred': stage_pred,
+            'junction_pred': junction_pred,
+            'stage_votes': {
+                'Approach': approach_votes,
+                'Turn': turn_votes,
+                'Recover': recover_votes,
+            },
+            'junction_votes': {
+                'Left': int(junction_counts.get('Left', 0)),
+                'Right': int(junction_counts.get('Right', 0)),
+            },
+            'stage_majority': stage_majority,
+            'junction_candidate': junction_candidate,
+            'recover_support_count': self._recover_support_count,
+            'thresholds': {
+                'stage_majority': majority_thr,
+                'stage_enter_turn_votes': enter_turn_thr,
+                'stage_exit_turn_votes': self.stage_exit_turn_votes,
+                'junction_lock_votes': self.junction_lock_votes,
+                'recover_min_steps': self.recover_min_steps,
+            },
+            'omega_components': {
+                'straight_keep_raw': float(omega_raw),
+                'turn_component': float(turn_omega),
+                'recover_alpha': float(recover_alpha),
+            },
+            'transition': transition_info,
+        }
+
+        return {
+            'state': self.state.name,
+            'locked_turn_dir': self.locked_turn_dir,
+            'omega_cmd_final': float(omega_cmd_final),
+            'submodule_outputs': {
+                'stage3': stage_out,
+                'junction_lr': junction_out,
+                'straight_keep': straight_out,
+            },
+            'debug': debug,
+        }
+
+
+__all__ = ['NavState', 'HierarchicalNavigatorStateMachine']
+

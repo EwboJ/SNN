@@ -1,0 +1,43 @@
+# 层级导航统一配置
+# 用途:
+# - replay 离线复现
+# - ROS2 在线节点
+# 说明:
+# - 默认值面向 48x64 输入主线
+# - checkpoint 路径为示例相对路径, 可按实验结果替换
+
+system:
+  image_h: 48              # 输入图像高度, 与训练 img_h 对齐
+  image_w: 64              # 输入图像宽度, 与训练 img_w 对齐
+  control_rate_hz: 10      # 状态机更新频率(Hz)
+
+models:
+  junction_lr_ckpt: "checkpoint/corridor_task/corridor_task_junction_lr_APLIF_ADD_T4/best_model.ckpt"      # 左右判定模型
+  stage3_ckpt: "checkpoint/corridor_task/corridor_task_stage3_APLIF_ADD_T4/best_model.ckpt"                # 三阶段模型
+  straight_keep_ckpt: "checkpoint/corridor/straight_keep_reg_APLIF_ADD_T4_seq4/best_model.ckpt"            # 直行纠偏回归模型
+
+state_machine:
+  boot_steps: 6                       # 启动预热步数, 抑制首帧抖动
+  stage_window_size: 7                # stage3 多帧投票窗口大小
+  stage_enter_turn_votes: 5           # 进入 Turn 所需最少票数
+  stage_exit_turn_votes: 5            # 退出 Turn 所需最少票数
+  junction_window_size: 5             # junction 左右投票窗口大小
+  junction_lock_votes: 4              # 锁定 Left/Right 所需最少票数
+  recover_min_steps: 8                # Recover 最少保持步数
+  recover_blend_steps: 12             # Recover 到直行阶段的融合步数
+  straightkeep_suppress_in_turn: true # Turn 期间抑制 straight_keep 输出
+
+turn_control:
+  left_omega: 1.2             # 固定左转角速度(rad/s)
+  right_omega: -1.2           # 固定右转角速度(rad/s)
+  use_fixed_turn_rate: true   # Turn 阶段使用固定角速度
+  max_turn_steps: 20          # Turn 最长持续步数, 防止卡死
+
+straight_keep:
+  omega_clip: 1.2             # 回归输出角速度裁剪阈值
+  use_clip: true              # 是否启用裁剪
+
+logging:
+  save_debug_json: true       # 保存逐步状态与决策信息(json)
+  save_csv: true              # 保存关键时序信息(csv)
+  verbose: true               # 控制台打印详细日志
