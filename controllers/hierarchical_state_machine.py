@@ -28,6 +28,23 @@
     "omega_cmd_raw": 0.0
   }
 }
+
+示例：
+    sm = HierarchicalNavigatorStateMachine(
+        stage_window_size=7,
+        stage_enter_turn_votes=5,
+        stage_exit_turn_votes=5,
+        junction_window_size=5,
+        junction_lock_votes=4,
+        recover_min_steps=8,
+        boot_steps=6,
+        straightkeep_suppress_in_turn=True,
+        recover_blend_steps=12,
+        max_turn_steps=20,
+        use_fixed_turn_rate=True,
+        omega_clip=1.2,
+        use_clip=True,
+    )
 """
 
 from __future__ import annotations
@@ -68,6 +85,10 @@ class HierarchicalNavigatorStateMachine:
         boot_steps: int = 6,
         straightkeep_suppress_in_turn: bool = True,
         recover_blend_steps: int = 12,
+        max_turn_steps: int = 20,
+        use_fixed_turn_rate: bool = True,
+        omega_clip: float = 1.2,
+        use_clip: bool = True,
         # 可选控制参数（未在强制列表中，但便于工程接入）
         left_turn_omega: float = 1.2,
         right_turn_omega: float = -1.2,
@@ -82,6 +103,11 @@ class HierarchicalNavigatorStateMachine:
         self.boot_steps = max(0, int(boot_steps))
         self.straightkeep_suppress_in_turn = bool(straightkeep_suppress_in_turn)
         self.recover_blend_steps = max(1, int(recover_blend_steps))
+        # 与 hierarchical_nav.yaml 对齐的系统级控制参数
+        self.max_turn_steps = max(1, int(max_turn_steps))
+        self.use_fixed_turn_rate = bool(use_fixed_turn_rate)
+        self.omega_clip = max(0.0, float(omega_clip))
+        self.use_clip = bool(use_clip)
 
         self.left_turn_omega = float(left_turn_omega)
         self.right_turn_omega = float(right_turn_omega)
@@ -289,6 +315,7 @@ class HierarchicalNavigatorStateMachine:
         enter_turn_thr = max(majority_thr, self.stage_enter_turn_votes)
 
         transition_info = None
+        turn_timeout_triggered = False
 
         # ===== 3) 状态转移逻辑（含迟滞） =====
         if self.state == NavState.BOOT:
@@ -333,18 +360,27 @@ class HierarchicalNavigatorStateMachine:
 
         elif self.state == NavState.TURN:
             # TURN 期间方向锁存不可改写（关键约束）
-            if stage_pred == 'Recover':
-                self._recover_support_count += 1
-            else:
-                self._recover_support_count = 0
-
-            # TURN -> RECOVER: 需要连续 Recover 支持
-            if self._recover_support_count >= self.stage_exit_turn_votes:
+            # TURN 超时保护：即使 Recover 支持不足，也要强制转入 RECOVER
+            if self.state_step >= self.max_turn_steps:
+                turn_timeout_triggered = True
                 transition_info = self._transition(
                     NavState.RECOVER,
-                    f'consecutive_recover({self._recover_support_count}) '
-                    f'>= exit_turn_votes({self.stage_exit_turn_votes})'
+                    'turn_timeout'
                 )
+                self._recover_support_count = 0
+            else:
+                if stage_pred == 'Recover':
+                    self._recover_support_count += 1
+                else:
+                    self._recover_support_count = 0
+
+                # TURN -> RECOVER: 需要连续 Recover 支持
+                if self._recover_support_count >= self.stage_exit_turn_votes:
+                    transition_info = self._transition(
+                        NavState.RECOVER,
+                        f'consecutive_recover({self._recover_support_count}) '
+                        f'>= exit_turn_votes({self.stage_exit_turn_votes})'
+                    )
 
         elif self.state == NavState.RECOVER:
             # RECOVER 保持至少 recover_min_steps，且 Turn 不再占多数后回到 STRAIGHTKEEP
@@ -360,6 +396,7 @@ class HierarchicalNavigatorStateMachine:
         # ===== 4) 计算最终角速度输出 =====
         turn_omega = self._fixed_turn_omega(self.locked_turn_dir)
         recover_alpha = 1.0
+        turn_mix_ratio = 0.0
 
         if self.state == NavState.BOOT:
             omega_cmd_final = 0.0
@@ -367,18 +404,34 @@ class HierarchicalNavigatorStateMachine:
             # 直行和接近阶段，主要采用 straight_keep 输出
             omega_cmd_final = omega_raw
         elif self.state == NavState.TURN:
-            # TURN 阶段按锁存方向执行固定转向控制
-            if self.straightkeep_suppress_in_turn:
+            # TURN 阶段按配置切换控制策略，且锁存方向始终主导
+            if self.use_fixed_turn_rate:
                 omega_cmd_final = turn_omega
             else:
-                # 非抑制模式下给少量 straight_keep 权重
-                omega_cmd_final = 0.7 * turn_omega + 0.3 * omega_raw
+                # 允许少量 straight_keep 混合；suppress=True 时混合更弱
+                turn_mix_ratio = 0.1 if self.straightkeep_suppress_in_turn else 0.3
+                omega_cmd_final = ((1.0 - turn_mix_ratio) * turn_omega
+                                   + turn_mix_ratio * omega_raw)
+                # 强约束：转向方向以锁存方向为主，防止反向穿越
+                if turn_omega != 0.0 and (omega_cmd_final * turn_omega) < 0.0:
+                    sign = 1.0 if turn_omega > 0.0 else -1.0
+                    omega_cmd_final = sign * abs(omega_cmd_final)
         elif self.state == NavState.RECOVER:
             # RECOVER 阶段线性混合: 从 turn 控制逐步过渡到 straight_keep
             recover_alpha = min(1.0, self.state_step / float(self.recover_blend_steps))
             omega_cmd_final = (1.0 - recover_alpha) * turn_omega + recover_alpha * omega_raw
         else:
             omega_cmd_final = omega_raw
+
+        # 统一裁剪：在最终角速度上执行系统级安全限制
+        omega_before_clip = float(omega_cmd_final)
+        clip_applied = False
+        if self.use_clip:
+            low = -abs(self.omega_clip)
+            high = abs(self.omega_clip)
+            omega_cmd_final = max(low, min(high, float(omega_cmd_final)))
+            clip_applied = (abs(omega_cmd_final - omega_before_clip) > 1e-12)
+        omega_after_clip = float(omega_cmd_final)
 
         # ===== 5) 组织调试输出 =====
         debug = {
@@ -404,12 +457,19 @@ class HierarchicalNavigatorStateMachine:
                 'stage_exit_turn_votes': self.stage_exit_turn_votes,
                 'junction_lock_votes': self.junction_lock_votes,
                 'recover_min_steps': self.recover_min_steps,
+                'max_turn_steps': self.max_turn_steps,
             },
             'omega_components': {
                 'straight_keep_raw': float(omega_raw),
                 'turn_component': float(turn_omega),
                 'recover_alpha': float(recover_alpha),
+                'turn_mix_ratio': float(turn_mix_ratio),
+                'use_fixed_turn_rate': bool(self.use_fixed_turn_rate),
             },
+            'turn_timeout_triggered': bool(turn_timeout_triggered),
+            'clip_applied': bool(clip_applied),
+            'omega_before_clip': float(omega_before_clip),
+            'omega_after_clip': float(omega_after_clip),
             'transition': transition_info,
         }
 
@@ -427,4 +487,3 @@ class HierarchicalNavigatorStateMachine:
 
 
 __all__ = ['NavState', 'HierarchicalNavigatorStateMachine']
-
