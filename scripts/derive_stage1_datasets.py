@@ -2,11 +2,12 @@
 走廊导航阶段一数据集派生脚本
 ================================
 从已经 downsample 并完成 train/val/test 划分的 corridor 数据中,
-派生三个任务数据集:
+派生四个任务数据集:
 
   A) action3_balanced_v1  — 三分类 (Left / Straight / Right)
   B) junction_lr_v1       — 二分类 (Left / Right), 仅转弯窗口
-  C) stage4_v1            — 四分类 (Follow / Approach / Turn / Recover)
+  C) stage3_v1            — 三分类 (Approach / Turn / Recover)
+  D) stage4_v1            — 四分类 (Follow / Approach / Turn / Recover)
 
 重要假设:
   输入数据已经经过 downsample_corridor.py 智能降采样,
@@ -18,6 +19,9 @@
 
   # 仅派生 action3_balanced
   python scripts/derive_stage1_datasets.py --src_root ./data/corridor --dst_root ./data/stage1 --task action3_balanced
+
+  # 仅派生 stage3
+  python scripts/derive_stage1_datasets.py --src_root ./data/corridor --dst_root ./data/stage1 --task stage3 --force
 
   # 自定义参数
   python scripts/derive_stage1_datasets.py --src_root ./data/corridor --dst_root ./data/stage1 --task all --pre_turn_ms 2000 --recover_ms 1800 --force
