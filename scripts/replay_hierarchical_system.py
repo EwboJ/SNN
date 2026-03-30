@@ -1,32 +1,33 @@
 """
-层级导航系统离线回放脚本（不依赖 ROS2）
-=========================================
+层级导航系统离线回放脚本（系统级研究分析版，不依赖 ROS2）
+=========================================================
 
 功能：
-1) 读取层级导航配置（configs/hierarchical_nav.yaml）
-2) 逐帧调用三个推理模块（stage3 / junction_lr / straight_keep）
-3) 调用层级状态机 update() 得到最终控制输出
-4) 生成回放时间轴与统计结果
+1. 读取层级导航配置（configs/hierarchical_nav.yaml）
+2. 逐帧调用三模块推理（stage3 / junction_lr / straight_keep）
+3. 调用层级状态机 update() 得到系统级控制输出
+4. 输出回放轨迹、汇总统计和时间轴图
 
 输入 run 目录要求：
   - 必须包含 images/
   - 可选 labels.csv（若存在，优先按其 image_name 顺序回放）
-  - 可选 metadata（如 meta.json）
+  - 可选 meta.json
 
 输出文件：
   - replay_trace.csv
   - replay_summary.json
   - state_timeline.png
+  - replay_debug.json（当 logging.save_debug_json=true）
 
 示例命令：
-  # 在单个 run 上调试
+  # 常规回放（读取 yaml 中模型路径与状态机参数）
   python scripts/replay_hierarchical_system.py ^
       --run_dir data/corridor/test/J1_left_r02 ^
       --config configs/hierarchical_nav.yaml ^
       --out_dir results/replay_J1_left_r02 ^
       --device cuda:0
 
-  # 先小样本快速检查
+  # 快速调试前 120 帧
   python scripts/replay_hierarchical_system.py ^
       --run_dir data/corridor/test/J1_left_r02 ^
       --max_steps 120
@@ -52,7 +53,7 @@ except ImportError as exc:  # pragma: no cover
     raise RuntimeError('缺少依赖 PyYAML，请先安装: pip install pyyaml') from exc
 
 
-# 让脚本可直接从仓库根目录运行
+# 允许脚本在仓库根目录直接运行
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_THIS_DIR)
 if _REPO_ROOT not in sys.path:
@@ -69,7 +70,7 @@ from controllers.hierarchical_state_machine import (  # noqa: E402
 
 
 def _natural_key(text: str) -> List[Any]:
-    """用于文件名自然排序（0002.jpg 在 0010.jpg 前）。"""
+    """文件名自然排序 key（例如 2 < 10）。"""
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', text)]
 
 
@@ -83,13 +84,13 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 def _resolve_path(path_str: str, base_dir: Optional[str] = None) -> str:
     """
     解析路径：
-    - 绝对路径直接返回
-    - 相对路径优先相对 base_dir，再相对仓库根目录
+    - 绝对路径直接返回；
+    - 相对路径优先相对 base_dir，再相对仓库根目录。
     """
     if os.path.isabs(path_str):
         return path_str
 
-    candidates = []
+    candidates: List[str] = []
     if base_dir:
         candidates.append(os.path.abspath(os.path.join(base_dir, path_str)))
     candidates.append(os.path.abspath(os.path.join(_REPO_ROOT, path_str)))
@@ -98,7 +99,6 @@ def _resolve_path(path_str: str, base_dir: Optional[str] = None) -> str:
     for p in candidates:
         if os.path.exists(p):
             return p
-    # 即使不存在，也返回最符合工程习惯的路径
     return candidates[0]
 
 
@@ -136,8 +136,8 @@ def _load_labels_rows(labels_csv: str) -> Tuple[List[Dict[str, Any]], List[str]]
 def _collect_frames(run_dir: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     收集回放帧：
-    1) 若 labels.csv 存在且有 image_name，优先按 labels 顺序；
-    2) 否则按 images/ 文件名自然排序。
+    1) labels.csv 存在且包含 image_name 时，按 labels 顺序回放；
+    2) 否则按 images/ 文件名自然排序回放。
     """
     images_dir = os.path.join(run_dir, 'images')
     if not os.path.isdir(images_dir):
@@ -177,9 +177,56 @@ def _collect_frames(run_dir: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     return frames, label_fields
 
 
+def _normalize_phase(phase: str) -> str:
+    """将 phase 文本规整到 Approach/Turn/Recover；无法识别返回空串。"""
+    s = str(phase or '').strip().lower()
+    if s == 'approach':
+        return 'Approach'
+    if s == 'turn':
+        return 'Turn'
+    if s == 'recover':
+        return 'Recover'
+    return ''
+
+
+def _infer_gt_turn_dir(run_name: str) -> str:
+    """
+    从 run_name 推断真实转向方向：
+      *_left_*  -> Left
+      *_right_* -> Right
+    """
+    s = str(run_name or '').strip().lower()
+    if re.search(r'(^|_)left(_|$)', s):
+        return 'Left'
+    if re.search(r'(^|_)right(_|$)', s):
+        return 'Right'
+    return ''
+
+
+def _compress_state_sequence(states: List[str]) -> List[str]:
+    """将状态序列压缩为首次变化序列，用于论文展示状态链路。"""
+    seq: List[str] = []
+    prev = None
+    for st in states:
+        if st != prev:
+            seq.append(st)
+            prev = st
+    return seq
+
+
+def _first_step_with_state(trace_rows: List[Dict[str, Any]], target_state: str) -> Optional[int]:
+    for r in trace_rows:
+        if str(r.get('state', '')) == target_state:
+            return int(r['step_idx'])
+    return None
+
+
 def _build_state_machine(cfg: Dict[str, Any]) -> HierarchicalNavigatorStateMachine:
+    """根据 yaml 参数构建状态机（与配置字段完整对齐）。"""
     sm_cfg = deepcopy(cfg.get('state_machine', {}) or {})
     turn_cfg = deepcopy(cfg.get('turn_control', {}) or {})
+    sk_cfg = deepcopy(cfg.get('straight_keep', {}) or {})
+
     return HierarchicalNavigatorStateMachine(
         stage_window_size=sm_cfg.get('stage_window_size', 7),
         stage_enter_turn_votes=sm_cfg.get('stage_enter_turn_votes', 5),
@@ -190,6 +237,12 @@ def _build_state_machine(cfg: Dict[str, Any]) -> HierarchicalNavigatorStateMachi
         boot_steps=sm_cfg.get('boot_steps', 6),
         straightkeep_suppress_in_turn=sm_cfg.get('straightkeep_suppress_in_turn', True),
         recover_blend_steps=sm_cfg.get('recover_blend_steps', 12),
+        # 关键增强参数（来自 hierarchical_nav.yaml）
+        max_turn_steps=turn_cfg.get('max_turn_steps', 20),
+        use_fixed_turn_rate=turn_cfg.get('use_fixed_turn_rate', True),
+        omega_clip=sk_cfg.get('omega_clip', 1.2),
+        use_clip=sk_cfg.get('use_clip', True),
+        # 保留原有转向角速度参数
         left_turn_omega=turn_cfg.get('left_omega', 1.2),
         right_turn_omega=turn_cfg.get('right_omega', -1.2),
     )
@@ -197,60 +250,44 @@ def _build_state_machine(cfg: Dict[str, Any]) -> HierarchicalNavigatorStateMachi
 
 def _plot_state_timeline(trace_rows: List[Dict[str, Any]], out_png: str) -> None:
     """
-    绘制系统时间轴图：
-    - 状态随时间变化
-    - stage3 预测
-    - junction_lr 预测（同时显示锁存方向）
-    - straight_keep 原始角速度与最终角速度
+    绘制 4 行时间轴图：
+    1) 状态 state
+    2) stage3 预测 + gt_phase（若可得）
+    3) junction 预测方向 + 锁存方向
+    4) omega_raw 与 omega_final
     """
     if not trace_rows:
-        # 空数据时输出一张占位图，避免流程中断
         Image.new('RGB', (1280, 720), color=(255, 255, 255)).save(out_png)
         return
 
-    # 延迟导入，避免环境中 matplotlib/numpy 二进制冲突导致脚本无法启动
+    # 延迟导入：避免环境中 matplotlib/numpy 版本冲突导致脚本启动失败
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
     except Exception as e:  # pragma: no cover
-        # 兜底：仍然写出 png，提示需要 matplotlib 才能获得完整可视化
         from PIL import ImageDraw
         canvas = Image.new('RGB', (1400, 900), color=(255, 255, 255))
         draw = ImageDraw.Draw(canvas)
-        text = [
+        lines = [
             'state_timeline.png (fallback)',
             '当前环境无法导入 matplotlib，已输出占位图。',
             f'错误: {e}',
             '',
-            '建议安装兼容版本后重跑，以生成完整时间轴曲线图。',
-            '例如：pip install --upgrade matplotlib numpy',
+            '建议安装兼容版本后重跑以生成完整曲线图。',
+            '例如: pip install --upgrade matplotlib numpy',
         ]
         y = 40
-        for line in text:
+        for line in lines:
             draw.text((40, y), line, fill=(20, 20, 20))
-            y += 36
+            y += 34
         canvas.save(out_png)
         return
 
     steps = [int(r['step_idx']) for r in trace_rows]
-
-    state_map = {
-        'BOOT': 0,
-        'STRAIGHTKEEP': 1,
-        'APPROACH': 2,
-        'TURN': 3,
-        'RECOVER': 4,
-    }
-    stage_map = {
-        'Approach': 0,
-        'Turn': 1,
-        'Recover': 2,
-    }
-    turn_map = {
-        'Left': 0,
-        'Right': 1,
-    }
+    state_map = {'BOOT': 0, 'STRAIGHTKEEP': 1, 'APPROACH': 2, 'TURN': 3, 'RECOVER': 4}
+    stage_map = {'Approach': 0, 'Turn': 1, 'Recover': 2}
+    turn_map = {'Left': 0, 'Right': 1}
 
     state_vals = [state_map.get(str(r.get('state', '')), -1) for r in trace_rows]
     stage_vals = [stage_map.get(str(r.get('pred_stage', '')), -1) for r in trace_rows]
@@ -258,6 +295,11 @@ def _plot_state_timeline(trace_rows: List[Dict[str, Any]], out_png: str) -> None
     locked_turn_vals = [turn_map.get(str(r.get('locked_turn_dir', '')), -1) for r in trace_rows]
     omega_raw_vals = [_safe_float(r.get('omega_cmd_raw', 0.0), 0.0) for r in trace_rows]
     omega_final_vals = [_safe_float(r.get('omega_cmd_final', 0.0), 0.0) for r in trace_rows]
+
+    # gt_phase 可选覆盖
+    gt_phase_vals = [stage_map.get(_normalize_phase(r.get('gt_phase', '')), -1)
+                     for r in trace_rows]
+    gt_valid_idx = [i for i, v in enumerate(gt_phase_vals) if v >= 0]
 
     fig, axes = plt.subplots(4, 1, figsize=(16, 12), sharex=True)
 
@@ -270,7 +312,13 @@ def _plot_state_timeline(trace_rows: List[Dict[str, Any]], out_png: str) -> None
     ax.grid(alpha=0.25)
 
     ax = axes[1]
-    ax.plot(steps, stage_vals, drawstyle='steps-post', lw=1.6, color='#43A047')
+    ax.plot(steps, stage_vals, drawstyle='steps-post', lw=1.6,
+            color='#43A047', label='stage3_pred')
+    if gt_valid_idx:
+        ax.scatter([steps[i] for i in gt_valid_idx],
+                   [gt_phase_vals[i] for i in gt_valid_idx],
+                   s=12, marker='x', color='#E53935', alpha=0.8, label='gt_phase')
+        ax.legend(loc='upper right')
     ax.set_yticks([0, 1, 2])
     ax.set_yticklabels(['Approach', 'Turn', 'Recover'])
     ax.set_ylabel('Stage3')
@@ -306,35 +354,42 @@ def run_replay(args: argparse.Namespace) -> None:
     cfg = _load_yaml(config_path)
     cfg_dir = os.path.dirname(config_path)
 
+    # logging 配置（真正生效）
+    log_cfg = deepcopy(cfg.get('logging', {}) or {})
+    save_debug_json = bool(log_cfg.get('save_debug_json', True))
+    save_csv = bool(log_cfg.get('save_csv', True))
+    verbose = bool(log_cfg.get('verbose', True))
+
+    def vprint(msg: str) -> None:
+        if verbose:
+            print(msg)
+
     run_dir = _resolve_path(args.run_dir, base_dir=_REPO_ROOT)
     if not os.path.isdir(run_dir):
         raise FileNotFoundError(f'run_dir 不存在: {run_dir}')
 
-    # 输出目录默认按 run 名命名
     if args.out_dir:
         out_dir = _resolve_path(args.out_dir, base_dir=_REPO_ROOT)
     else:
-        out_dir = os.path.join(_REPO_ROOT, 'results',
-                               f'replay_{os.path.basename(run_dir)}')
+        out_dir = os.path.join(_REPO_ROOT, 'results', f'replay_{os.path.basename(run_dir)}')
     os.makedirs(out_dir, exist_ok=True)
 
-    # 读取可选 metadata
     meta_json = _load_optional_json(os.path.join(run_dir, 'meta.json'))
-
-    # 收集帧
     frames, label_fields = _collect_frames(run_dir)
     if args.max_steps is not None and args.max_steps > 0:
         frames = frames[:args.max_steps]
 
-    print('=' * 72)
-    print('[Replay] 层级导航系统离线回放')
-    print(f'  配置文件:   {config_path}')
-    print(f'  run 目录:   {run_dir}')
-    print(f'  帧数量:     {len(frames)}')
-    print(f'  输出目录:   {out_dir}')
-    print('=' * 72)
+    vprint('=' * 72)
+    vprint('[Replay] 层级导航系统离线回放')
+    vprint(f'  配置文件:   {config_path}')
+    vprint(f'  run 目录:   {run_dir}')
+    vprint(f'  帧数量:     {len(frames)}')
+    vprint(f'  输出目录:   {out_dir}')
+    vprint(f'  logging:    save_debug_json={save_debug_json}, '
+           f'save_csv={save_csv}, verbose={verbose}')
+    vprint('=' * 72)
 
-    # ===== 1) 加载三个推理模块 =====
+    # 1) 三模块推理封装
     model_cfg = cfg.get('models', {}) or {}
     stage3_ckpt = _resolve_path(str(model_cfg.get('stage3_ckpt', '')), base_dir=cfg_dir)
     junction_ckpt = _resolve_path(str(model_cfg.get('junction_lr_ckpt', '')), base_dir=cfg_dir)
@@ -344,21 +399,28 @@ def run_replay(args: argparse.Namespace) -> None:
     junction_infer = JunctionLRInfer(junction_ckpt, device=args.device)
     straight_infer = StraightKeepInfer(straight_ckpt, device=args.device)
 
-    # ===== 2) 加载状态机 =====
+    # 2) 层级状态机
     sm = _build_state_machine(cfg)
     sm.reset()
 
-    # ===== 3) 逐帧回放 =====
+    # 3) 逐帧回放
     trace_rows: List[Dict[str, Any]] = []
+    debug_rows: List[Dict[str, Any]] = []
     state_counts = Counter()
     locked_turn_dir_counts = Counter()
     num_turn_entries = 0
     num_recover_entries = 0
+    num_clip_applied = 0
 
     for idx, fr in enumerate(frames):
         image_name = fr['image_name']
         image_path = fr['image_path']
         label_row = fr.get('label_row', {}) or {}
+
+        # 真实标签辅助信息（可选）
+        run_name = str(label_row.get('run_name', os.path.basename(run_dir)))
+        gt_phase = str(label_row.get('phase', '')).strip() if ('phase' in label_row) else ''
+        gt_turn_dir = _infer_gt_turn_dir(run_name)
 
         with Image.open(image_path) as img:
             img_rgb = img.convert('RGB')
@@ -372,19 +434,31 @@ def run_replay(args: argparse.Namespace) -> None:
             'straight_keep': straight_out,
         })
 
+        debug = sm_out.get('debug', {}) if isinstance(sm_out.get('debug', {}), dict) else {}
+        transition = debug.get('transition', None)
+        transition_from = ''
+        transition_to = ''
+        transition_reason = ''
+        if isinstance(transition, dict):
+            transition_from = str(transition.get('from', ''))
+            transition_to = str(transition.get('to', ''))
+            transition_reason = str(transition.get('reason', ''))
+            if transition_to == 'TURN':
+                num_turn_entries += 1
+            elif transition_to == 'RECOVER':
+                num_recover_entries += 1
+
         state_now = str(sm_out.get('state', ''))
         locked_dir = sm_out.get('locked_turn_dir', None)
         locked_dir_str = '' if locked_dir is None else str(locked_dir)
+
         omega_raw = _safe_float(straight_out.get('omega_cmd_raw', 0.0), 0.0)
         omega_final = _safe_float(sm_out.get('omega_cmd_final', 0.0), 0.0)
-
-        transition = (sm_out.get('debug', {}) or {}).get('transition', None)
-        if isinstance(transition, dict):
-            to_state = str(transition.get('to', ''))
-            if to_state == 'TURN':
-                num_turn_entries += 1
-            elif to_state == 'RECOVER':
-                num_recover_entries += 1
+        clip_applied = bool(debug.get('clip_applied', False))
+        omega_before_clip = _safe_float(debug.get('omega_before_clip', omega_final), omega_final)
+        omega_after_clip = _safe_float(debug.get('omega_after_clip', omega_final), omega_final)
+        if clip_applied:
+            num_clip_applied += 1
 
         state_counts[state_now] += 1
         if locked_dir_str:
@@ -395,50 +469,120 @@ def run_replay(args: argparse.Namespace) -> None:
             'image_name': image_name,
             'pred_stage': stage_out.get('pred_stage', ''),
             'pred_turn_dir': junction_out.get('pred_label', ''),
+            'gt_phase': gt_phase,
+            'gt_turn_dir': gt_turn_dir,
             'locked_turn_dir': locked_dir_str,
             'state': state_now,
+            'transition_from': transition_from,
+            'transition_to': transition_to,
+            'transition_reason': transition_reason,
             'omega_cmd_raw': omega_raw,
             'omega_cmd_final': omega_final,
+            'clip_applied': clip_applied,
+            'omega_before_clip': omega_before_clip,
+            'omega_after_clip': omega_after_clip,
             'stage_confidence': _safe_float(stage_out.get('confidence', 0.0), 0.0),
             'junction_confidence': _safe_float(junction_out.get('confidence', 0.0), 0.0),
-            # 扩展字段：尽量保留 labels.csv 信息，便于后续分析
+            # 保留可选标签信息，兼容不同数据目录
             'timestamp_ns': label_row.get('timestamp_ns', ''),
             'frame_idx': label_row.get('frame_idx', ''),
-            'run_name': label_row.get('run_name', os.path.basename(run_dir)),
+            'run_name': run_name,
         }
         trace_rows.append(row)
 
-    # ===== 4) 保存 replay_trace.csv =====
+        debug_rows.append({
+            'step_idx': idx,
+            'state': state_now,
+            'transition': transition if isinstance(transition, dict) else None,
+            'stage_votes': debug.get('stage_votes', {}),
+            'junction_votes': debug.get('junction_votes', {}),
+            'recover_support_count': debug.get('recover_support_count', 0),
+            'omega_before_clip': omega_before_clip,
+            'omega_after_clip': omega_after_clip,
+            # 额外保留便于深入排查
+            'clip_applied': clip_applied,
+            'turn_timeout_triggered': bool(debug.get('turn_timeout_triggered', False)),
+        })
+
+    # 4) replay_trace.csv（保持基础功能，默认保存）
     trace_csv = os.path.join(out_dir, 'replay_trace.csv')
     trace_fields = [
         'step_idx',
         'image_name',
         'pred_stage',
         'pred_turn_dir',
+        'gt_phase',
+        'gt_turn_dir',
         'locked_turn_dir',
         'state',
+        'transition_from',
+        'transition_to',
+        'transition_reason',
         'omega_cmd_raw',
         'omega_cmd_final',
+        'clip_applied',
+        'omega_before_clip',
+        'omega_after_clip',
         'stage_confidence',
         'junction_confidence',
         'timestamp_ns',
         'frame_idx',
         'run_name',
     ]
+    # 出于兼容性，始终输出 replay_trace.csv；save_csv 用于显式记录与提示
+    if not save_csv:
+        vprint('  [i] logging.save_csv=False，但为兼容仍输出 replay_trace.csv')
     with open(trace_csv, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=trace_fields)
         writer.writeheader()
         for r in trace_rows:
             writer.writerow(r)
 
-    # ===== 5) 保存 replay_summary.json =====
+    # 5) replay_summary.json（系统级统计增强）
+    state_seq = [str(r.get('state', '')) for r in trace_rows]
+    unique_state_sequence = _compress_state_sequence(state_seq)
+    first_turn_step = _first_step_with_state(trace_rows, 'TURN')
+    first_recover_step = _first_step_with_state(trace_rows, 'RECOVER')
+    turn_duration_steps = sum(1 for s in state_seq if s == 'TURN')
+    recover_duration_steps = sum(1 for s in state_seq if s == 'RECOVER')
+
+    final_locked_turn_dir = ''
+    if trace_rows:
+        final_locked_turn_dir = str(trace_rows[-1].get('locked_turn_dir', ''))
+
+    # 全局 gt_turn_dir：优先使用轨迹中的首个非空值；否则用 run 目录名推断
+    gt_turn_dir_global = ''
+    for r in trace_rows:
+        d = str(r.get('gt_turn_dir', '')).strip()
+        if d:
+            gt_turn_dir_global = d
+            break
+    if not gt_turn_dir_global:
+        gt_turn_dir_global = _infer_gt_turn_dir(os.path.basename(run_dir))
+
+    turn_dir_match: Optional[bool]
+    if gt_turn_dir_global:
+        turn_dir_match = (str(final_locked_turn_dir) == str(gt_turn_dir_global))
+    else:
+        turn_dir_match = None
+
     summary = {
         'total_steps': len(trace_rows),
         'state_counts': dict(state_counts),
         'num_turn_entries': int(num_turn_entries),
         'num_recover_entries': int(num_recover_entries),
         'locked_turn_dir_counts': dict(locked_turn_dir_counts),
-        # 额外上下文信息（便于追溯）
+        # 新增系统级分析字段
+        'final_locked_turn_dir': final_locked_turn_dir,
+        'gt_turn_dir': gt_turn_dir_global,
+        'turn_dir_match': turn_dir_match,
+        'first_turn_step': first_turn_step,
+        'first_recover_step': first_recover_step,
+        'turn_duration_steps': int(turn_duration_steps),
+        'recover_duration_steps': int(recover_duration_steps),
+        'num_clip_applied': int(num_clip_applied),
+        'unique_state_sequence': unique_state_sequence,
+        # 追溯信息
         'run_dir': run_dir,
         'config_path': config_path,
         'label_fields': label_fields,
@@ -448,24 +592,40 @@ def run_replay(args: argparse.Namespace) -> None:
             'valid_frames': (meta_json or {}).get('valid_frames', None),
             'duration_seconds': (meta_json or {}).get('duration_seconds', None),
         },
+        'logging_flags': {
+            'save_debug_json': save_debug_json,
+            'save_csv': save_csv,
+            'verbose': verbose,
+        },
     }
     summary_json = os.path.join(out_dir, 'replay_summary.json')
     with open(summary_json, 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    # ===== 6) 绘制 state_timeline.png =====
+    # 6) replay_debug.json（可选）
+    debug_json = os.path.join(out_dir, 'replay_debug.json')
+    if save_debug_json:
+        with open(debug_json, 'w', encoding='utf-8') as f:
+            json.dump(debug_rows, f, ensure_ascii=False, indent=2)
+    else:
+        debug_json = ''
+
+    # 7) 绘制时间轴
     timeline_png = os.path.join(out_dir, 'state_timeline.png')
     _plot_state_timeline(trace_rows, timeline_png)
 
+    # 结束日志
     print('\n[Replay] 完成')
     print(f'  - trace:    {trace_csv}')
     print(f'  - summary:  {summary_json}')
     print(f'  - timeline: {timeline_png}')
+    if save_debug_json:
+        print(f'  - debug:    {debug_json}')
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='离线回放层级导航系统并生成时间轴分析'
+        description='离线回放层级导航系统并生成系统级时间轴分析'
     )
     parser.add_argument('--run_dir', type=str, required=True,
                         help='单个 run 目录（至少包含 images/）')
@@ -487,3 +647,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
