@@ -6,6 +6,7 @@
 支持的实验类型:
   - action3_balanced (三分类)
   - junction_lr (左右判定)
+  - stage3 (三阶段)
   - stage4 (四阶段)
   - straight_keep_reg (直行纠偏回归)
   - 其他自定义实验
@@ -181,6 +182,57 @@ def _extract_config_fields(config):
     return fields
 
 
+def _is_missing(v):
+    """判断字段是否缺失（None 或空字符串）。"""
+    return v is None or (isinstance(v, str) and v.strip() == '')
+
+
+def _infer_meta_from_name(name):
+    """
+    从实验名/目录名启发式推断 dataset / task_name。
+    兼容以下命名模式：
+      - corridor_task_stage3_*
+      - corridor_task_stage4_*
+      - corridor_task_junction_lr_*
+      - corridor_task_action3_balanced_*
+      - corridor_regression_*
+    """
+    s = str(name or '').lower()
+    out = {}
+
+    # 优先匹配最明确的 corridor_task 前缀模式
+    if 'corridor_task_action3_balanced_' in s:
+        out['dataset'] = 'corridor_task'
+        out['task_name'] = 'action3_balanced'
+        return out
+    if 'corridor_task_junction_lr_' in s:
+        out['dataset'] = 'corridor_task'
+        out['task_name'] = 'junction_lr'
+        return out
+    if 'corridor_task_stage3_' in s:
+        out['dataset'] = 'corridor_task'
+        out['task_name'] = 'stage3'
+        return out
+    if 'corridor_task_stage4_' in s:
+        out['dataset'] = 'corridor_task'
+        out['task_name'] = 'stage4'
+        return out
+
+    # 回归命名模式
+    if 'corridor_regression_' in s:
+        out['dataset'] = 'corridor'
+        out['task_name'] = 'straight_keep_reg'
+        return out
+
+    # 通用 token 兜底（用于 exp_name 中明确包含 task token 的情况）
+    for tn in ('action3_balanced', 'junction_lr', 'stage3', 'stage4'):
+        if tn in s:
+            out['task_name'] = tn
+            break
+
+    return out
+
+
 # ============================================================================
 # 单实验读取
 # ============================================================================
@@ -240,7 +292,7 @@ def read_experiment(exp_dir):
     met = _load_json(os.path.join(exp_dir, 'metrics.json'))
     if met:
         sources.append('metrics')
-        if 'exp_name' not in record or not record['exp_name']:
+        if _is_missing(record.get('exp_name')):
             record['exp_name'] = met.get('exp_name', exp_name)
 
         # 从 metrics.json 填充 (仅在尚未有值时)
@@ -256,20 +308,22 @@ def read_experiment(exp_dir):
             'avg_spike_rate': 'test_spike_rate',
             'sparsity': 'test_sparsity',
             'spikes_per_image': 'test_spikes_per_image',
+            'test_samples': 'test_samples',
+            'total_test_frames': 'test_samples',
             'epoch': 'best_epoch',
         }
         for src_key, dst_key in field_map.items():
-            if src_key in met and dst_key not in record:
+            if src_key in met and _is_missing(record.get(dst_key)):
                 record[dst_key] = met[src_key]
 
         # 直接同名字段 (config 类信息)
         direct_fields = [
             'neuron_type', 'residual_mode', 'T', 'dataset',
             'task_name', 'img_h', 'img_w', 'seq_len', 'stride',
-            'mode', 'encoding',
+            'mode', 'encoding', 'task_num_classes',
         ]
         for f in direct_fields:
-            if f in met and f not in record:
+            if f in met and _is_missing(record.get(f)):
                 record[f] = met[f]
 
     # ---- 3) best_model.ckpt ----
@@ -282,30 +336,77 @@ def read_experiment(exp_dir):
                 ckpt_path = alt_path
                 break
 
+    ckpt_meta = None
     if os.path.isfile(ckpt_path):
         ckpt_meta = _load_ckpt_meta(ckpt_path)
         if ckpt_meta:
             sources.append('ckpt')
             # 从 checkpoint 补充
-            if 'max_test_acc' in ckpt_meta and 'best_val_acc' not in record:
+            if 'max_test_acc' in ckpt_meta and _is_missing(record.get('best_val_acc')):
                 record['best_val_acc'] = ckpt_meta['max_test_acc']
-            if 'max_val_acc' in ckpt_meta and 'best_val_acc' not in record:
+            if 'max_val_acc' in ckpt_meta and _is_missing(record.get('best_val_acc')):
                 record['best_val_acc'] = ckpt_meta['max_val_acc']
-            if 'min_val_mae' in ckpt_meta and 'best_val_mae' not in record:
+            if 'min_val_mae' in ckpt_meta and _is_missing(record.get('best_val_mae')):
                 record['best_val_mae'] = ckpt_meta['min_val_mae']
-            if 'epoch' in ckpt_meta and 'best_epoch' not in record:
+            if 'epoch' in ckpt_meta and _is_missing(record.get('best_epoch')):
                 record['best_epoch'] = ckpt_meta['epoch']
             if 'config' in ckpt_meta:
                 cfg_fields = _extract_config_fields(ckpt_meta['config'])
                 for k, v in cfg_fields.items():
-                    if k not in record:
+                    if _is_missing(record.get(k)):
                         record[k] = v
 
     # ---- 4) pipeline_log.json (补充信息) ----
     plog = _load_json(os.path.join(exp_dir, 'pipeline_log.json'))
     if plog:
-        if 'task_type' in plog and 'task_name' not in record:
+        if 'task_type' in plog and _is_missing(record.get('task_name')):
             record['task_name'] = plog['task_type']
+
+    # ---- 5) metadata fallback（增强 results 汇总鲁棒性）----
+    # 5.1 test_samples 兜底：兼容 plot_results.py 输出 total_test_frames
+    if _is_missing(record.get('test_samples')):
+        if met and not _is_missing(met.get('test_samples')):
+            record['test_samples'] = met.get('test_samples')
+        elif met and not _is_missing(met.get('total_test_frames')):
+            record['test_samples'] = met.get('total_test_frames')
+        elif not _is_missing(record.get('total_test_frames')):
+            record['test_samples'] = record.get('total_test_frames')
+
+    # 5.2 当 dataset / task_name 缺失时，优先再尝试 ckpt config
+    if (_is_missing(record.get('dataset')) or _is_missing(record.get('task_name'))):
+        if ckpt_meta and isinstance(ckpt_meta, dict) and isinstance(ckpt_meta.get('config'), dict):
+            cfg_fields = _extract_config_fields(ckpt_meta['config'])
+            if not _is_missing(cfg_fields.get('dataset')) and _is_missing(record.get('dataset')):
+                record['dataset'] = cfg_fields['dataset']
+            if not _is_missing(cfg_fields.get('task_name')) and _is_missing(record.get('task_name')):
+                record['task_name'] = cfg_fields['task_name']
+
+    # 5.3 启发式推断：从 exp_name / 目录名补齐缺失 metadata
+    # 注意：只在缺失字段时补齐，不覆盖已有值
+    name_candidates = [
+        record.get('exp_name'),
+        exp_name,
+        os.path.basename(exp_dir),
+    ]
+    for name in name_candidates:
+        hint = _infer_meta_from_name(name)
+        if _is_missing(record.get('task_name')) and not _is_missing(hint.get('task_name')):
+            record['task_name'] = hint['task_name']
+        if _is_missing(record.get('dataset')) and not _is_missing(hint.get('dataset')):
+            record['dataset'] = hint['dataset']
+
+    # 5.4 task_name 缺失但 exp_name 中包含明确 token 时，自动补齐
+    #（与上一步互补，确保 stage3/stage4/junction_lr/action3_balanced 可识别）
+    if _is_missing(record.get('task_name')):
+        token_hint = _infer_meta_from_name(record.get('exp_name', exp_name))
+        if not _is_missing(token_hint.get('task_name')):
+            record['task_name'] = token_hint['task_name']
+
+    # 5.5 dataset 缺失但 task_name 属于 corridor_task 系列，自动补 corridor_task
+    if _is_missing(record.get('dataset')):
+        task_l = str(record.get('task_name', '')).lower()
+        if task_l in ('stage3', 'stage4', 'junction_lr', 'action3_balanced'):
+            record['dataset'] = 'corridor_task'
 
     # 没有任何数据来源则返回 None
     if not sources:
