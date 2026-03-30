@@ -12,9 +12,9 @@ system:
   control_rate_hz: 10      # 状态机更新频率(Hz)
 
 models:
-  junction_lr_ckpt: "checkpoint/corridor_task/corridor_task_junction_lr_APLIF_ADD_T4/best_model.ckpt"      # 左右判定模型
-  stage3_ckpt: "checkpoint/corridor_task/corridor_task_stage3_APLIF_ADD_T4/best_model.ckpt"                # 三阶段模型
-  straight_keep_ckpt: "checkpoint/corridor/straight_keep_reg_APLIF_ADD_T4_seq4/best_model.ckpt"            # 直行纠偏回归模型
+  junction_lr_ckpt: "./checkpoint/corridor_task/corridor_task_junction_lr_APLIF_ADD_T4/best_model.ckpt"      # 左右判定模型
+  stage3_ckpt: "./checkpoint/corridor_task/corridor_task_stage3_APLIF_ADD_T4/best_model.ckpt"                # 三阶段模型
+  straight_keep_ckpt: "./checkpoint/corridor/straight_keep_reg_APLIF_ADD_T4_seq4/best_model.ckpt"            # 直行纠偏回归模型
 
 state_machine:
   boot_steps: 6                       # 启动预热步数, 抑制首帧抖动
