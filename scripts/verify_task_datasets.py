@@ -439,7 +439,8 @@ def plot_timeline(run_info, task_type, out_path):
         if ph in phases:
             ph_handles.append(
                 mpatches.Patch(color=color, alpha=0.4, label=ph))
-    if task_type in ('junction_lr', 'stage4', 'junction_windows',
+    # 一致性修复：stage3 与 stage4 同样显示 t_turn_on 图例
+    if task_type in ('junction_lr', 'stage3', 'stage4', 'junction_windows',
                      'stage_windows', 'action3'):
         ph_handles.append(plt.Line2D(
             [0], [0], color='red', linestyle='--', label='t_turn_on'))
