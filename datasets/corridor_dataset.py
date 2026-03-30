@@ -104,16 +104,40 @@ def _load_labels_csv(csv_path: str) -> List[Dict[str, Any]]:
     rows = []
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        for ridx, row in enumerate(reader):
+            image_name = row.get('image_name', '')
+            # frame_idx 规则：
+            # 1) 优先 labels.csv 中已有字段
+            # 2) 否则用 image_name 去后缀
+            # 3) 再兜底到 run 内行号
+            frame_idx = row.get('frame_idx', '')
+            if frame_idx in (None, '') and image_name:
+                frame_idx = os.path.splitext(image_name)[0]
+            if frame_idx in (None, ''):
+                frame_idx = str(ridx)
+
+            # t_rel_ms 可能不存在或为空，做安全解析
+            t_rel_raw = row.get('t_rel_ms', '')
+            try:
+                t_rel_ms = float(t_rel_raw) if t_rel_raw not in ('', None) else ''
+            except (TypeError, ValueError):
+                t_rel_ms = ''
+
             rows.append({
-                'image_name': row['image_name'],
+                'image_name': image_name,
                 'action_id': int(row['action_id']),
                 'action_name': row['action_name'],
                 'timestamp_ns': int(row['timestamp_ns']),
                 'linear_x': float(row['linear_x']),
                 'angular_z': float(row['angular_z']),
-                'time_diff_ms': float(row['time_diff_ms']),
+                'time_diff_ms': float(row.get('time_diff_ms', 0.0)),
                 'valid': int(row['valid']),
+                # 以下字段为可选元信息，缺失时保持空串/默认值
+                'phase': row.get('phase', ''),
+                't_rel_ms': t_rel_ms,
+                'run_name': row.get('run_name', ''),
+                'split': row.get('split', ''),
+                'frame_idx': frame_idx,
             })
     return rows
 
@@ -237,6 +261,7 @@ class CorridorDataset(Dataset):
         self.valid_only = valid_only
         self.action_set = action_set
         self.transforms = transforms
+        # return_meta 仅用于评估/分析阶段，默认关闭以避免影响训练吞吐
         self.return_meta = return_meta
 
         # 5→3 类映射
@@ -269,6 +294,8 @@ class CorridorDataset(Dataset):
         for run_dir in runs:
             csv_path = os.path.join(run_dir, 'labels.csv')
             rows = _load_labels_csv(csv_path)
+            run_name_fallback = os.path.basename(run_dir)
+            split_fallback = os.path.basename(os.path.dirname(run_dir))
 
             for row in rows:
                 # 过滤 valid=0
@@ -295,11 +322,17 @@ class CorridorDataset(Dataset):
 
                 sample = {
                     'img_path': img_path,
+                    'image_name': row.get('image_name', ''),
                     'label': label,
                     'linear_x': row['linear_x'],
                     'angular_z': row['angular_z'],
                     'timestamp_ns': row['timestamp_ns'],
                     'time_diff_ms': row['time_diff_ms'],
+                    'phase': row.get('phase', ''),
+                    't_rel_ms': row.get('t_rel_ms', ''),
+                    'run_name': row.get('run_name', '') or run_name_fallback,
+                    'split': row.get('split', '') or split_fallback,
+                    'frame_idx': row.get('frame_idx', ''),
                     'run_dir': run_dir,
                     'action_id_orig': row['action_id'],
                 }
@@ -349,10 +382,16 @@ class CorridorDataset(Dataset):
 
         if self.return_meta:
             meta = {
+                'image_name': s.get('image_name', ''),
                 'timestamp_ns': s['timestamp_ns'],
                 'time_diff_ms': s['time_diff_ms'],
                 'linear_x': s['linear_x'],
                 'angular_z': s['angular_z'],
+                'phase': s.get('phase', ''),
+                't_rel_ms': s.get('t_rel_ms', ''),
+                'run_name': s.get('run_name', ''),
+                'split': s.get('split', ''),
+                'frame_idx': s.get('frame_idx', ''),
                 'run_dir': s['run_dir'],
                 'action_id_orig': s['action_id_orig'],
             }
@@ -393,6 +432,7 @@ class CorridorSequenceDataset(Dataset):
         action_set: 同 CorridorDataset
         backward_policy: 同 CorridorDataset
         transforms: torchvision transforms
+        return_meta: True 时返回每帧 meta_list（评估/分析用）
         print_stats: True=打印统计
     """
 
@@ -408,6 +448,7 @@ class CorridorSequenceDataset(Dataset):
         action_set: str = '5',
         backward_policy: str = 'drop',
         transforms=None,
+        return_meta: bool = False,
         print_stats: bool = True,
     ):
         assert seq_len >= 2, f"seq_len 必须 >= 2, 得到: {seq_len}"
@@ -417,6 +458,8 @@ class CorridorSequenceDataset(Dataset):
         self.mode = mode
         self.control_dim = control_dim
         self.transforms = transforms
+        # return_meta 仅用于评估/分析阶段，默认关闭以避免影响训练吞吐
+        self.return_meta = return_meta
 
         if action_set == '5':
             self.num_classes = 5
@@ -505,6 +548,7 @@ class CorridorSequenceDataset(Dataset):
         seq_indices = self.sequences[idx]
         frames = []
         labels = []
+        metas = [] if self.return_meta else None
 
         for si in seq_indices:
             s = self.base_samples[si]
@@ -527,6 +571,20 @@ class CorridorSequenceDataset(Dataset):
                 else:
                     labels.append([s['linear_x'], s['angular_z']])
 
+            if self.return_meta:
+                metas.append({
+                    'image_name': s.get('image_name', ''),
+                    'timestamp_ns': s['timestamp_ns'],
+                    'linear_x': s['linear_x'],
+                    'angular_z': s['angular_z'],
+                    # phase 名称保持原样，不做改写
+                    'phase': s.get('phase', ''),
+                    't_rel_ms': s.get('t_rel_ms', ''),
+                    'run_name': s.get('run_name', ''),
+                    'split': s.get('split', ''),
+                    'frame_idx': s.get('frame_idx', ''),
+                })
+
         # 堆叠: frames [L, C, H, W], labels [L] or [L, control_dim]
         frames_tensor = torch.stack(frames, dim=0)
 
@@ -535,4 +593,6 @@ class CorridorSequenceDataset(Dataset):
         else:
             labels_tensor = torch.tensor(labels, dtype=torch.float32)
 
+        if self.return_meta:
+            return frames_tensor, labels_tensor, metas
         return frames_tensor, labels_tensor
