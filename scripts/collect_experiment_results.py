@@ -321,10 +321,36 @@ def read_experiment(exp_dir):
             'neuron_type', 'residual_mode', 'T', 'dataset',
             'task_name', 'img_h', 'img_w', 'seq_len', 'stride',
             'mode', 'encoding', 'task_num_classes',
+            # 回归增强字段：作为额外列透传到 CSV（不改 SUMMARY_FIELDS）
+            'phase_available', 'abs_gain_ratio', 'signed_gain',
+            'mean_abs_pred', 'mean_abs_gt',
         ]
         for f in direct_fields:
             if f in met and _is_missing(record.get(f)):
                 record[f] = met[f]
+
+        # straight_keep 回归 phase 指标兜底：
+        # 若 final_test_metrics.json 未提供 phase_stats，则从 metrics.json 补收
+        # 仅在目标字段缺失时补，不覆盖更高优先级来源
+        ps = met.get('phase_stats')
+        if isinstance(ps, dict):
+            for phase_name, prefix in (('Correcting', 'correcting'),
+                                       ('Settled', 'settled')):
+                # 兼容键名大小写（Correcting/correcting 等）
+                pdata = ps.get(phase_name)
+                if not isinstance(pdata, dict):
+                    for k, v in ps.items():
+                        if str(k).lower() == phase_name.lower() \
+                                and isinstance(v, dict):
+                            pdata = v
+                            break
+                if not isinstance(pdata, dict):
+                    continue
+
+                for metric in ('mae', 'rmse'):
+                    out_key = f'{prefix}_{metric}'
+                    if metric in pdata and _is_missing(record.get(out_key)):
+                        record[out_key] = pdata[metric]
 
     # ---- 3) best_model.ckpt ----
     ckpt_path = os.path.join(exp_dir, 'best_model.ckpt')
