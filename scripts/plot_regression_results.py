@@ -444,6 +444,171 @@ def plot_training_curves_reg(tb_dir, out_dir):
 
 
 # ============================================================================
+# 元信息解析辅助（兼容 tuple/list/dict-of-lists）
+# ============================================================================
+def _to_python(v):
+    """把 tensor/ndarray 转为 python 标量或列表。"""
+    if isinstance(v, torch.Tensor):
+        if v.numel() == 1:
+            return v.item()
+        return v.detach().cpu().tolist()
+    if isinstance(v, np.ndarray):
+        if v.size == 1:
+            return v.item()
+        return v.tolist()
+    return v
+
+
+def _safe_pick(v, idx):
+    """安全按下标取值，失败返回 None。"""
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        if 0 <= idx < len(v):
+            return v[idx]
+        return None
+    if isinstance(v, torch.Tensor):
+        if v.ndim == 0:
+            return v
+        if 0 <= idx < v.shape[0]:
+            return v[idx]
+        return None
+    if isinstance(v, np.ndarray):
+        if v.ndim == 0:
+            return v
+        if 0 <= idx < v.shape[0]:
+            return v[idx]
+        return None
+    # 对无法索引的标量/对象，直接返回原值（用于单样本 meta）
+    return v
+
+
+def _extract_meta_value(meta, key, bidx=0, tidx=None):
+    """
+    从 meta 中提取字段，兼容：
+      1) dict of lists / tensors
+      2) list[dict]（按 batch）
+      3) list[list[dict]] 或 time-major 结构（序列）
+    """
+    if meta is None:
+        return None
+
+    # 情况 A: meta 是 dict（最常见的 DataLoader collate 结果）
+    if isinstance(meta, dict):
+        if key not in meta:
+            return None
+        val = meta.get(key)
+        val_b = _safe_pick(val, bidx)
+        if tidx is not None:
+            val_bt = _safe_pick(val_b, tidx)
+            return _to_python(val_bt)
+        return _to_python(val_b)
+
+    # 情况 B: meta 是 list/tuple
+    if isinstance(meta, (list, tuple)):
+        # B1. time-major: meta[t] 是 dict，dict[key] 再按 batch 取
+        if tidx is not None:
+            mt = _safe_pick(meta, tidx)
+            if isinstance(mt, dict) and key in mt:
+                return _to_python(_safe_pick(mt.get(key), bidx))
+
+        # B2. batch-major: meta[b] 是 dict
+        mb = _safe_pick(meta, bidx)
+        if isinstance(mb, dict) and key in mb:
+            vb = mb.get(key)
+            if tidx is not None:
+                return _to_python(_safe_pick(vb, tidx))
+            return _to_python(vb)
+
+        # B3. batch-major + sequence list: meta[b][t] 是 dict
+        if tidx is not None and isinstance(mb, (list, tuple)):
+            mbt = _safe_pick(mb, tidx)
+            if isinstance(mbt, dict):
+                return _to_python(mbt.get(key))
+
+    return None
+
+
+def _extract_meta_with_keys(meta, keys, bidx=0, tidx=None, default=''):
+    """按候选 key 顺序读取 meta 字段。"""
+    for k in keys:
+        v = _extract_meta_value(meta, k, bidx=bidx, tidx=tidx)
+        if v is not None and str(v) != '':
+            return v
+    return default
+
+
+def _extract_phase(meta, bidx=0, tidx=None):
+    """提取 phase，失败返回空字符串。"""
+    v = _extract_meta_with_keys(meta, ['phase'], bidx=bidx, tidx=tidx,
+                                default='')
+    return '' if v is None else str(v)
+
+
+def _extract_run_name(meta, bidx=0, tidx=None):
+    """提取 run_name；若仅有 run_dir，则回退到 basename(run_dir)。"""
+    rn = _extract_meta_with_keys(meta, ['run_name'], bidx=bidx, tidx=tidx,
+                                 default='')
+    if rn:
+        return str(rn)
+    run_dir = _extract_meta_with_keys(meta, ['run_dir'], bidx=bidx,
+                                      tidx=tidx, default='')
+    if run_dir:
+        return os.path.basename(str(run_dir))
+    return ''
+
+
+def _extract_image_name(meta, bidx=0, tidx=None):
+    """提取 image_name（若可得）。"""
+    img_name = _extract_meta_with_keys(
+        meta, ['image_name', 'img_name'], bidx=bidx, tidx=tidx, default='')
+    if img_name:
+        return str(img_name)
+    img_path = _extract_meta_with_keys(
+        meta, ['img_path'], bidx=bidx, tidx=tidx, default='')
+    if img_path:
+        return os.path.basename(str(img_path))
+    return ''
+
+
+def _normalize_phase_name(phase):
+    """将 phase 名称规范到论文常用写法。"""
+    p = str(phase or '').strip()
+    pl = p.lower()
+    if pl.startswith('correct'):
+        return 'Correcting'
+    if pl.startswith('settl'):
+        return 'Settled'
+    return p
+
+
+def _to_float_scalar(v, default=0.0):
+    """安全转换为 float 标量。"""
+    if isinstance(v, torch.Tensor):
+        if v.numel() == 0:
+            return float(default)
+        return float(v.reshape(-1)[0].item())
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _unpack_batch(batch):
+    """
+    兼容两种 batch:
+      - (frame, label)
+      - (frame, label, meta)
+    """
+    if isinstance(batch, (list, tuple)):
+        if len(batch) >= 3:
+            return batch[0], batch[1], batch[2]
+        if len(batch) >= 2:
+            return batch[0], batch[1], None
+    raise ValueError('Unexpected batch format')
+
+
+# ============================================================================
 # 主流程
 # ============================================================================
 def main():
@@ -543,30 +708,68 @@ def main():
         torchvision.transforms.Normalize([0.5] * 3, [0.5] * 3),
     ])
 
-    # corridor_task dataset (return_meta=True 读取 phase)
+    # corridor / corridor_task 数据集
     is_corridor_task = (dataset_type == 'corridor_task')
     has_phase = False
+    meta_enabled = False
 
     if is_corridor_task:
-        from datasets.corridor_task_dataset import CorridorTaskDataset
-        test_ds = CorridorTaskDataset(
-            root_dir=args.data_root, transforms=transform,
-            return_meta=True, print_stats=True)
-        # 检查第一个样本是否有 phase
-        if len(test_ds) > 0:
-            _, _, sample_meta = test_ds[0]
-            has_phase = bool(sample_meta.get('phase', ''))
+        if is_sequence:
+            from datasets.corridor_task_dataset import CorridorTaskSequenceDataset
+            test_ds = CorridorTaskSequenceDataset(
+                root_dir=args.data_root,
+                seq_len=int(seq_len) if seq_len else 4,
+                stride=int(stride) if stride is not None else 1,
+                transforms=transform,
+                return_meta=False,
+                print_stats=True)
+        else:
+            from datasets.corridor_task_dataset import CorridorTaskDataset
+            test_ds = CorridorTaskDataset(
+                root_dir=args.data_root, transforms=transform,
+                return_meta=False, print_stats=True)
     else:
-        from datasets.corridor_dataset import CorridorDataset
-        test_ds = CorridorDataset(
-            root_dir=args.data_root, mode=mode,
-            control_dim=control_dim,
-            valid_only=True, transforms=transform)
+        if is_sequence:
+            from datasets.corridor_dataset import CorridorSequenceDataset
+            test_ds = CorridorSequenceDataset(
+                root_dir=args.data_root,
+                seq_len=int(seq_len) if seq_len else 4,
+                stride=int(stride) if stride is not None else 1,
+                mode=mode, control_dim=control_dim,
+                valid_only=True, transforms=transform,
+                print_stats=True)
+        else:
+            from datasets.corridor_dataset import CorridorDataset
+            test_ds = CorridorDataset(
+                root_dir=args.data_root, mode=mode,
+                control_dim=control_dim,
+                valid_only=True, transforms=transform)
+
+    # 兼容修复：若数据集支持 return_meta，则评估阶段临时开启
+    if hasattr(test_ds, 'return_meta'):
+        try:
+            test_ds.return_meta = True
+            meta_enabled = True
+        except Exception:
+            meta_enabled = False
+
+    # 采样检查：判定是否存在 phase 元信息（不影响无 phase 情况）
+    if meta_enabled and len(test_ds) > 0:
+        try:
+            sample = test_ds[0]
+            if isinstance(sample, (list, tuple)) and len(sample) >= 3:
+                sample_meta = sample[2]
+                ph0 = _extract_phase(sample_meta, bidx=0,
+                                     tidx=0 if is_sequence else None)
+                has_phase = bool(str(ph0).strip())
+        except Exception:
+            has_phase = False
 
     loader = data.DataLoader(
         test_ds, batch_size=args.batch_size,
         shuffle=False, num_workers=0)
     print(f'  [✓] 测试集: {len(test_ds)} 帧')
+    print(f'  [✓] meta_enabled: {meta_enabled}')
     print(f'  [✓] has_phase: {has_phase}')
 
     # ---- [3/6] 推理 ----
@@ -577,17 +780,19 @@ def main():
     all_preds = []
     all_labels = []
     all_phases = []
+    all_t_rel_ms = []
+    all_run_names = []
+    all_image_names = []
+    all_frame_idx = []
     total_spikes = 0
     total_frames = 0
     all_spike_rates = []
+    pred_index = 0
 
     with torch.no_grad():
         for batch in tqdm(loader, desc='Inference'):
-            if is_corridor_task and has_phase:
-                frame, label, meta = batch
-            else:
-                frame, label = batch[:2]
-                meta = None
+            # 兼容 (frame, label) 与 (frame, label, meta)
+            frame, label, meta = _unpack_batch(batch)
 
             frame = frame.float().to(args.device)
             label = label.to(args.device)
@@ -605,16 +810,31 @@ def main():
                     total_frames += B
 
                     for i in range(B):
-                        all_preds.append(out_t[i].item())
-                        all_labels.append(label[i, t].item())
-                        if meta is not None:
-                            try:
-                                phases = meta.get('phase', None) \
-                                    if isinstance(meta, dict) else None
-                                ph = phases[i] if phases else ''
-                            except (IndexError, TypeError):
-                                ph = ''
-                            all_phases.append(str(ph))
+                        all_preds.append(_to_float_scalar(out_t[i]))
+                        all_labels.append(_to_float_scalar(label[i, t]))
+
+                        # 元信息提取：phase / t_rel_ms / run_name / image_name / frame_idx
+                        ph = _extract_phase(meta, bidx=i, tidx=t)
+                        t_rel = _extract_meta_with_keys(
+                            meta, ['t_rel_ms', 'time_diff_ms'],
+                            bidx=i, tidx=t, default='')
+                        run_name = _extract_run_name(meta, bidx=i, tidx=t)
+                        image_name = _extract_image_name(meta, bidx=i, tidx=t)
+                        frame_idx = _extract_meta_with_keys(
+                            meta, ['frame_idx'], bidx=i, tidx=t,
+                            default=str(t))
+                        if not frame_idx and image_name:
+                            frame_idx = os.path.splitext(
+                                os.path.basename(str(image_name)))[0]
+
+                        all_phases.append(str(ph) if ph is not None else '')
+                        all_t_rel_ms.append('' if t_rel is None else t_rel)
+                        all_run_names.append(str(run_name) if run_name else '')
+                        all_image_names.append(
+                            str(image_name) if image_name else '')
+                        all_frame_idx.append(
+                            str(frame_idx) if frame_idx is not None else '')
+                        pred_index += 1
 
                     if (encoding == 'rate'
                             and hasattr(net, 'backbone')):
@@ -630,16 +850,31 @@ def main():
                 total_frames += B
 
                 for i in range(B):
-                    all_preds.append(out_fr[i].item())
-                    all_labels.append(label[i].item())
-                    if meta is not None:
-                        try:
-                            phases = meta.get('phase', None) \
-                                if isinstance(meta, dict) else None
-                            ph = phases[i] if phases else ''
-                        except (IndexError, TypeError):
-                            ph = ''
-                        all_phases.append(str(ph))
+                    all_preds.append(_to_float_scalar(out_fr[i]))
+                    all_labels.append(_to_float_scalar(label[i]))
+
+                    # 元信息提取：单帧模式
+                    ph = _extract_phase(meta, bidx=i, tidx=None)
+                    t_rel = _extract_meta_with_keys(
+                        meta, ['t_rel_ms', 'time_diff_ms'],
+                        bidx=i, tidx=None, default='')
+                    run_name = _extract_run_name(meta, bidx=i, tidx=None)
+                    image_name = _extract_image_name(meta, bidx=i, tidx=None)
+                    frame_idx = _extract_meta_with_keys(
+                        meta, ['frame_idx'], bidx=i, tidx=None,
+                        default=str(pred_index))
+                    if not frame_idx and image_name:
+                        frame_idx = os.path.splitext(
+                            os.path.basename(str(image_name)))[0]
+
+                    all_phases.append(str(ph) if ph is not None else '')
+                    all_t_rel_ms.append('' if t_rel is None else t_rel)
+                    all_run_names.append(str(run_name) if run_name else '')
+                    all_image_names.append(
+                        str(image_name) if image_name else '')
+                    all_frame_idx.append(
+                        str(frame_idx) if frame_idx is not None else '')
+                    pred_index += 1
 
                 functional.reset_net(net)
 
@@ -711,11 +946,13 @@ def main():
 
     # Phase 统计
     phase_stats = {}
-    if all_phases:
+    phase_available = any(str(p).strip() for p in all_phases)
+    if phase_available:
         phase_errs = defaultdict(list)
         for p, r in zip(all_phases, residuals):
-            if p:
-                phase_errs[p].append(r)
+            p_norm = _normalize_phase_name(p)
+            if p_norm:
+                phase_errs[p_norm].append(r)
 
         for ph, errs in phase_errs.items():
             errs_arr = np.array(errs)
@@ -733,6 +970,15 @@ def main():
                       f'MAE={st["mae"]:.4f}  '
                       f'RMSE={st["rmse"]:.4f}  '
                       f'n={st["count"]}')
+            # 便于快速核查 straight_keep 的核心分段指标
+            if 'Correcting' in phase_stats:
+                st = phase_stats['Correcting']
+                print(f'    [Correcting] MAE={st["mae"]:.4f} '
+                      f'RMSE={st["rmse"]:.4f} n={st["count"]}')
+            if 'Settled' in phase_stats:
+                st = phase_stats['Settled']
+                print(f'    [Settled]    MAE={st["mae"]:.4f} '
+                      f'RMSE={st["rmse"]:.4f} n={st["count"]}')
 
     # ---- [5/6] 图表输出 ----
     print('\n[5/6] 生成图表...')
@@ -788,9 +1034,9 @@ def main():
         'spikes_per_image': round(spk_per_img, 1),
         'total_test_frames': total_frames,
         'group_rates': {k: round(v, 6) for k, v in grp_rates.items()},
+        'phase_available': bool(phase_available),
+        'phase_stats': phase_stats if phase_stats else {},
     }
-    if phase_stats:
-        metrics['phase_stats'] = phase_stats
     if seq_len:
         metrics['seq_len'] = seq_len
         metrics['stride'] = stride
@@ -804,25 +1050,23 @@ def main():
     csv_path = os.path.join(args.out_dir, 'predictions.csv')
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        if all_phases:
-            writer.writerow(['index', 'prediction', 'ground_truth',
-                             'residual', 'phase'])
-            for i in range(len(all_preds)):
-                writer.writerow([
-                    i, round(all_preds[i], 6),
-                    round(all_labels[i], 6),
-                    round(float(residuals[i]), 6),
-                    all_phases[i] if i < len(all_phases) else '',
-                ])
-        else:
-            writer.writerow(['index', 'prediction', 'ground_truth',
-                             'residual'])
-            for i in range(len(all_preds)):
-                writer.writerow([
-                    i, round(all_preds[i], 6),
-                    round(all_labels[i], 6),
-                    round(float(residuals[i]), 6),
-                ])
+        # 保持逐样本导出，并补充 phase / t_rel_ms / run_name / image_name / frame_idx
+        writer.writerow([
+            'index', 'prediction', 'ground_truth', 'residual',
+            'phase', 't_rel_ms', 'run_name', 'image_name', 'frame_idx'
+        ])
+        for i in range(len(all_preds)):
+            writer.writerow([
+                i,
+                round(all_preds[i], 6),
+                round(all_labels[i], 6),
+                round(float(residuals[i]), 6),
+                all_phases[i] if i < len(all_phases) else '',
+                all_t_rel_ms[i] if i < len(all_t_rel_ms) else '',
+                all_run_names[i] if i < len(all_run_names) else '',
+                all_image_names[i] if i < len(all_image_names) else '',
+                all_frame_idx[i] if i < len(all_frame_idx) else '',
+            ])
     print(f'  [✓] {csv_path}')
 
     # ---- 总结 ----
