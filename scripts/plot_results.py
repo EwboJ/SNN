@@ -13,6 +13,13 @@
         --data_root ./data/corridor/test \
         --tb_dir checkpoint/corridor/corridor_discrete_3cls_rate_APLIF_ADD_T4/runs \
         --out_dir results/baseline_APLIF_ADD_T4
+
+    # corridor_task stage3 示例（3类: Approach/Turn/Recover）
+    python scripts/plot_results.py \
+        --ckpt checkpoint/corridor_task/corridor_task_stage3_APLIF_ADD_T4/best_model.ckpt \
+        --data_root ./data/stage1/stage3_v1/test \
+        --tb_dir checkpoint/corridor_task/corridor_task_stage3_APLIF_ADD_T4/runs \
+        --out_dir results/stage3_APLIF_ADD_T4
 """
 
 import os
@@ -21,7 +28,7 @@ import json
 import csv
 import time
 import argparse
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 
 import numpy as np
 import torch
@@ -418,6 +425,9 @@ def export_predictions_csv(test_ds, all_preds, all_labels, all_probs,
         run_name = sample.get('run_name', '')
         if not run_name and 'run_dir' in sample:
             run_name = os.path.basename(sample['run_dir'])
+        # run_name 兜底：避免后续 run-level 统计因空值失败
+        if not run_name:
+            run_name = f'unknown_run_{i}'
 
         # frame_idx: 从图片文件名提取
         frame_idx = ''
@@ -465,6 +475,127 @@ def export_predictions_csv(test_ds, all_preds, all_labels, all_probs,
 # ============================================================================
 # 主流程
 # ============================================================================
+def _safe_int(v, default=None):
+    """安全转 int，失败返回 default。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _majority_vote_int(values):
+    """
+    多数投票（整数标签）。
+    若出现并列，取标签 id 更小者，保证结果稳定可复现。
+    """
+    ints = []
+    for v in values:
+        vi = _safe_int(v, None)
+        if vi is not None:
+            ints.append(vi)
+    if not ints:
+        return None
+    cnt = Counter(ints)
+    return sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+
+
+def _infer_task_name_from_path(data_root, default_name='action3_balanced'):
+    """当 ckpt 缺 task_name 时，尝试从 data_root 推断任务名。"""
+    if not data_root:
+        return default_name
+    path_l = str(data_root).lower()
+    for n in ('stage3', 'stage4', 'junction_lr', 'action3_balanced'):
+        if n in path_l:
+            return n
+    return default_name
+
+
+def export_run_level_summary(out_dir, class_names=None):
+    """
+    基于 predictions.csv 的 run_name 做逐 run 多数投票统计：
+      - run_predictions.csv
+      - run_metrics.json
+    Returns:
+      dict or None
+    """
+    pred_path = os.path.join(out_dir, 'predictions.csv')
+    if not os.path.isfile(pred_path):
+        print('  [!] 未找到 predictions.csv，跳过 run-level 统计')
+        return None
+
+    run_bucket = OrderedDict()
+    with open(pred_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for ridx, row in enumerate(reader):
+            raw_name = (row.get('run_name') or '').strip()
+            # run_name 缺失时安全兜底，避免不同样本被错误合并
+            if raw_name:
+                run_name = raw_name
+            else:
+                sid = row.get('sample_id', ridx)
+                run_name = f'unknown_run_{sid}'
+
+            if run_name not in run_bucket:
+                run_bucket[run_name] = {'true': [], 'pred': []}
+            run_bucket[run_name]['true'].append(row.get('true_label'))
+            run_bucket[run_name]['pred'].append(row.get('pred_label'))
+
+    def _label_name(label_id):
+        if label_id is None:
+            return ''
+        if class_names and 0 <= label_id < len(class_names):
+            return class_names[label_id]
+        return f'class_{label_id}'
+
+    out_rows = []
+    correct_runs = 0
+    for run_name, d in run_bucket.items():
+        tmaj = _majority_vote_int(d['true'])
+        pmaj = _majority_vote_int(d['pred'])
+        ok = int((tmaj is not None) and (pmaj is not None) and (tmaj == pmaj))
+        correct_runs += ok
+        out_rows.append({
+            'run_name': run_name,
+            'true_label_majority': '' if tmaj is None else tmaj,
+            'pred_label_majority': '' if pmaj is None else pmaj,
+            'correct': ok,
+            'num_frames': len(d['true']),
+            # 额外字段：方便论文表格直接读标签名
+            'true_name_majority': _label_name(tmaj),
+            'pred_name_majority': _label_name(pmaj),
+        })
+
+    run_pred_path = os.path.join(out_dir, 'run_predictions.csv')
+    with open(run_pred_path, 'w', newline='', encoding='utf-8') as f:
+        fields = [
+            'run_name',
+            'true_label_majority',
+            'pred_label_majority',
+            'correct',
+            'num_frames',
+            'true_name_majority',
+            'pred_name_majority',
+        ]
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(out_rows)
+    print(f'  [✓] {run_pred_path} ({len(out_rows)} runs)')
+
+    total_runs = len(out_rows)
+    run_acc = (correct_runs / total_runs) if total_runs > 0 else 0.0
+    run_metrics = {
+        'run_accuracy': round(float(run_acc), 6),
+        'total_runs': total_runs,
+        'correct_runs': correct_runs,
+        'source': 'predictions.csv_majority_vote',
+    }
+    run_met_path = os.path.join(out_dir, 'run_metrics.json')
+    with open(run_met_path, 'w', encoding='utf-8') as f:
+        json.dump(run_metrics, f, indent=2, ensure_ascii=False)
+    print(f'  [✓] {run_met_path}')
+    return run_metrics
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='走廊导航实验可视化',
@@ -501,18 +632,25 @@ def main():
     neuron_type = cfg.get('neuron_type', 'APLIF')
     residual_mode = cfg.get('residual_mode', 'ADD')
     epoch = ckpt.get('epoch', '?') if isinstance(ckpt, dict) else '?'
+    task_name = cfg.get('task_name', '')
+    task_num_classes = cfg.get('task_num_classes', cfg.get('num_classes', None))
 
     # corridor_task 已知任务 -> 类名映射表
     _TASK_CLASS_NAMES = {
         'action3_balanced': ['Left', 'Straight', 'Right'],
         'junction_lr':      ['Left', 'Right'],
+        'stage3':           ['Approach', 'Turn', 'Recover'],
         'stage4':           ['Follow', 'Approach', 'Turn', 'Recover'],
     }
 
     if is_corridor_task:
         # corridor_task: 从 config 读取 task_name / task_num_classes
-        task_name = cfg.get('task_name', 'action3_balanced')
+        task_name = cfg.get('task_name', '')
+        if not task_name:
+            task_name = _infer_task_name_from_path(
+                args.data_root, default_name='action3_balanced')
         num_actions = cfg.get('task_num_classes', cfg.get('num_classes', 3))
+        task_num_classes = num_actions
         mode = 'discrete'  # corridor_task 都是离散分类
         control_dim = 1
         action_set = str(num_actions)  # 兼容字段
@@ -526,6 +664,7 @@ def main():
         action_set = str(cfg.get('action_set', '3'))
         control_dim = cfg.get('control_dim', 1)
         num_actions = cfg.get('num_classes', 3 if action_set == '3' else 5)
+        task_num_classes = task_num_classes if task_num_classes is not None else num_actions
         exp_name = f"{neuron_type}_{residual_mode}_T{T}"
         names_3 = ['Left', 'Straight', 'Right']
         names_5 = ['Forward', 'Backward', 'Left', 'Right', 'Stop']
@@ -623,6 +762,8 @@ def main():
 
     # 计算指标
     accuracy = 0.0
+    run_metrics = None
+    macro_precision, macro_recall, macro_f1 = None, None, None
     if is_discrete:
         correct = sum(p == l for p, l in zip(all_preds, all_labels))
         accuracy = correct / len(all_labels)
@@ -658,12 +799,24 @@ def main():
                 'f1': float(f1[i]),
                 'support': int(sup[i]),
             })
+        # 宏平均指标：更适合论文中跨类整体分析
+        macro_precision = float(np.mean(p)) if len(p) > 0 else 0.0
+        macro_recall = float(np.mean(r)) if len(r) > 0 else 0.0
+        macro_f1 = float(np.mean(f1)) if len(f1) > 0 else 0.0
         plot_per_class_metrics(per_class, args.out_dir)
 
         # 4d. 逐样本预测导出
         export_predictions_csv(
             test_ds, all_preds, all_labels, all_probs,
             sample_spike_rates, class_names, num_actions, args.out_dir)
+        run_metrics = export_run_level_summary(args.out_dir, class_names)
+        print(f'  [i] Frame-level Accuracy: {accuracy:.4f}')
+        if run_metrics:
+            print(f'  [i] Run-level   Accuracy: '
+                  f'{run_metrics["run_accuracy"]:.4f} '
+                  f'({run_metrics["correct_runs"]}/{run_metrics["total_runs"]})')
+        else:
+            print('  [i] Run-level   Accuracy: N/A')
 
     # 4b. Spike 分析
     plot_spike_analysis(group_rates, spikes_per_img, accuracy,
@@ -691,19 +844,76 @@ def main():
 
     # ---- 保存 metrics.json ----
     print('\n[5/5] 保存 metrics.json...')
+    # 元信息：优先从 ckpt config 读取，缺失时做安全 fallback
+    dataset_meta = cfg.get(
+        'dataset',
+        'corridor_task' if is_corridor_task else 'corridor')
+    if dataset_meta not in ('corridor_task', 'corridor'):
+        dataset_meta = 'corridor_task' if is_corridor_task else 'corridor'
+
+    task_name_meta = cfg.get('task_name', task_name)
+    if is_corridor_task and not task_name_meta:
+        task_name_meta = _infer_task_name_from_path(
+            args.data_root, default_name='action3_balanced')
+
+    task_num_classes_meta = cfg.get('task_num_classes', task_num_classes)
+    if task_num_classes_meta is None:
+        task_num_classes_meta = cfg.get('num_classes', num_actions)
+    # corridor_task 任务名兜底到固定集合，便于后续汇总脚本稳定识别
+    if is_corridor_task:
+        known_tasks = set(_TASK_CLASS_NAMES.keys())
+        if task_name_meta not in known_tasks:
+            inferred = _infer_task_name_from_path(args.data_root, default_name='')
+            if inferred in known_tasks:
+                task_name_meta = inferred
+            else:
+                cls_n = _safe_int(task_num_classes_meta, num_actions)
+                if cls_n == 2:
+                    task_name_meta = 'junction_lr'
+                elif cls_n == 4:
+                    task_name_meta = 'stage4'
+                elif cls_n == 3 and 'stage3' in str(args.data_root).lower():
+                    task_name_meta = 'stage3'
+                else:
+                    task_name_meta = 'action3_balanced'
+
+    seq_len_meta = cfg.get('seq_len', None)
+    stride_meta = cfg.get('stride', None)
+    encoding_meta = cfg.get('encoding', encoding)
+
     metrics = {
         'exp_name': exp_name,
         'epoch': epoch,
+        'dataset': dataset_meta,
+        'task_name': task_name_meta,
+        'task_num_classes': _safe_int(task_num_classes_meta, task_num_classes_meta),
+        'neuron_type': cfg.get('neuron_type', neuron_type),
+        'residual_mode': cfg.get('residual_mode', residual_mode),
+        'T': _safe_int(cfg.get('T', T), T),
+        'img_h': _safe_int(cfg.get('img_h', img_h), img_h),
+        'img_w': _safe_int(cfg.get('img_w', img_w), img_w),
+        'seq_len': seq_len_meta,
+        'stride': stride_meta,
+        'encoding': encoding_meta,
         'accuracy': round(accuracy, 6),
         'avg_spike_rate': round(float(avg_sr), 6),
         'sparsity': round(1.0 - float(avg_sr), 6),
         'spikes_per_image': round(spikes_per_img, 1),
+        'test_samples': total_frames,
         'total_test_frames': total_frames,
         'group_rates': {k: round(v, 6) for k, v in group_rates.items()},
+        'source': 'plot_results.py',
     }
     if is_discrete:
         metrics['per_class'] = per_class
         metrics['confusion_matrix'] = cm.tolist()
+        metrics['macro_precision'] = round(float(macro_precision or 0.0), 6)
+        metrics['macro_recall'] = round(float(macro_recall or 0.0), 6)
+        metrics['macro_f1'] = round(float(macro_f1 or 0.0), 6)
+        if run_metrics:
+            metrics['run_accuracy'] = run_metrics['run_accuracy']
+            metrics['run_total'] = run_metrics['total_runs']
+            metrics['run_correct'] = run_metrics['correct_runs']
 
     with open(os.path.join(args.out_dir, 'metrics.json'), 'w',
               encoding='utf-8') as f:
