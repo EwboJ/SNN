@@ -4,7 +4,7 @@
 支持:
   - CIFAR-10/100（原流程完全不变）
   - 走廊导航原始数据集（corridor, 离散/回归/序列）
-  - 阶段一派生任务（corridor_task, action3/junction_lr/stage4）
+  - 阶段一派生任务（corridor_task, action3/junction_lr/stage3/stage4）
 
 v3 变更:
   - 新增 --dataset corridor_task 分支
@@ -34,7 +34,16 @@ CIFAR-10:
         --task_name junction_lr --task_num_classes 2 \\
         --encoding rate -T 8 -b 32 -epochs 60 --final_test
 
-阶段一派生任务 (stage4):
+阶段一派生任务 (stage3，主线推荐):
+    python train.py --dataset corridor_task \\
+        --task_root ./data/stage1/stage3_v1 \\
+        --task_name stage3 --task_num_classes 3 \\
+        --encoding rate -T 4 --img_h 48 --img_w 64 \\
+        --neuron_type APLIF --residual_mode ADD \\
+        --class_balance weighted_sampler -b 32 -epochs 80 \\
+        -lr 0.001 -enable_tensorboard --final_test
+
+阶段一派生任务 (stage4，历史/可选):
     python train.py --dataset corridor_task \\
         --task_root ./data/stage1/stage4_v1 \\
         --task_name stage4 --task_num_classes 4 \\
@@ -745,7 +754,7 @@ def main():
                         type=str,
                         help='corridor_task 数据根目录 (含 train/val/test/)')
     parser.add_argument('--task_name', default='action3_balanced', type=str,
-                        help='任务名 (用于实验命名: action3_balanced/junction_lr/stage4)')
+                        help='任务名 (用于实验命名: action3_balanced/junction_lr/stage3/stage4)')
     parser.add_argument('--task_num_classes', default=3, type=int,
                         help='corridor_task 类别数')
     parser.add_argument('--label_smoothing', default=0.0, type=float,
