@@ -110,8 +110,9 @@ class HierarchicalNavigatorStateMachine:
         start_junction_hist_on_turn_signal: bool = True,
         min_turn_votes_to_start_junction_hist: int = 1,
         reset_junction_hist_when_no_turn_signal: bool = True,
-        turn_relock_window_steps: int = 6,
-        turn_relock_votes: int = 4,
+        turn_relock_window_steps: int = 12,
+        turn_relock_votes: int = 3,
+        turn_relock_hist_size: int = 5,
         allow_turn_relock_once: bool = True,
         soft_turn_steps: int = 14,
     ) -> None:
@@ -147,12 +148,14 @@ class HierarchicalNavigatorStateMachine:
         self.reset_junction_hist_when_no_turn_signal = bool(reset_junction_hist_when_no_turn_signal)
         self.turn_relock_window_steps = max(0, int(turn_relock_window_steps))
         self.turn_relock_votes = max(1, int(turn_relock_votes))
+        self.turn_relock_hist_size = max(1, int(turn_relock_hist_size))
         self.allow_turn_relock_once = bool(allow_turn_relock_once)
         self.soft_turn_steps = max(1, int(soft_turn_steps))
 
         # 历史窗口（用于投票迟滞）
         self._stage_hist = deque(maxlen=self.stage_window_size)
         self._junction_hist = deque(maxlen=self.junction_window_size)
+        self._turn_relock_hist = deque(maxlen=self.turn_relock_hist_size)
 
         self.reset()
 
@@ -171,6 +174,7 @@ class HierarchicalNavigatorStateMachine:
         self._turn_relock_used: bool = False
         self._stage_hist.clear()
         self._junction_hist.clear()
+        self._turn_relock_hist.clear()
 
     @staticmethod
     def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -377,9 +381,10 @@ class HierarchicalNavigatorStateMachine:
             if self.state_step <= self.turn_relock_window_steps:
                 junction_hist_update_allowed = True
                 if junction_pred is not None:
-                    self._junction_hist.append(junction_pred)
+                    self._turn_relock_hist.append(junction_pred)
         elif self.state in (NavState.BOOT, NavState.STRAIGHTKEEP):
             self._junction_hist.clear()
+            self._turn_relock_hist.clear()
 
         stage_counts = self._get_stage_counts()
         junction_counts = self._get_junction_counts()
@@ -406,6 +411,9 @@ class HierarchicalNavigatorStateMachine:
         relock_from = ''
         relock_to = ''
         relock_reason = ''
+        relock_window_open = False
+        turn_relock_votes_window = {'Left': 0, 'Right': 0}
+        turn_relock_candidate = None
 
         # ===== 3) 状态转移逻辑（含迟滞） =====
         if self.state == NavState.BOOT:
@@ -496,6 +504,7 @@ class HierarchicalNavigatorStateMachine:
                 self._recover_support_count = 0
                 self._straight_recover_hold_count = 0
                 self._turn_relock_used = False
+                self._turn_relock_hist.clear()
             else:
                 # ===== APPROACH -> STRAIGHTKEEP (保守 fallback) =====
                 # 必须同时满足所有条件才允许 fallback
@@ -523,6 +532,21 @@ class HierarchicalNavigatorStateMachine:
         elif self.state == NavState.TURN:
             # TURN 期间方向一般不改写；仅在早期窗口允许一次纠错重锁
             _turn_relock_window_open = (self.state_step <= self.turn_relock_window_steps)
+            relock_window_open = bool(_turn_relock_window_open)
+            _turn_relock_counts = Counter(self._turn_relock_hist)
+            _relock_left_votes = int(_turn_relock_counts.get('Left', 0))
+            _relock_right_votes = int(_turn_relock_counts.get('Right', 0))
+            turn_relock_votes_window = {
+                'Left': _relock_left_votes,
+                'Right': _relock_right_votes,
+            }
+            if (_relock_left_votes >= self.turn_relock_votes
+                    and _relock_left_votes >= _relock_right_votes):
+                turn_relock_candidate = 'Left'
+            elif (_relock_right_votes >= self.turn_relock_votes
+                    and _relock_right_votes > _relock_left_votes):
+                turn_relock_candidate = 'Right'
+
             _turn_signal_strong = (turn_votes >= majority_thr or stage_majority == 'Turn')
             _relock_quota_ok = ((not self.allow_turn_relock_once) or (not self._turn_relock_used))
             if (_turn_relock_window_open
@@ -530,8 +554,8 @@ class HierarchicalNavigatorStateMachine:
                     and _relock_quota_ok
                     and self.locked_turn_dir in ('Left', 'Right')):
                 _opposite_dir = 'Right' if self.locked_turn_dir == 'Left' else 'Left'
-                _opposite_votes = int(junction_counts.get(_opposite_dir, 0))
-                if _opposite_votes >= self.turn_relock_votes:
+                _opposite_votes = int(_turn_relock_counts.get(_opposite_dir, 0))
+                if turn_relock_candidate == _opposite_dir and _opposite_votes >= self.turn_relock_votes:
                     relock_applied = True
                     relock_from = str(self.locked_turn_dir)
                     relock_to = _opposite_dir
@@ -703,6 +727,7 @@ class HierarchicalNavigatorStateMachine:
                 'reset_junction_hist_when_no_turn_signal': self.reset_junction_hist_when_no_turn_signal,
                 'turn_relock_window_steps': self.turn_relock_window_steps,
                 'turn_relock_votes': self.turn_relock_votes,
+                'turn_relock_hist_size': self.turn_relock_hist_size,
                 'allow_turn_relock_once': self.allow_turn_relock_once,
                 'soft_turn_steps': self.soft_turn_steps,
             },
@@ -734,6 +759,10 @@ class HierarchicalNavigatorStateMachine:
             'relock_from': str(relock_from),
             'relock_to': str(relock_to),
             'relock_reason': str(relock_reason),
+            'relock_window_open': bool(relock_window_open),
+            'turn_relock_votes_window': turn_relock_votes_window,
+            'turn_relock_candidate': turn_relock_candidate,
+            'turn_relock_hist': list(self._turn_relock_hist),
             'transition': transition_info,
         }
 
