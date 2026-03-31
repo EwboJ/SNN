@@ -284,6 +284,15 @@ def _build_state_machine(cfg: Dict[str, Any]) -> HierarchicalNavigatorStateMachi
         right_turn_omega=turn_cfg.get('right_omega', -1.2),
         # TURN -> RECOVER 渐减累计门槛
         recover_support_steps_needed=sm_cfg.get('recover_support_steps_needed', 2),
+        min_turn_steps=sm_cfg.get('min_turn_steps', 5),
+        turn_exit_vote_threshold=sm_cfg.get('turn_exit_vote_threshold', 2),
+        straight_recover_omega_thresh=sm_cfg.get('straight_recover_omega_thresh', 0.3),
+        straight_recover_hold_steps=sm_cfg.get('straight_recover_hold_steps', 3),
+        min_approach_steps_before_junction_lock=sm_cfg.get('min_approach_steps_before_junction_lock', 3),
+        min_turn_votes_before_junction_lock=sm_cfg.get('min_turn_votes_before_junction_lock', 2),
+        start_junction_hist_on_turn_signal=sm_cfg.get('start_junction_hist_on_turn_signal', True),
+        min_turn_votes_to_start_junction_hist=sm_cfg.get('min_turn_votes_to_start_junction_hist', 1),
+        reset_junction_hist_when_no_turn_signal=sm_cfg.get('reset_junction_hist_when_no_turn_signal', True),
     )
 
 
