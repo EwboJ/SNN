@@ -48,6 +48,9 @@ state_machine:
   provisional_turn_min_observe_steps: 3        # 最小观察步数，未达到前禁止提交
   provisional_turn_recent_consistency_steps: 3 # 最近连续一致步数阈值，用于方向稳定性判定
   provisional_turn_margin_votes: 2             # 主方向相对次方向的最小领先票数
+  provisional_turn_use_omega_gate: true        # 是否启用 omega 方向一致性门控，抑制仅靠 junction 连续误判的早提交
+  provisional_turn_omega_sign_thresh: 0.06     # omega 符号判定阈值，|omega| 小于该值视为无方向提示
+  provisional_turn_require_omega_agreement: true # 当存在 omega 方向提示时，提交方向需与其一致才允许 commit
 turn_control:
   left_omega: 1.2             # 固定左转角速度(rad/s)
   right_omega: -1.2           # 固定右转角速度(rad/s)

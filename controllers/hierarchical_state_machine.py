@@ -122,6 +122,9 @@ class HierarchicalNavigatorStateMachine:
         provisional_turn_min_observe_steps: int = 3,
         provisional_turn_recent_consistency_steps: int = 3,
         provisional_turn_margin_votes: int = 2,
+        provisional_turn_use_omega_gate: bool = True,
+        provisional_turn_omega_sign_thresh: float = 0.06,
+        provisional_turn_require_omega_agreement: bool = True,
     ) -> None:
         # 参数做安全裁剪，避免异常配置导致状态机不可用
         self.stage_window_size = max(1, int(stage_window_size))
@@ -164,6 +167,9 @@ class HierarchicalNavigatorStateMachine:
         self.provisional_turn_min_observe_steps = max(1, int(provisional_turn_min_observe_steps))
         self.provisional_turn_recent_consistency_steps = max(1, int(provisional_turn_recent_consistency_steps))
         self.provisional_turn_margin_votes = max(1, int(provisional_turn_margin_votes))
+        self.provisional_turn_use_omega_gate = bool(provisional_turn_use_omega_gate)
+        self.provisional_turn_omega_sign_thresh = max(0.0, float(provisional_turn_omega_sign_thresh))
+        self.provisional_turn_require_omega_agreement = bool(provisional_turn_require_omega_agreement)
 
         # 历史窗口（用于投票迟滞）
         self._stage_hist = deque(maxlen=self.stage_window_size)
@@ -352,6 +358,16 @@ class HierarchicalNavigatorStateMachine:
                 break
         return int(cnt)
 
+    @staticmethod
+    def _omega_dir_hint(omega_raw: float, thresh: float) -> Optional[str]:
+        """Infer turn direction hint from straight_keep omega sign."""
+        t = abs(float(thresh))
+        if float(omega_raw) >= t:
+            return 'Left'
+        if float(omega_raw) <= -t:
+            return 'Right'
+        return None
+
     def _fixed_turn_omega(self, turn_dir: Optional[str]) -> float:
         if turn_dir == 'Left':
             return self.left_turn_omega
@@ -415,6 +431,11 @@ class HierarchicalNavigatorStateMachine:
         provisional_turn_margin = 0
         provisional_turn_observe_ready = False
         provisional_turn_commit_block_reason = ''
+        provisional_turn_omega_dir_hint = self._omega_dir_hint(
+            omega_raw, self.provisional_turn_omega_sign_thresh
+        )
+        provisional_turn_omega_agree = None
+        provisional_turn_effective_mix_ratio = 0.0
 
         if self.state == NavState.APPROACH:
             _turn_signal_for_junction_hist = (
@@ -633,11 +654,28 @@ class HierarchicalNavigatorStateMachine:
             _turn_signal_strong = (stage_majority == 'Turn' or turn_votes >= majority_thr)
             _recent_ok = (provisional_turn_recent_dir is not None)
             _margin_ok = (provisional_turn_margin >= self.provisional_turn_margin_votes)
+            _omega_conflict = (
+                provisional_turn_omega_dir_hint is not None
+                and provisional_turn_candidate in ('Left', 'Right')
+                and provisional_turn_candidate != provisional_turn_omega_dir_hint
+            )
+            if provisional_turn_candidate in ('Left', 'Right'):
+                provisional_turn_omega_agree = (not _omega_conflict)
+            elif provisional_turn_omega_dir_hint is None:
+                provisional_turn_omega_agree = True
+            else:
+                provisional_turn_omega_agree = None
+            _omega_gate_conflict_block = (
+                self.provisional_turn_use_omega_gate
+                and self.provisional_turn_require_omega_agreement
+                and _omega_conflict
+            )
             provisional_turn_commit_ready = bool(
                 provisional_turn_observe_ready
                 and _turn_signal_strong
                 and _recent_ok
                 and _margin_ok
+                and (not _omega_gate_conflict_block)
             )
 
             if not provisional_turn_commit_ready:
@@ -647,6 +685,8 @@ class HierarchicalNavigatorStateMachine:
                     provisional_turn_commit_block_reason = 'turn_signal_weak'
                 elif not _recent_ok:
                     provisional_turn_commit_block_reason = 'no_recent_consistency'
+                elif _omega_gate_conflict_block:
+                    provisional_turn_commit_block_reason = 'omega_sign_conflict'
                 elif not _margin_ok:
                     provisional_turn_commit_block_reason = 'margin_too_small'
                 else:
@@ -844,6 +884,7 @@ class HierarchicalNavigatorStateMachine:
         turn_omega = self._fixed_turn_omega(_turn_control_dir)
         recover_alpha = 1.0
         turn_mix_ratio = 0.0
+        provisional_turn_effective_mix_ratio = 0.0
 
         if self.state == NavState.BOOT:
             omega_cmd_final = 0.0
@@ -852,7 +893,19 @@ class HierarchicalNavigatorStateMachine:
             omega_cmd_final = omega_raw
         elif self.state == NavState.PROVISIONAL_TURN:
             # 方向尚未最终确认，仅施加小幅转向偏置，避免强制大转向
-            turn_mix_ratio = self.provisional_turn_mix_ratio
+            provisional_turn_effective_mix_ratio = self.provisional_turn_mix_ratio
+            _mix_candidate = provisional_turn_candidate
+            if _mix_candidate not in ('Left', 'Right'):
+                _mix_candidate = self.provisional_turn_dir
+            _mix_conflict = (
+                self.provisional_turn_use_omega_gate
+                and provisional_turn_omega_dir_hint is not None
+                and _mix_candidate in ('Left', 'Right')
+                and _mix_candidate != provisional_turn_omega_dir_hint
+            )
+            if _mix_conflict:
+                provisional_turn_effective_mix_ratio *= 0.4
+            turn_mix_ratio = provisional_turn_effective_mix_ratio
             omega_cmd_final = ((1.0 - turn_mix_ratio) * omega_raw
                                + turn_mix_ratio * turn_omega)
         elif self.state == NavState.TURN:
@@ -932,6 +985,9 @@ class HierarchicalNavigatorStateMachine:
                 'provisional_turn_min_observe_steps': self.provisional_turn_min_observe_steps,
                 'provisional_turn_recent_consistency_steps': self.provisional_turn_recent_consistency_steps,
                 'provisional_turn_margin_votes': self.provisional_turn_margin_votes,
+                'provisional_turn_use_omega_gate': self.provisional_turn_use_omega_gate,
+                'provisional_turn_omega_sign_thresh': self.provisional_turn_omega_sign_thresh,
+                'provisional_turn_require_omega_agreement': self.provisional_turn_require_omega_agreement,
             },
             'omega_components': {
                 'straight_keep_raw': float(omega_raw),
@@ -975,6 +1031,9 @@ class HierarchicalNavigatorStateMachine:
             'provisional_turn_margin': int(provisional_turn_margin),
             'provisional_turn_observe_ready': bool(provisional_turn_observe_ready),
             'provisional_turn_commit_block_reason': str(provisional_turn_commit_block_reason),
+            'provisional_turn_omega_dir_hint': provisional_turn_omega_dir_hint,
+            'provisional_turn_omega_agree': provisional_turn_omega_agree,
+            'provisional_turn_effective_mix_ratio': float(provisional_turn_effective_mix_ratio),
             'transition': transition_info,
         }
 

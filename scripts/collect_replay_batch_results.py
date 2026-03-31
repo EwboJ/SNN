@@ -43,7 +43,10 @@ COLLECT_FIELDS = [
     'gt_turn_dir',
     'first_locked_turn_dir',
     'most_frequent_locked_turn_dir',
+    'corrected_eval_dir',
     'turn_dir_match',
+    'corrected_turn_dir_match',
+    'has_late_correction',
     'num_turn_entries',
     'num_recover_entries',
     'first_turn_step',
@@ -84,6 +87,14 @@ def _format_sequence(seq: Any) -> str:
     if isinstance(seq, list):
         return ' -> '.join(str(s) for s in seq)
     return str(seq) if seq else ''
+
+
+def _normalize_turn_dir(val: Any) -> str:
+    """将方向字段规范化为 Left/Right/''。"""
+    s = str(val).strip()
+    if s in ('Left', 'Right'):
+        return s
+    return ''
 
 
 def _load_summary(json_path: str) -> Optional[Dict[str, Any]]:
@@ -127,13 +138,38 @@ def _collect_all_runs(exp_root: str) -> List[Dict[str, Any]]:
         # 提取每一个字段，缺失则留空
         run_name = _extract_run_name(summary, sd)
         unique_seq = _safe_get(summary, 'unique_state_sequence', [])
+        gt_turn_dir = _normalize_turn_dir(_safe_get(summary, 'gt_turn_dir', ''))
+        first_locked_turn_dir = _normalize_turn_dir(
+            _safe_get(summary, 'first_locked_turn_dir', '')
+        )
+        most_frequent_locked_turn_dir = _normalize_turn_dir(
+            _safe_get(summary, 'most_frequent_locked_turn_dir', '')
+        )
+
+        # 辅助分析指标：优先使用 most_frequent_locked_turn_dir 评估后期纠正是否成功
+        corrected_eval_dir = (
+            most_frequent_locked_turn_dir
+            if most_frequent_locked_turn_dir
+            else first_locked_turn_dir
+        )
+        if gt_turn_dir and corrected_eval_dir:
+            corrected_turn_dir_match: Any = (corrected_eval_dir == gt_turn_dir)
+        else:
+            corrected_turn_dir_match = ''
+        has_late_correction = bool(
+            most_frequent_locked_turn_dir
+            and first_locked_turn_dir != most_frequent_locked_turn_dir
+        )
 
         row: Dict[str, Any] = {
             'run_name':                      run_name,
-            'gt_turn_dir':                   _safe_get(summary, 'gt_turn_dir', ''),
-            'first_locked_turn_dir':         _safe_get(summary, 'first_locked_turn_dir', ''),
-            'most_frequent_locked_turn_dir': _safe_get(summary, 'most_frequent_locked_turn_dir', ''),
+            'gt_turn_dir':                   gt_turn_dir,
+            'first_locked_turn_dir':         first_locked_turn_dir,
+            'most_frequent_locked_turn_dir': most_frequent_locked_turn_dir,
+            'corrected_eval_dir':            corrected_eval_dir,
             'turn_dir_match':                _safe_get(summary, 'turn_dir_match', ''),
+            'corrected_turn_dir_match':      corrected_turn_dir_match,
+            'has_late_correction':           has_late_correction,
             'num_turn_entries':              _safe_get(summary, 'num_turn_entries', ''),
             'num_recover_entries':           _safe_get(summary, 'num_recover_entries', ''),
             'first_turn_step':               _safe_get(summary, 'first_turn_step', ''),
@@ -171,6 +207,25 @@ def _compute_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     match_count = sum(1 for r in rows if r.get('turn_dir_match') is True)
     valid_match_count = sum(1 for r in rows if r.get('turn_dir_match') in (True, False))
     turn_dir_match_rate = match_count / valid_match_count if valid_match_count > 0 else None
+
+    # corrected_turn_dir_match_rate（辅助分析指标）：
+    # 优先按 corrected_eval_dir（most_frequent 优先）评估与 gt 的匹配比例
+    corrected_match_count = sum(1 for r in rows if r.get('corrected_turn_dir_match') is True)
+    valid_corrected_match_count = sum(
+        1 for r in rows if r.get('corrected_turn_dir_match') in (True, False)
+    )
+    corrected_turn_dir_match_rate = (
+        corrected_match_count / valid_corrected_match_count
+        if valid_corrected_match_count > 0 else None
+    )
+
+    # late_correction_rate：发生“首锁与后期主导方向不同”的比例（辅助分析）
+    late_correction_count = sum(1 for r in rows if r.get('has_late_correction') is True)
+    valid_late_correction_count = sum(1 for r in rows if r.get('has_late_correction') in (True, False))
+    late_correction_rate = (
+        late_correction_count / valid_late_correction_count
+        if valid_late_correction_count > 0 else None
+    )
 
     # single_turn_success_rate：num_turn_entries == 1
     single_turn_count = sum(1 for r in rows if _to_int(r.get('num_turn_entries')) == 1)
@@ -218,6 +273,8 @@ def _compute_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         'total_runs':                  total_runs,
         'turn_dir_match_rate':         turn_dir_match_rate,
+        'corrected_turn_dir_match_rate': corrected_turn_dir_match_rate,
+        'late_correction_rate':        late_correction_rate,
         'single_turn_success_rate':    single_turn_success_rate,
         'single_recover_success_rate': single_recover_success_rate,
         'full_sequence_success_rate':  full_sequence_success_rate,
@@ -296,7 +353,9 @@ def _write_md(rows: List[Dict[str, Any]], stats: Dict[str, Any], out_md: str) ->
     lines.append('| 指标 | 值 |')
     lines.append('|------|-----|')
     lines.append(f'| total_runs | {stats.get("total_runs", 0)} |')
-    lines.append(f'| turn_dir_match_rate | {_fmt_pct(stats.get("turn_dir_match_rate"))} |')
+    lines.append(f'| turn_dir_match_rate (首锁正确率, 主指标) | {_fmt_pct(stats.get("turn_dir_match_rate"))} |')
+    lines.append(f'| corrected_turn_dir_match_rate (后期纠正后匹配率, 辅助指标) | {_fmt_pct(stats.get("corrected_turn_dir_match_rate"))} |')
+    lines.append(f'| late_correction_rate (发生后期纠正比例, 辅助指标) | {_fmt_pct(stats.get("late_correction_rate"))} |')
     lines.append(f'| single_turn_success_rate | {_fmt_pct(stats.get("single_turn_success_rate"))} |')
     lines.append(f'| single_recover_success_rate | {_fmt_pct(stats.get("single_recover_success_rate"))} |')
     lines.append(f'| full_sequence_success_rate | {_fmt_pct(stats.get("full_sequence_success_rate"))} |')
@@ -314,7 +373,11 @@ def _write_md(rows: List[Dict[str, Any]], stats: Dict[str, Any], out_md: str) ->
         ('run_name',                      'Run'),
         ('gt_turn_dir',                   'GT Dir'),
         ('first_locked_turn_dir',         '1st Lock'),
-        ('turn_dir_match',                'Match'),
+        ('most_frequent_locked_turn_dir', 'Most Freq Lock'),
+        ('corrected_eval_dir',            'Corr Eval Dir'),
+        ('turn_dir_match',                '1st Match'),
+        ('corrected_turn_dir_match',      'Corr Match'),
+        ('has_late_correction',           'Late Corr'),
         ('num_turn_entries',              '#Turn'),
         ('num_recover_entries',           '#Recov'),
         ('first_turn_step',              '1st Turn'),
@@ -362,7 +425,9 @@ def _print_stats(stats: Dict[str, Any]) -> None:
     print('  Replay Batch 聚合统计')
     print('=' * 64)
     print(f'  total_runs                  : {stats.get("total_runs", 0)}')
-    print(f'  turn_dir_match_rate         : {_fmt_pct(stats.get("turn_dir_match_rate"))}')
+    print(f'  turn_dir_match_rate         : {_fmt_pct(stats.get("turn_dir_match_rate"))}  (主指标: 首锁正确率)')
+    print(f'  corrected_turn_dir_match_rate: {_fmt_pct(stats.get("corrected_turn_dir_match_rate"))}  (辅助: 后期纠正后匹配率)')
+    print(f'  late_correction_rate        : {_fmt_pct(stats.get("late_correction_rate"))}  (辅助: 发生后期纠正比例)')
     print(f'  single_turn_success_rate    : {_fmt_pct(stats.get("single_turn_success_rate"))}')
     print(f'  single_recover_success_rate : {_fmt_pct(stats.get("single_recover_success_rate"))}')
     print(f'  full_sequence_success_rate  : {_fmt_pct(stats.get("full_sequence_success_rate"))}')

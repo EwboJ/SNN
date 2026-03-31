@@ -304,6 +304,11 @@ def _build_state_machine(cfg: Dict[str, Any]) -> HierarchicalNavigatorStateMachi
         provisional_turn_min_observe_steps=sm_cfg.get('provisional_turn_min_observe_steps', 3),
         provisional_turn_recent_consistency_steps=sm_cfg.get('provisional_turn_recent_consistency_steps', 3),
         provisional_turn_margin_votes=sm_cfg.get('provisional_turn_margin_votes', 2),
+        provisional_turn_use_omega_gate=sm_cfg.get('provisional_turn_use_omega_gate', True),
+        provisional_turn_omega_sign_thresh=sm_cfg.get('provisional_turn_omega_sign_thresh', 0.06),
+        provisional_turn_require_omega_agreement=sm_cfg.get(
+            'provisional_turn_require_omega_agreement', True
+        ),
     )
 
 
@@ -355,6 +360,15 @@ def _snapshot_state_machine_thresholds(
             getattr(sm, 'provisional_turn_recent_consistency_steps', 3)
         ),
         'provisional_turn_margin_votes': int(getattr(sm, 'provisional_turn_margin_votes', 2)),
+        'provisional_turn_use_omega_gate': bool(
+            getattr(sm, 'provisional_turn_use_omega_gate', True)
+        ),
+        'provisional_turn_omega_sign_thresh': float(
+            getattr(sm, 'provisional_turn_omega_sign_thresh', 0.06)
+        ),
+        'provisional_turn_require_omega_agreement': bool(
+            getattr(sm, 'provisional_turn_require_omega_agreement', True)
+        ),
     }
 
 
@@ -654,6 +668,13 @@ def run_replay(args: argparse.Namespace) -> None:
             'turn_exit_ready': bool(debug.get('turn_exit_ready', False)),
             'straight_recover_hold_count': int(
                 _safe_float(debug.get('straight_recover_hold_count', 0), 0)),
+            'provisional_turn_omega_dir_hint': (
+                '' if debug.get('provisional_turn_omega_dir_hint', None) is None
+                else str(debug.get('provisional_turn_omega_dir_hint'))
+            ),
+            'provisional_turn_omega_agree': debug.get('provisional_turn_omega_agree', None),
+            'provisional_turn_effective_mix_ratio': _safe_float(
+                debug.get('provisional_turn_effective_mix_ratio', 0.0), 0.0),
             # 新增列
             'valid_flag': valid_flag,
             'gt_action_name': gt_action_name,
@@ -682,6 +703,10 @@ def run_replay(args: argparse.Namespace) -> None:
                 debug.get('fallback_blocked_by_turn_signal', False)),
             'fallback_blocked_by_junction_lock': bool(
                 debug.get('fallback_blocked_by_junction_lock', False)),
+            'provisional_turn_omega_dir_hint': debug.get('provisional_turn_omega_dir_hint', None),
+            'provisional_turn_omega_agree': debug.get('provisional_turn_omega_agree', None),
+            'provisional_turn_effective_mix_ratio': _safe_float(
+                debug.get('provisional_turn_effective_mix_ratio', 0.0), 0.0),
         }
         # 保留完整状态机 debug 字段，便于核查新逻辑是否实际生效
         debug_row.update(deepcopy(debug))
@@ -714,6 +739,9 @@ def run_replay(args: argparse.Namespace) -> None:
         'current_recover_votes',
         'turn_exit_ready',
         'straight_recover_hold_count',
+        'provisional_turn_omega_dir_hint',
+        'provisional_turn_omega_agree',
+        'provisional_turn_effective_mix_ratio',
         # 新增列
         'valid_flag',
         'gt_action_name',
