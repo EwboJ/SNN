@@ -94,6 +94,19 @@ class HierarchicalNavigatorStateMachine:
         right_turn_omega: float = -1.2,
         # TURN -> RECOVER 支持累计门槛（渐减模式下需要的有效支持步数）
         recover_support_steps_needed: int = 2,
+        # ===== 新增可配置参数 =====
+        # TURN 最小步数：在此之前不允许退出 TURN
+        min_turn_steps: int = 5,
+        # TURN 退出投票阈值：turn_votes 低于此值时考虑退出
+        turn_exit_vote_threshold: int = 2,
+        # TURN 退出时 straight_keep omega 阈值：|omega| 低于此值视为可安全切回直行
+        straight_recover_omega_thresh: float = 0.3,
+        # TURN 退出时低 turn+低 omega 需持续的步数
+        straight_recover_hold_steps: int = 3,
+        # APPROACH 中 junction 最早锁存的步数门槛
+        min_approach_steps_before_junction_lock: int = 3,
+        # APPROACH 中 junction 锁存需要的最低 turn 票数
+        min_turn_votes_before_junction_lock: int = 2,
     ) -> None:
         # 参数做安全裁剪，避免异常配置导致状态机不可用
         self.stage_window_size = max(1, int(stage_window_size))
@@ -115,6 +128,14 @@ class HierarchicalNavigatorStateMachine:
         self.right_turn_omega = float(right_turn_omega)
         self.recover_support_steps_needed = max(1, int(recover_support_steps_needed))
 
+        # ===== 新增参数 =====
+        self.min_turn_steps = max(1, int(min_turn_steps))
+        self.turn_exit_vote_threshold = max(0, int(turn_exit_vote_threshold))
+        self.straight_recover_omega_thresh = max(0.0, float(straight_recover_omega_thresh))
+        self.straight_recover_hold_steps = max(1, int(straight_recover_hold_steps))
+        self.min_approach_steps_before_junction_lock = max(0, int(min_approach_steps_before_junction_lock))
+        self.min_turn_votes_before_junction_lock = max(0, int(min_turn_votes_before_junction_lock))
+
         # 历史窗口（用于投票迟滞）
         self._stage_hist = deque(maxlen=self.stage_window_size)
         self._junction_hist = deque(maxlen=self.junction_window_size)
@@ -131,6 +152,8 @@ class HierarchicalNavigatorStateMachine:
         self.global_step: int = 0
         self.state_step: int = 0
         self._recover_support_count: int = 0
+        # 新增：低 turn + 低 omega 持续计数
+        self._straight_recover_hold_count: int = 0
         self._stage_hist.clear()
         self._junction_hist.clear()
 
@@ -322,6 +345,10 @@ class HierarchicalNavigatorStateMachine:
         # 用于 debug：记录 fallback 被阻止的原因
         fallback_blocked_by_turn_signal = False
         fallback_blocked_by_junction_lock = False
+        # 新增 debug 字段
+        turn_exit_ready = False
+        junction_lock_allowed = True
+        junction_lock_block_reason = ''
 
         # ===== 3) 状态转移逻辑（含迟滞） =====
         if self.state == NavState.BOOT:
@@ -358,6 +385,27 @@ class HierarchicalNavigatorStateMachine:
                 _recent_1 = list(self._stage_hist)[-1:]
                 _turn_rising = (_recent_1[-1] == 'Turn')
 
+            # ===== Junction 锁存门控逻辑（防止早期锁错） =====
+            # junction_candidate 是原始投票判定结果，这里通过额外门控决定是否允许正式锁存
+            _junction_raw_candidate = junction_candidate  # 保留原始候选用于 debug
+            _jlock_time_ok = (self.state_step >= self.min_approach_steps_before_junction_lock)
+            _jlock_turn_ok = (turn_votes >= self.min_turn_votes_before_junction_lock)
+            _jlock_rising_ok = _turn_rising
+
+            if not _jlock_time_ok:
+                # 步数不足，延迟锁存
+                junction_lock_allowed = False
+                junction_lock_block_reason = 'junction_lock_deferred_by_early_approach'
+                junction_candidate = None  # 不允许使用，但继续累积 junction votes
+            elif not (_jlock_turn_ok or _jlock_rising_ok):
+                # Turn 信号太弱且无上升趋势，延迟锁存
+                junction_lock_allowed = False
+                junction_lock_block_reason = 'junction_lock_deferred_by_weak_turn_signal'
+                junction_candidate = None
+            else:
+                junction_lock_allowed = True
+                junction_lock_block_reason = ''
+
             # 计算宽松进入 TURN 的阈值
             _soft_turn_thr = max(1, self.stage_enter_turn_votes - 1)
 
@@ -389,20 +437,21 @@ class HierarchicalNavigatorStateMachine:
                     f'rising={_turn_rising})'
                 )
                 self._recover_support_count = 0
+                self._straight_recover_hold_count = 0
             else:
                 # ===== APPROACH -> STRAIGHTKEEP (保守 fallback) =====
                 # 必须同时满足所有条件才允许 fallback
                 _fb_time_ok = (self.state_step >= self.stage_window_size)
                 _fb_approach_weak = (approach_votes < majority_thr)
                 _fb_turn_absent = (turn_votes < max(1, self.stage_enter_turn_votes - 1))
-                _fb_no_junction = (junction_candidate is None)
+                _fb_no_junction = (_junction_raw_candidate is None)
 
                 if _fb_time_ok and _fb_approach_weak and _fb_turn_absent and _fb_no_junction:
                     transition_info = self._transition(
                         NavState.STRAIGHTKEEP,
                         f'approach_fallback_no_turn_signal('
                         f'approach={approach_votes}, turn={turn_votes}, '
-                        f'junction={junction_candidate})'
+                        f'junction={_junction_raw_candidate})'
                     )
                     self._junction_hist.clear()
                 else:
@@ -416,23 +465,52 @@ class HierarchicalNavigatorStateMachine:
         elif self.state == NavState.TURN:
             # TURN 期间方向锁存不可改写（关键约束）
             # ===== Recover 支持累计逻辑（渐减模式，吸收抖动） =====
-            if stage_pred == 'Recover':
+            if recover_votes >= majority_thr:
                 self._recover_support_count += 1
             else:
                 # 不立刻清零，渐减以吸收 Recover 的轻微抖动
                 self._recover_support_count = max(0, self._recover_support_count - 1)
 
-            # ===== TURN -> RECOVER 优先级：Recover 信号确认 > timeout =====
-            if self._recover_support_count >= self.recover_support_steps_needed:
-                # Recover 信号已稳定确认，正常退出 TURN
-                transition_info = self._transition(
-                    NavState.RECOVER,
-                    f'recover_signal_confirmed('
-                    f'support={self._recover_support_count}, '
-                    f'needed={self.recover_support_steps_needed})'
+            # ===== 低 turn + 低 omega 持续计数 =====
+            _low_turn = (turn_votes <= self.turn_exit_vote_threshold)
+            _low_omega = (abs(omega_raw) <= self.straight_recover_omega_thresh)
+            if _low_turn and _low_omega:
+                self._straight_recover_hold_count += 1
+            else:
+                self._straight_recover_hold_count = 0
+
+            # ===== TURN -> RECOVER 多条件退出逻辑 =====
+            # 只有过了最小 TURN 步数才允许进入 RECOVER 判断
+            turn_exit_ready = (self.state_step >= self.min_turn_steps)
+
+            if turn_exit_ready:
+                # 条件 a: Recover 信号已稳定确认
+                _exit_by_recover_signal = (
+                    self._recover_support_count >= self.recover_support_steps_needed
                 )
-            elif self.state_step >= self.max_turn_steps:
-                # Recover 始终无法形成稳定支持，timeout 兜底
+                # 条件 b: 低 turn 票数 + 低 omega 持续足够步数
+                _exit_by_low_turn_omega = (
+                    self._straight_recover_hold_count >= self.straight_recover_hold_steps
+                )
+
+                if _exit_by_recover_signal:
+                    transition_info = self._transition(
+                        NavState.RECOVER,
+                        f'recover_signal_confirmed('
+                        f'support={self._recover_support_count}, '
+                        f'needed={self.recover_support_steps_needed})'
+                    )
+                elif _exit_by_low_turn_omega:
+                    transition_info = self._transition(
+                        NavState.RECOVER,
+                        f'recover_by_low_turn_and_low_omega('
+                        f'turn_votes={turn_votes}, '
+                        f'omega_raw={omega_raw:.3f}, '
+                        f'hold_count={self._straight_recover_hold_count})'
+                    )
+
+            # 最终兜底：timeout 强制退出
+            if transition_info is None and self.state_step >= self.max_turn_steps:
                 turn_timeout_triggered = True
                 transition_info = self._transition(
                     NavState.RECOVER,
@@ -440,6 +518,7 @@ class HierarchicalNavigatorStateMachine:
                     f'recover_support={self._recover_support_count})'
                 )
                 self._recover_support_count = 0
+                self._straight_recover_hold_count = 0
 
         elif self.state == NavState.RECOVER:
             # RECOVER 保持至少 recover_min_steps，且 Turn 不再占多数后回到 STRAIGHTKEEP
@@ -510,6 +589,7 @@ class HierarchicalNavigatorStateMachine:
             'stage_majority': stage_majority,
             'junction_candidate': junction_candidate,
             'recover_support_count': self._recover_support_count,
+            'recover_support_threshold': self.recover_support_steps_needed,
             'thresholds': {
                 'stage_majority': majority_thr,
                 'stage_enter_turn_votes': enter_turn_thr,
@@ -518,6 +598,12 @@ class HierarchicalNavigatorStateMachine:
                 'recover_min_steps': self.recover_min_steps,
                 'max_turn_steps': self.max_turn_steps,
                 'recover_support_steps_needed': self.recover_support_steps_needed,
+                'min_turn_steps': self.min_turn_steps,
+                'turn_exit_vote_threshold': self.turn_exit_vote_threshold,
+                'straight_recover_omega_thresh': self.straight_recover_omega_thresh,
+                'straight_recover_hold_steps': self.straight_recover_hold_steps,
+                'min_approach_steps_before_junction_lock': self.min_approach_steps_before_junction_lock,
+                'min_turn_votes_before_junction_lock': self.min_turn_votes_before_junction_lock,
             },
             'omega_components': {
                 'straight_keep_raw': float(omega_raw),
@@ -527,16 +613,19 @@ class HierarchicalNavigatorStateMachine:
                 'use_fixed_turn_rate': bool(self.use_fixed_turn_rate),
             },
             'turn_timeout_triggered': bool(turn_timeout_triggered),
-            # 新增：Recover 信号分析
+            # Recover 信号分析
             'current_recover_votes': recover_votes,
-            'recover_support_count': self._recover_support_count,
-            'recover_support_threshold': self.recover_support_steps_needed,
             'clip_applied': bool(clip_applied),
             'omega_before_clip': float(omega_before_clip),
             'omega_after_clip': float(omega_after_clip),
-            # 新增：fallback 被阻止的原因分析
+            # fallback 被阻止的原因分析
             'fallback_blocked_by_turn_signal': bool(fallback_blocked_by_turn_signal),
             'fallback_blocked_by_junction_lock': bool(fallback_blocked_by_junction_lock),
+            # ===== 新增 debug 字段 =====
+            'turn_exit_ready': bool(turn_exit_ready),
+            'straight_recover_hold_count': int(self._straight_recover_hold_count),
+            'junction_lock_allowed': bool(junction_lock_allowed),
+            'junction_lock_block_reason': str(junction_lock_block_reason),
             'transition': transition_info,
         }
 
