@@ -27,6 +27,17 @@ state_machine:
   recover_blend_steps: 12             # Recover 到直行阶段的融合步数
   straightkeep_suppress_in_turn: true # Turn 期间抑制 straight_keep 输出
 
+  # ----- TURN 退出增强 -----
+  min_turn_steps: 10                  # TURN 最小持续步数, 在此之前不允许退出 TURN
+  recover_support_steps_needed: 2     # Recover 信号累计确认所需有效支持步数(渐减模式)
+  turn_exit_vote_threshold: 3         # turn_votes 低于此值时, 配合低 omega 可退出 TURN
+  straight_recover_omega_thresh: 0.12 # TURN 退出条件: |omega_raw| 低于此值视为可安全切回直行
+  straight_recover_hold_steps: 3      # 低 turn + 低 omega 需持续的步数才可退出 TURN
+
+  # ----- Junction 锁存延迟 -----
+  min_approach_steps_before_junction_lock: 20  # APPROACH 中 junction 最早锁存的步数门槛, 防止早期锁错
+  min_turn_votes_before_junction_lock: 2       # junction 锁存需要的最低 turn 票数, Turn 信号太弱时延迟锁存
+
 turn_control:
   left_omega: 1.2             # 固定左转角速度(rad/s)
   right_omega: -1.2           # 固定右转角速度(rad/s)
