@@ -457,6 +457,9 @@ def run_replay(args: argparse.Namespace) -> None:
     num_turn_entries = 0
     num_recover_entries = 0
     num_clip_applied = 0
+    num_turn_timeout_exits = 0
+    num_recover_signal_exits = 0
+    num_low_turn_low_omega_exits = 0
 
     # 新增：系统级研究分析追踪变量
     turn_signal_peak_votes = 0        # Turn 票数历史峰值
@@ -464,6 +467,7 @@ def run_replay(args: argparse.Namespace) -> None:
     fallback_step_list: List[int] = []  # 所有 fallback 发生的 step
 
     # 检测 labels.csv 中是否有 action_name / label_name 字段
+    first_junction_lock_allowed_step: Optional[int] = None
     has_action_name = 'action_name' in label_fields
     has_label_name = 'label_name' in label_fields
     has_valid_field = 'valid' in label_fields
@@ -508,6 +512,14 @@ def run_replay(args: argparse.Namespace) -> None:
                 num_turn_entries += 1
             elif transition_to == 'RECOVER':
                 num_recover_entries += 1
+            if transition_from == 'TURN' and transition_to == 'RECOVER':
+                reason_lc = transition_reason.lower()
+                if 'turn_timeout' in reason_lc:
+                    num_turn_timeout_exits += 1
+                elif 'recover_signal_confirmed' in reason_lc:
+                    num_recover_signal_exits += 1
+                elif 'recover_by_low_turn_and_low_omega' in reason_lc:
+                    num_low_turn_low_omega_exits += 1
             # 新增：检测 fallback 并记录 step_idx
             if 'fallback' in transition_reason.lower():
                 fallback_step_list.append(idx)
@@ -538,6 +550,11 @@ def run_replay(args: argparse.Namespace) -> None:
         junction_candidate = debug.get('junction_candidate', None)
         if junction_candidate is not None and junction_lock_first_step is None:
             junction_lock_first_step = idx
+        junction_lock_allowed = bool(debug.get('junction_lock_allowed', False))
+        if first_junction_lock_allowed_step is None:
+            in_approach_flow = (state_now == 'APPROACH') or (transition_from == 'APPROACH')
+            if in_approach_flow and junction_lock_allowed:
+                first_junction_lock_allowed_step = idx
 
         row = {
             'step_idx': idx,
@@ -558,6 +575,13 @@ def run_replay(args: argparse.Namespace) -> None:
             'omega_after_clip': omega_after_clip,
             'stage_confidence': _safe_float(stage_out.get('confidence', 0.0), 0.0),
             'junction_confidence': _safe_float(junction_out.get('confidence', 0.0), 0.0),
+            'junction_candidate': '' if junction_candidate is None else str(junction_candidate),
+            'junction_lock_allowed': junction_lock_allowed,
+            'junction_lock_block_reason': str(debug.get('junction_lock_block_reason', '')),
+            'current_recover_votes': int(_safe_float(debug.get('current_recover_votes', 0), 0)),
+            'turn_exit_ready': bool(debug.get('turn_exit_ready', False)),
+            'straight_recover_hold_count': int(
+                _safe_float(debug.get('straight_recover_hold_count', 0), 0)),
             # 新增列
             'valid_flag': valid_flag,
             'gt_action_name': gt_action_name,
@@ -569,7 +593,7 @@ def run_replay(args: argparse.Namespace) -> None:
         }
         trace_rows.append(row)
 
-        debug_rows.append({
+        debug_row = {
             'step_idx': idx,
             'state': state_now,
             'transition': transition if isinstance(transition, dict) else None,
@@ -586,7 +610,10 @@ def run_replay(args: argparse.Namespace) -> None:
                 debug.get('fallback_blocked_by_turn_signal', False)),
             'fallback_blocked_by_junction_lock': bool(
                 debug.get('fallback_blocked_by_junction_lock', False)),
-        })
+        }
+        # 保留完整状态机 debug 字段，便于核查新逻辑是否实际生效
+        debug_row.update(deepcopy(debug))
+        debug_rows.append(debug_row)
 
     # 4) replay_trace.csv（保持基础功能，默认保存）
     trace_csv = os.path.join(out_dir, 'replay_trace.csv')
@@ -609,6 +636,12 @@ def run_replay(args: argparse.Namespace) -> None:
         'omega_after_clip',
         'stage_confidence',
         'junction_confidence',
+        'junction_candidate',
+        'junction_lock_allowed',
+        'junction_lock_block_reason',
+        'current_recover_votes',
+        'turn_exit_ready',
+        'straight_recover_hold_count',
         # 新增列
         'valid_flag',
         'gt_action_name',
@@ -709,7 +742,11 @@ def run_replay(args: argparse.Namespace) -> None:
         # ===== 新增：TURN 信号分析 =====
         'turn_signal_peak_votes': int(turn_signal_peak_votes),
         'junction_lock_first_step': junction_lock_first_step,
+        'first_junction_lock_allowed_step': first_junction_lock_allowed_step,
         'fallback_step_list': fallback_step_list,
+        'num_turn_timeout_exits': int(num_turn_timeout_exits),
+        'num_recover_signal_exits': int(num_recover_signal_exits),
+        'num_low_turn_low_omega_exits': int(num_low_turn_low_omega_exits),
         # 追溯信息
         'run_dir': run_dir,
         'config_path': config_path,
