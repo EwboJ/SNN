@@ -316,6 +316,9 @@ class HierarchicalNavigatorStateMachine:
 
         transition_info = None
         turn_timeout_triggered = False
+        # 用于 debug：记录 fallback 被阻止的原因
+        fallback_blocked_by_turn_signal = False
+        fallback_blocked_by_junction_lock = False
 
         # ===== 3) 状态转移逻辑（含迟滞） =====
         if self.state == NavState.BOOT:
@@ -340,23 +343,72 @@ class HierarchicalNavigatorStateMachine:
                 self._junction_hist.clear()
 
         elif self.state == NavState.APPROACH:
-            # APPROACH -> TURN: Turn 投票达到阈值 + junction 满足锁存条件
-            if turn_votes >= enter_turn_thr and junction_candidate is not None:
+            # ===== APPROACH 转移优先级：TURN 进入 > fallback =====
+            # 判断 Turn 票数是否正在上升（最近两帧趋势）
+            _turn_rising = False
+            _hist_len = len(self._stage_hist)
+            if _hist_len >= 2:
+                # 检查最近两帧中至少有一帧是 Turn
+                _recent_2 = list(self._stage_hist)[-2:]
+                _turn_rising = (_recent_2[-1] == 'Turn')
+            elif _hist_len >= 1:
+                _recent_1 = list(self._stage_hist)[-1:]
+                _turn_rising = (_recent_1[-1] == 'Turn')
+
+            # 计算宽松进入 TURN 的阈值
+            _soft_turn_thr = max(1, self.stage_enter_turn_votes - 1)
+
+            # ---- 条件 A: junction 已锁定 + Turn 票数 >= 多数阈值 ----
+            _cond_a = (junction_candidate is not None
+                       and turn_votes >= majority_thr)
+            # ---- 条件 B: junction 已锁定 + Turn 票数 >= 进入阈值 ----
+            _cond_b = (junction_candidate is not None
+                       and turn_votes >= self.stage_enter_turn_votes)
+            # ---- 条件 C: junction 已锁定 + Turn 票数 >= (进入阈值-1) 且趋势上升 ----
+            _cond_c = (junction_candidate is not None
+                       and turn_votes >= _soft_turn_thr
+                       and _turn_rising)
+
+            if _cond_a or _cond_b or _cond_c:
+                # ===== APPROACH -> TURN =====
                 self.locked_turn_dir = junction_candidate
+                # 选择最精确的 reason 标签
+                if _cond_b or (turn_votes >= enter_turn_thr):
+                    _reason = 'normal_enter_turn'
+                elif _cond_a:
+                    _reason = 'enter_turn_with_locked_junction_candidate'
+                else:
+                    _reason = 'enter_turn_with_locked_junction_candidate'
                 transition_info = self._transition(
                     NavState.TURN,
-                    f'turn_votes({turn_votes}) >= enter_turn_thr({enter_turn_thr}) '
-                    f'and junction_lock={junction_candidate}'
+                    f'{_reason}(turn_votes={turn_votes}, '
+                    f'junction_lock={junction_candidate}, '
+                    f'rising={_turn_rising})'
                 )
                 self._recover_support_count = 0
             else:
-                # 若长时间未形成 Turn，可回到 STRAIGHTKEEP（避免卡在 APPROACH）
-                if self.state_step >= self.stage_window_size and approach_votes < majority_thr:
+                # ===== APPROACH -> STRAIGHTKEEP (保守 fallback) =====
+                # 必须同时满足所有条件才允许 fallback
+                _fb_time_ok = (self.state_step >= self.stage_window_size)
+                _fb_approach_weak = (approach_votes < majority_thr)
+                _fb_turn_absent = (turn_votes < max(1, self.stage_enter_turn_votes - 1))
+                _fb_no_junction = (junction_candidate is None)
+
+                if _fb_time_ok and _fb_approach_weak and _fb_turn_absent and _fb_no_junction:
                     transition_info = self._transition(
                         NavState.STRAIGHTKEEP,
-                        'approach_not_stable_fallback_to_straightkeep'
+                        f'approach_fallback_no_turn_signal('
+                        f'approach={approach_votes}, turn={turn_votes}, '
+                        f'junction={junction_candidate})'
                     )
                     self._junction_hist.clear()
+                else:
+                    # 记录 fallback 被阻止的原因（用于 debug 分析）
+                    if _fb_time_ok and _fb_approach_weak:
+                        if not _fb_turn_absent:
+                            fallback_blocked_by_turn_signal = True
+                        if not _fb_no_junction:
+                            fallback_blocked_by_junction_lock = True
 
         elif self.state == NavState.TURN:
             # TURN 期间方向锁存不可改写（关键约束）
@@ -365,7 +417,7 @@ class HierarchicalNavigatorStateMachine:
                 turn_timeout_triggered = True
                 transition_info = self._transition(
                     NavState.RECOVER,
-                    'turn_timeout'
+                    f'turn_timeout(max_turn_steps={self.max_turn_steps})'
                 )
                 self._recover_support_count = 0
             else:
@@ -470,6 +522,9 @@ class HierarchicalNavigatorStateMachine:
             'clip_applied': bool(clip_applied),
             'omega_before_clip': float(omega_before_clip),
             'omega_after_clip': float(omega_after_clip),
+            # 新增：fallback 被阻止的原因分析
+            'fallback_blocked_by_turn_signal': bool(fallback_blocked_by_turn_signal),
+            'fallback_blocked_by_junction_lock': bool(fallback_blocked_by_junction_lock),
             'transition': transition_info,
         }
 

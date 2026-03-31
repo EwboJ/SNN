@@ -31,6 +31,11 @@
   python scripts/replay_hierarchical_system.py ^
       --run_dir data/corridor/test/J1_left_r02 ^
       --max_steps 120
+
+  # 仅回放 labels.csv 中 valid=1 的帧
+  python scripts/replay_hierarchical_system.py ^
+      --run_dir data/corridor/test/J1_left_r02 ^
+      --valid_only
 """
 
 from __future__ import annotations
@@ -133,11 +138,30 @@ def _load_labels_rows(labels_csv: str) -> Tuple[List[Dict[str, Any]], List[str]]
     return rows, fields
 
 
-def _collect_frames(run_dir: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _is_valid_flag(val: Any) -> bool:
+    """判断 labels.csv 中 valid 字段值是否表示有效帧。"""
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    return s in ('1', 'true', 'yes')
+
+
+def _collect_frames(
+    run_dir: str,
+    valid_only: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[str], int, int]:
     """
     收集回放帧：
     1) labels.csv 存在且包含 image_name 时，按 labels 顺序回放；
     2) 否则按 images/ 文件名自然排序回放。
+
+    当 valid_only=True 且 labels.csv 含 valid 字段时，仅保留有效帧。
+
+    Returns:
+        frames: 帧列表
+        label_fields: labels.csv 列名
+        original_count: 过滤前总帧数
+        skipped_count: 被 valid 过滤掉的帧数
     """
     images_dir = os.path.join(run_dir, 'images')
     if not os.path.isdir(images_dir):
@@ -147,6 +171,13 @@ def _collect_frames(run_dir: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     label_rows, label_fields = _load_labels_rows(labels_csv)
 
     frames: List[Dict[str, Any]] = []
+    original_count = 0
+    skipped_count = 0
+
+    # 检测 labels.csv 是否含有 valid 字段
+    has_valid_field = bool(label_rows and ('valid' in label_rows[0]))
+    do_valid_filter = valid_only and has_valid_field
+
     if label_rows and ('image_name' in label_rows[0]):
         for row in label_rows:
             image_name = str(row.get('image_name', '')).strip()
@@ -154,6 +185,11 @@ def _collect_frames(run_dir: str) -> Tuple[List[Dict[str, Any]], List[str]]:
                 continue
             image_path = os.path.join(images_dir, image_name)
             if not os.path.isfile(image_path):
+                continue
+            original_count += 1
+            # valid 过滤
+            if do_valid_filter and not _is_valid_flag(row.get('valid')):
+                skipped_count += 1
                 continue
             frames.append({
                 'image_name': image_name,
@@ -166,6 +202,7 @@ def _collect_frames(run_dir: str) -> Tuple[List[Dict[str, Any]], List[str]]:
                  if os.path.splitext(n)[1].lower() in valid_ext]
         names = sorted(names, key=_natural_key)
         for n in names:
+            original_count += 1
             frames.append({
                 'image_name': n,
                 'image_path': os.path.join(images_dir, n),
@@ -174,7 +211,7 @@ def _collect_frames(run_dir: str) -> Tuple[List[Dict[str, Any]], List[str]]:
 
     if not frames:
         raise RuntimeError(f'没有可用图像帧: {run_dir}')
-    return frames, label_fields
+    return frames, label_fields, original_count, skipped_count
 
 
 def _normalize_phase(phase: str) -> str:
@@ -375,7 +412,12 @@ def run_replay(args: argparse.Namespace) -> None:
     os.makedirs(out_dir, exist_ok=True)
 
     meta_json = _load_optional_json(os.path.join(run_dir, 'meta.json'))
-    frames, label_fields = _collect_frames(run_dir)
+
+    # 收集帧（支持 valid_only 过滤）
+    valid_only = bool(getattr(args, 'valid_only', False))
+    frames, label_fields, original_total, skipped_invalid = _collect_frames(
+        run_dir, valid_only=valid_only
+    )
     if args.max_steps is not None and args.max_steps > 0:
         frames = frames[:args.max_steps]
 
@@ -383,7 +425,9 @@ def run_replay(args: argparse.Namespace) -> None:
     vprint('[Replay] 层级导航系统离线回放')
     vprint(f'  配置文件:   {config_path}')
     vprint(f'  run 目录:   {run_dir}')
-    vprint(f'  帧数量:     {len(frames)}')
+    vprint(f'  原始帧数:   {original_total}')
+    vprint(f'  有效帧数:   {len(frames)}  (跳过无效帧: {skipped_invalid})')
+    vprint(f'  valid_only: {valid_only}')
     vprint(f'  输出目录:   {out_dir}')
     vprint(f'  logging:    save_debug_json={save_debug_json}, '
            f'save_csv={save_csv}, verbose={verbose}')
@@ -412,6 +456,16 @@ def run_replay(args: argparse.Namespace) -> None:
     num_recover_entries = 0
     num_clip_applied = 0
 
+    # 新增：系统级研究分析追踪变量
+    turn_signal_peak_votes = 0        # Turn 票数历史峰值
+    junction_lock_first_step = None   # junction 首次锁定的 step
+    fallback_step_list: List[int] = []  # 所有 fallback 发生的 step
+
+    # 检测 labels.csv 中是否有 action_name / label_name 字段
+    has_action_name = 'action_name' in label_fields
+    has_label_name = 'label_name' in label_fields
+    has_valid_field = 'valid' in label_fields
+
     for idx, fr in enumerate(frames):
         image_name = fr['image_name']
         image_path = fr['image_path']
@@ -421,6 +475,11 @@ def run_replay(args: argparse.Namespace) -> None:
         run_name = str(label_row.get('run_name', os.path.basename(run_dir)))
         gt_phase = str(label_row.get('phase', '')).strip() if ('phase' in label_row) else ''
         gt_turn_dir = _infer_gt_turn_dir(run_name)
+
+        # 新增：gt 辅助标签
+        gt_action_name = str(label_row.get('action_name', '')).strip() if has_action_name else ''
+        gt_label_name = str(label_row.get('label_name', '')).strip() if has_label_name else ''
+        valid_flag = str(label_row.get('valid', '')).strip() if has_valid_field else ''
 
         with Image.open(image_path) as img:
             img_rgb = img.convert('RGB')
@@ -447,6 +506,9 @@ def run_replay(args: argparse.Namespace) -> None:
                 num_turn_entries += 1
             elif transition_to == 'RECOVER':
                 num_recover_entries += 1
+            # 新增：检测 fallback 并记录 step_idx
+            if 'fallback' in transition_reason.lower():
+                fallback_step_list.append(idx)
 
         state_now = str(sm_out.get('state', ''))
         locked_dir = sm_out.get('locked_turn_dir', None)
@@ -463,6 +525,17 @@ def run_replay(args: argparse.Namespace) -> None:
         state_counts[state_now] += 1
         if locked_dir_str:
             locked_turn_dir_counts[locked_dir_str] += 1
+
+        # 新增：追踪 Turn 票数峰值
+        stage_votes = debug.get('stage_votes', {})
+        cur_turn_votes = int(stage_votes.get('Turn', 0)) if isinstance(stage_votes, dict) else 0
+        if cur_turn_votes > turn_signal_peak_votes:
+            turn_signal_peak_votes = cur_turn_votes
+
+        # 新增：追踪 junction 首次锁定 step
+        junction_candidate = debug.get('junction_candidate', None)
+        if junction_candidate is not None and junction_lock_first_step is None:
+            junction_lock_first_step = idx
 
         row = {
             'step_idx': idx,
@@ -483,6 +556,10 @@ def run_replay(args: argparse.Namespace) -> None:
             'omega_after_clip': omega_after_clip,
             'stage_confidence': _safe_float(stage_out.get('confidence', 0.0), 0.0),
             'junction_confidence': _safe_float(junction_out.get('confidence', 0.0), 0.0),
+            # 新增列
+            'valid_flag': valid_flag,
+            'gt_action_name': gt_action_name,
+            'gt_label_name': gt_label_name,
             # 保留可选标签信息，兼容不同数据目录
             'timestamp_ns': label_row.get('timestamp_ns', ''),
             'frame_idx': label_row.get('frame_idx', ''),
@@ -502,6 +579,11 @@ def run_replay(args: argparse.Namespace) -> None:
             # 额外保留便于深入排查
             'clip_applied': clip_applied,
             'turn_timeout_triggered': bool(debug.get('turn_timeout_triggered', False)),
+            # 新增 fallback 分析字段
+            'fallback_blocked_by_turn_signal': bool(
+                debug.get('fallback_blocked_by_turn_signal', False)),
+            'fallback_blocked_by_junction_lock': bool(
+                debug.get('fallback_blocked_by_junction_lock', False)),
         })
 
     # 4) replay_trace.csv（保持基础功能，默认保存）
@@ -525,6 +607,11 @@ def run_replay(args: argparse.Namespace) -> None:
         'omega_after_clip',
         'stage_confidence',
         'junction_confidence',
+        # 新增列
+        'valid_flag',
+        'gt_action_name',
+        'gt_label_name',
+        # 原有可选列
         'timestamp_ns',
         'frame_idx',
         'run_name',
@@ -582,6 +669,15 @@ def run_replay(args: argparse.Namespace) -> None:
         'recover_duration_steps': int(recover_duration_steps),
         'num_clip_applied': int(num_clip_applied),
         'unique_state_sequence': unique_state_sequence,
+        # ===== 新增：valid 过滤相关统计 =====
+        'used_total_steps': len(trace_rows),
+        'original_total_steps': original_total,
+        'used_valid_only': valid_only,
+        'skipped_invalid_steps': skipped_invalid,
+        # ===== 新增：TURN 信号分析 =====
+        'turn_signal_peak_votes': int(turn_signal_peak_votes),
+        'junction_lock_first_step': junction_lock_first_step,
+        'fallback_step_list': fallback_step_list,
         # 追溯信息
         'run_dir': run_dir,
         'config_path': config_path,
@@ -621,6 +717,11 @@ def run_replay(args: argparse.Namespace) -> None:
     print(f'  - timeline: {timeline_png}')
     if save_debug_json:
         print(f'  - debug:    {debug_json}')
+    if fallback_step_list:
+        print(f'  - fallback 发生步: {fallback_step_list}')
+    if junction_lock_first_step is not None:
+        print(f'  - junction 首次锁定步: {junction_lock_first_step}')
+    print(f'  - Turn 票数峰值: {turn_signal_peak_votes}')
 
 
 def main() -> None:
@@ -638,6 +739,9 @@ def main() -> None:
                         help='推理设备，例如 cpu / cuda:0（默认自动选择）')
     parser.add_argument('--max_steps', type=int, default=0,
                         help='仅回放前 N 帧（0 表示全部）')
+    # 新增：valid 过滤开关
+    parser.add_argument('--valid_only', action='store_true', default=False,
+                        help='仅回放 labels.csv 中 valid=1/true 的帧（默认回放全部）')
     args = parser.parse_args()
     if args.max_steps <= 0:
         args.max_steps = None
@@ -647,4 +751,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
