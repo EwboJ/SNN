@@ -60,6 +60,7 @@ class NavState(Enum):
     BOOT = 'BOOT'
     STRAIGHTKEEP = 'STRAIGHTKEEP'
     APPROACH = 'APPROACH'
+    PROVISIONAL_TURN = 'PROVISIONAL_TURN'
     TURN = 'TURN'
     RECOVER = 'RECOVER'
 
@@ -115,6 +116,9 @@ class HierarchicalNavigatorStateMachine:
         turn_relock_hist_size: int = 5,
         allow_turn_relock_once: bool = True,
         soft_turn_steps: int = 14,
+        provisional_turn_window_steps: int = 6,
+        provisional_turn_commit_votes: int = 4,
+        provisional_turn_mix_ratio: float = 0.35,
     ) -> None:
         # 参数做安全裁剪，避免异常配置导致状态机不可用
         self.stage_window_size = max(1, int(stage_window_size))
@@ -151,11 +155,15 @@ class HierarchicalNavigatorStateMachine:
         self.turn_relock_hist_size = max(1, int(turn_relock_hist_size))
         self.allow_turn_relock_once = bool(allow_turn_relock_once)
         self.soft_turn_steps = max(1, int(soft_turn_steps))
+        self.provisional_turn_window_steps = max(1, int(provisional_turn_window_steps))
+        self.provisional_turn_commit_votes = max(1, int(provisional_turn_commit_votes))
+        self.provisional_turn_mix_ratio = max(0.0, min(1.0, float(provisional_turn_mix_ratio)))
 
         # 历史窗口（用于投票迟滞）
         self._stage_hist = deque(maxlen=self.stage_window_size)
         self._junction_hist = deque(maxlen=self.junction_window_size)
         self._turn_relock_hist = deque(maxlen=self.turn_relock_hist_size)
+        self._provisional_turn_hist = deque(maxlen=self.provisional_turn_window_steps)
 
         self.reset()
 
@@ -166,6 +174,7 @@ class HierarchicalNavigatorStateMachine:
         """
         self.state: NavState = NavState.BOOT
         self.locked_turn_dir: Optional[str] = None
+        self.provisional_turn_dir: Optional[str] = None
         self.global_step: int = 0
         self.state_step: int = 0
         self._recover_support_count: int = 0
@@ -175,6 +184,7 @@ class HierarchicalNavigatorStateMachine:
         self._stage_hist.clear()
         self._junction_hist.clear()
         self._turn_relock_hist.clear()
+        self._provisional_turn_hist.clear()
 
     @staticmethod
     def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -358,6 +368,10 @@ class HierarchicalNavigatorStateMachine:
         _turn_rising = self._is_turn_rising()
         junction_hist_update_allowed = False
         junction_hist_reset_applied = False
+        provisional_turn_window_open = False
+        provisional_turn_candidate = None
+        provisional_turn_commit_ready = False
+        provisional_turn_hist = list(self._provisional_turn_hist)
 
         if self.state == NavState.APPROACH:
             _turn_signal_for_junction_hist = (
@@ -376,15 +390,27 @@ class HierarchicalNavigatorStateMachine:
                 if self._junction_hist:
                     self._junction_hist.clear()
                     junction_hist_reset_applied = True
+            self._provisional_turn_hist.clear()
         elif self.state == NavState.TURN:
             # TURN 早期纠错窗口内继续累计 junction 票数，用于重锁方向判断
             if self.state_step <= self.turn_relock_window_steps:
                 junction_hist_update_allowed = True
                 if junction_pred is not None:
                     self._turn_relock_hist.append(junction_pred)
+            self._provisional_turn_hist.clear()
+        elif self.state == NavState.PROVISIONAL_TURN:
+            provisional_turn_window_open = (self.state_step <= self.provisional_turn_window_steps)
+            if provisional_turn_window_open and junction_pred is not None:
+                self._provisional_turn_hist.append(junction_pred)
+            provisional_turn_hist = list(self._provisional_turn_hist)
+            self._turn_relock_hist.clear()
         elif self.state in (NavState.BOOT, NavState.STRAIGHTKEEP):
             self._junction_hist.clear()
             self._turn_relock_hist.clear()
+            self._provisional_turn_hist.clear()
+        elif self.state == NavState.RECOVER:
+            self._turn_relock_hist.clear()
+            self._provisional_turn_hist.clear()
 
         stage_counts = self._get_stage_counts()
         junction_counts = self._get_junction_counts()
@@ -427,6 +453,7 @@ class HierarchicalNavigatorStateMachine:
         elif self.state == NavState.STRAIGHTKEEP:
             # 进入直行时清除本次转弯锁存
             self.locked_turn_dir = None
+            self.provisional_turn_dir = None
             self._recover_support_count = 0
             # STRAIGHTKEEP -> APPROACH: stage3 Approach 多数投票
             if approach_votes >= majority_thr:
@@ -486,17 +513,25 @@ class HierarchicalNavigatorStateMachine:
                        and _turn_rising)
 
             if _cond_a or _cond_b or _cond_c:
-                # ===== APPROACH -> TURN =====
-                self.locked_turn_dir = junction_candidate
+                # ===== APPROACH -> PROVISIONAL_TURN =====
+                self.provisional_turn_dir = junction_candidate
+                self.locked_turn_dir = None
+                self._provisional_turn_hist.clear()
+                if junction_pred is not None:
+                    self._provisional_turn_hist.append(junction_pred)
+                elif junction_candidate is not None:
+                    self._provisional_turn_hist.append(junction_candidate)
+                provisional_turn_hist = list(self._provisional_turn_hist)
+                provisional_turn_window_open = True
                 # 选择最精确的 reason 标签
                 if _cond_b or (turn_votes >= enter_turn_thr):
-                    _reason = 'normal_enter_turn'
+                    _reason = 'normal_enter_provisional_turn'
                 elif _cond_a:
-                    _reason = 'enter_turn_with_locked_junction_candidate'
+                    _reason = 'enter_provisional_turn_with_locked_junction_candidate'
                 else:
-                    _reason = 'enter_turn_with_locked_junction_candidate'
+                    _reason = 'enter_provisional_turn_with_locked_junction_candidate'
                 transition_info = self._transition(
-                    NavState.TURN,
+                    NavState.PROVISIONAL_TURN,
                     f'{_reason}(turn_votes={turn_votes}, '
                     f'junction_lock={junction_candidate}, '
                     f'rising={_turn_rising})'
@@ -528,6 +563,71 @@ class HierarchicalNavigatorStateMachine:
                             fallback_blocked_by_turn_signal = True
                         if not _fb_no_junction:
                             fallback_blocked_by_junction_lock = True
+
+        elif self.state == NavState.PROVISIONAL_TURN:
+            _prov_counts = Counter(self._provisional_turn_hist)
+            _prov_left_votes = int(_prov_counts.get('Left', 0))
+            _prov_right_votes = int(_prov_counts.get('Right', 0))
+            provisional_turn_hist = list(self._provisional_turn_hist)
+            provisional_turn_window_open = (self.state_step <= self.provisional_turn_window_steps)
+
+            if (_prov_left_votes >= self.provisional_turn_commit_votes
+                    and _prov_left_votes >= _prov_right_votes):
+                provisional_turn_candidate = 'Left'
+            elif (_prov_right_votes >= self.provisional_turn_commit_votes
+                    and _prov_right_votes > _prov_left_votes):
+                provisional_turn_candidate = 'Right'
+
+            provisional_turn_commit_ready = bool(
+                provisional_turn_candidate is not None
+                and (stage_majority == 'Turn' or turn_votes >= majority_thr)
+            )
+
+            if provisional_turn_commit_ready:
+                self.locked_turn_dir = provisional_turn_candidate
+                transition_info = self._transition(
+                    NavState.TURN,
+                    f'provisional_turn_committed('
+                    f'candidate={provisional_turn_candidate}, '
+                    f'left_votes={_prov_left_votes}, '
+                    f'right_votes={_prov_right_votes}, '
+                    f'commit_votes={self.provisional_turn_commit_votes})'
+                )
+                self._turn_relock_used = False
+                self._turn_relock_hist.clear()
+                self._provisional_turn_hist.clear()
+                self.provisional_turn_dir = None
+            else:
+                _turn_signal_faded = (
+                    stage_majority != 'Turn'
+                    and turn_votes < max(1, self.stage_enter_turn_votes - 1)
+                )
+                _window_expired_without_commit = (
+                    self.state_step >= self.provisional_turn_window_steps
+                    and not provisional_turn_commit_ready
+                )
+                if _turn_signal_faded or _window_expired_without_commit:
+                    if approach_votes >= majority_thr:
+                        transition_info = self._transition(
+                            NavState.APPROACH,
+                            f'provisional_turn_rejected_to_approach('
+                            f'turn_votes={turn_votes}, '
+                            f'stage_majority={stage_majority}, '
+                            f'window_expired={_window_expired_without_commit})'
+                        )
+                    else:
+                        transition_info = self._transition(
+                            NavState.STRAIGHTKEEP,
+                            f'provisional_turn_rejected_to_straightkeep('
+                            f'turn_votes={turn_votes}, '
+                            f'stage_majority={stage_majority}, '
+                            f'window_expired={_window_expired_without_commit})'
+                        )
+                        self._junction_hist.clear()
+                    self.locked_turn_dir = None
+                    self.provisional_turn_dir = None
+                    self._turn_relock_hist.clear()
+                    self._provisional_turn_hist.clear()
 
         elif self.state == NavState.TURN:
             # TURN 期间方向一般不改写；仅在早期窗口允许一次纠错重锁
@@ -646,11 +746,15 @@ class HierarchicalNavigatorStateMachine:
                     f'recover_stable(state_step={self.state_step}, turn_votes={turn_votes})'
                 )
                 self.locked_turn_dir = None
+                self.provisional_turn_dir = None
                 self._recover_support_count = 0
                 self._junction_hist.clear()
 
         # ===== 4) 计算最终角速度输出 =====
-        turn_omega = self._fixed_turn_omega(self.locked_turn_dir)
+        _turn_control_dir = self.locked_turn_dir
+        if self.state == NavState.PROVISIONAL_TURN:
+            _turn_control_dir = self.provisional_turn_dir
+        turn_omega = self._fixed_turn_omega(_turn_control_dir)
         recover_alpha = 1.0
         turn_mix_ratio = 0.0
 
@@ -659,6 +763,11 @@ class HierarchicalNavigatorStateMachine:
         elif self.state in (NavState.STRAIGHTKEEP, NavState.APPROACH):
             # 直行和接近阶段，主要采用 straight_keep 输出
             omega_cmd_final = omega_raw
+        elif self.state == NavState.PROVISIONAL_TURN:
+            # 方向尚未最终确认，仅施加小幅转向偏置，避免强制大转向
+            turn_mix_ratio = self.provisional_turn_mix_ratio
+            omega_cmd_final = ((1.0 - turn_mix_ratio) * omega_raw
+                               + turn_mix_ratio * turn_omega)
         elif self.state == NavState.TURN:
             # TURN 阶段按配置切换控制策略，且锁存方向始终主导
             if self.use_fixed_turn_rate:
@@ -730,6 +839,9 @@ class HierarchicalNavigatorStateMachine:
                 'turn_relock_hist_size': self.turn_relock_hist_size,
                 'allow_turn_relock_once': self.allow_turn_relock_once,
                 'soft_turn_steps': self.soft_turn_steps,
+                'provisional_turn_window_steps': self.provisional_turn_window_steps,
+                'provisional_turn_commit_votes': self.provisional_turn_commit_votes,
+                'provisional_turn_mix_ratio': self.provisional_turn_mix_ratio,
             },
             'omega_components': {
                 'straight_keep_raw': float(omega_raw),
@@ -763,6 +875,11 @@ class HierarchicalNavigatorStateMachine:
             'turn_relock_votes_window': turn_relock_votes_window,
             'turn_relock_candidate': turn_relock_candidate,
             'turn_relock_hist': list(self._turn_relock_hist),
+            'provisional_turn_dir': self.provisional_turn_dir,
+            'provisional_turn_hist': provisional_turn_hist,
+            'provisional_turn_candidate': provisional_turn_candidate,
+            'provisional_turn_commit_ready': bool(provisional_turn_commit_ready),
+            'provisional_turn_window_open': bool(provisional_turn_window_open),
             'transition': transition_info,
         }
 
