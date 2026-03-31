@@ -282,6 +282,8 @@ def _build_state_machine(cfg: Dict[str, Any]) -> HierarchicalNavigatorStateMachi
         # 保留原有转向角速度参数
         left_turn_omega=turn_cfg.get('left_omega', 1.2),
         right_turn_omega=turn_cfg.get('right_omega', -1.2),
+        # TURN -> RECOVER 渐减累计门槛
+        recover_support_steps_needed=sm_cfg.get('recover_support_steps_needed', 2),
     )
 
 
@@ -633,9 +635,28 @@ def run_replay(args: argparse.Namespace) -> None:
     turn_duration_steps = sum(1 for s in state_seq if s == 'TURN')
     recover_duration_steps = sum(1 for s in state_seq if s == 'RECOVER')
 
+    # final_locked_turn_dir：仅记录 run 结束时状态，不作为主评价指标
     final_locked_turn_dir = ''
     if trace_rows:
         final_locked_turn_dir = str(trace_rows[-1].get('locked_turn_dir', ''))
+
+    # first_locked_turn_dir：第一次出现非空 locked_turn_dir 的值
+    first_locked_turn_dir = ''
+    for r in trace_rows:
+        d = str(r.get('locked_turn_dir', '')).strip()
+        if d:
+            first_locked_turn_dir = d
+            break
+
+    # most_frequent_locked_turn_dir：整个 replay 中非空 locked_turn_dir 的众数
+    _locked_dir_counter: Counter = Counter()
+    for r in trace_rows:
+        d = str(r.get('locked_turn_dir', '')).strip()
+        if d:
+            _locked_dir_counter[d] += 1
+    most_frequent_locked_turn_dir = ''
+    if _locked_dir_counter:
+        most_frequent_locked_turn_dir = _locked_dir_counter.most_common(1)[0][0]
 
     # 全局 gt_turn_dir：优先使用轨迹中的首个非空值；否则用 run 目录名推断
     gt_turn_dir_global = ''
@@ -647,9 +668,18 @@ def run_replay(args: argparse.Namespace) -> None:
     if not gt_turn_dir_global:
         gt_turn_dir_global = _infer_gt_turn_dir(os.path.basename(run_dir))
 
+    # turn_dir_match 新规则：
+    #   优先使用 first_locked_turn_dir 与 gt 比较
+    #   若为空则退化到 most_frequent_locked_turn_dir
+    #   不再依赖 final_locked_turn_dir（可能因 RECOVER->STRAIGHTKEEP 被清空）
     turn_dir_match: Optional[bool]
     if gt_turn_dir_global:
-        turn_dir_match = (str(final_locked_turn_dir) == str(gt_turn_dir_global))
+        _eval_dir = first_locked_turn_dir or most_frequent_locked_turn_dir
+        if _eval_dir:
+            turn_dir_match = (_eval_dir == gt_turn_dir_global)
+        else:
+            # 整个 replay 从未锁定过方向
+            turn_dir_match = False
     else:
         turn_dir_match = None
 
@@ -659,8 +689,10 @@ def run_replay(args: argparse.Namespace) -> None:
         'num_turn_entries': int(num_turn_entries),
         'num_recover_entries': int(num_recover_entries),
         'locked_turn_dir_counts': dict(locked_turn_dir_counts),
-        # 新增系统级分析字段
+        # 系统级分析字段（方向评价）
         'final_locked_turn_dir': final_locked_turn_dir,
+        'first_locked_turn_dir': first_locked_turn_dir,
+        'most_frequent_locked_turn_dir': most_frequent_locked_turn_dir,
         'gt_turn_dir': gt_turn_dir_global,
         'turn_dir_match': turn_dir_match,
         'first_turn_step': first_turn_step,

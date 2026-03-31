@@ -92,6 +92,8 @@ class HierarchicalNavigatorStateMachine:
         # 可选控制参数（未在强制列表中，但便于工程接入）
         left_turn_omega: float = 1.2,
         right_turn_omega: float = -1.2,
+        # TURN -> RECOVER 支持累计门槛（渐减模式下需要的有效支持步数）
+        recover_support_steps_needed: int = 2,
     ) -> None:
         # 参数做安全裁剪，避免异常配置导致状态机不可用
         self.stage_window_size = max(1, int(stage_window_size))
@@ -111,6 +113,7 @@ class HierarchicalNavigatorStateMachine:
 
         self.left_turn_omega = float(left_turn_omega)
         self.right_turn_omega = float(right_turn_omega)
+        self.recover_support_steps_needed = max(1, int(recover_support_steps_needed))
 
         # 历史窗口（用于投票迟滞）
         self._stage_hist = deque(maxlen=self.stage_window_size)
@@ -412,27 +415,31 @@ class HierarchicalNavigatorStateMachine:
 
         elif self.state == NavState.TURN:
             # TURN 期间方向锁存不可改写（关键约束）
-            # TURN 超时保护：即使 Recover 支持不足，也要强制转入 RECOVER
-            if self.state_step >= self.max_turn_steps:
+            # ===== Recover 支持累计逻辑（渐减模式，吸收抖动） =====
+            if stage_pred == 'Recover':
+                self._recover_support_count += 1
+            else:
+                # 不立刻清零，渐减以吸收 Recover 的轻微抖动
+                self._recover_support_count = max(0, self._recover_support_count - 1)
+
+            # ===== TURN -> RECOVER 优先级：Recover 信号确认 > timeout =====
+            if self._recover_support_count >= self.recover_support_steps_needed:
+                # Recover 信号已稳定确认，正常退出 TURN
+                transition_info = self._transition(
+                    NavState.RECOVER,
+                    f'recover_signal_confirmed('
+                    f'support={self._recover_support_count}, '
+                    f'needed={self.recover_support_steps_needed})'
+                )
+            elif self.state_step >= self.max_turn_steps:
+                # Recover 始终无法形成稳定支持，timeout 兜底
                 turn_timeout_triggered = True
                 transition_info = self._transition(
                     NavState.RECOVER,
-                    f'turn_timeout(max_turn_steps={self.max_turn_steps})'
+                    f'turn_timeout(max_turn_steps={self.max_turn_steps}, '
+                    f'recover_support={self._recover_support_count})'
                 )
                 self._recover_support_count = 0
-            else:
-                if stage_pred == 'Recover':
-                    self._recover_support_count += 1
-                else:
-                    self._recover_support_count = 0
-
-                # TURN -> RECOVER: 需要连续 Recover 支持
-                if self._recover_support_count >= self.stage_exit_turn_votes:
-                    transition_info = self._transition(
-                        NavState.RECOVER,
-                        f'consecutive_recover({self._recover_support_count}) '
-                        f'>= exit_turn_votes({self.stage_exit_turn_votes})'
-                    )
 
         elif self.state == NavState.RECOVER:
             # RECOVER 保持至少 recover_min_steps，且 Turn 不再占多数后回到 STRAIGHTKEEP
@@ -510,6 +517,7 @@ class HierarchicalNavigatorStateMachine:
                 'junction_lock_votes': self.junction_lock_votes,
                 'recover_min_steps': self.recover_min_steps,
                 'max_turn_steps': self.max_turn_steps,
+                'recover_support_steps_needed': self.recover_support_steps_needed,
             },
             'omega_components': {
                 'straight_keep_raw': float(omega_raw),
@@ -519,6 +527,10 @@ class HierarchicalNavigatorStateMachine:
                 'use_fixed_turn_rate': bool(self.use_fixed_turn_rate),
             },
             'turn_timeout_triggered': bool(turn_timeout_triggered),
+            # 新增：Recover 信号分析
+            'current_recover_votes': recover_votes,
+            'recover_support_count': self._recover_support_count,
+            'recover_support_threshold': self.recover_support_steps_needed,
             'clip_applied': bool(clip_applied),
             'omega_before_clip': float(omega_before_clip),
             'omega_after_clip': float(omega_after_clip),
