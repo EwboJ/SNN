@@ -293,7 +293,69 @@ def _build_state_machine(cfg: Dict[str, Any]) -> HierarchicalNavigatorStateMachi
         start_junction_hist_on_turn_signal=sm_cfg.get('start_junction_hist_on_turn_signal', True),
         min_turn_votes_to_start_junction_hist=sm_cfg.get('min_turn_votes_to_start_junction_hist', 1),
         reset_junction_hist_when_no_turn_signal=sm_cfg.get('reset_junction_hist_when_no_turn_signal', True),
+        turn_relock_window_steps=sm_cfg.get('turn_relock_window_steps', 12),
+        turn_relock_votes=sm_cfg.get('turn_relock_votes', 3),
+        turn_relock_hist_size=sm_cfg.get('turn_relock_hist_size', 5),
+        allow_turn_relock_once=sm_cfg.get('allow_turn_relock_once', True),
+        soft_turn_steps=sm_cfg.get('soft_turn_steps', 14),
+        provisional_turn_window_steps=sm_cfg.get('provisional_turn_window_steps', 6),
+        provisional_turn_commit_votes=sm_cfg.get('provisional_turn_commit_votes', 4),
+        provisional_turn_mix_ratio=sm_cfg.get('provisional_turn_mix_ratio', 0.35),
+        provisional_turn_min_observe_steps=sm_cfg.get('provisional_turn_min_observe_steps', 3),
+        provisional_turn_recent_consistency_steps=sm_cfg.get('provisional_turn_recent_consistency_steps', 3),
+        provisional_turn_margin_votes=sm_cfg.get('provisional_turn_margin_votes', 2),
     )
+
+
+def _snapshot_state_machine_thresholds(
+    sm: HierarchicalNavigatorStateMachine,
+) -> Dict[str, Any]:
+    """提取状态机阈值快照，用于写入 replay_summary.json。"""
+    majority_thr = int(getattr(sm, 'stage_window_size', 7)) // 2 + 1
+    enter_turn_thr = max(majority_thr, int(getattr(sm, 'stage_enter_turn_votes', 5)))
+    return {
+        'stage_majority': majority_thr,
+        'stage_enter_turn_votes': enter_turn_thr,
+        'stage_exit_turn_votes': int(getattr(sm, 'stage_exit_turn_votes', 5)),
+        'junction_lock_votes': int(getattr(sm, 'junction_lock_votes', 4)),
+        'recover_min_steps': int(getattr(sm, 'recover_min_steps', 8)),
+        'max_turn_steps': int(getattr(sm, 'max_turn_steps', 20)),
+        'recover_support_steps_needed': int(getattr(sm, 'recover_support_steps_needed', 2)),
+        'min_turn_steps': int(getattr(sm, 'min_turn_steps', 5)),
+        'turn_exit_vote_threshold': int(getattr(sm, 'turn_exit_vote_threshold', 2)),
+        'straight_recover_omega_thresh': float(getattr(sm, 'straight_recover_omega_thresh', 0.3)),
+        'straight_recover_hold_steps': int(getattr(sm, 'straight_recover_hold_steps', 3)),
+        'min_approach_steps_before_junction_lock': int(
+            getattr(sm, 'min_approach_steps_before_junction_lock', 3)
+        ),
+        'min_turn_votes_before_junction_lock': int(
+            getattr(sm, 'min_turn_votes_before_junction_lock', 2)
+        ),
+        'start_junction_hist_on_turn_signal': bool(
+            getattr(sm, 'start_junction_hist_on_turn_signal', True)
+        ),
+        'min_turn_votes_to_start_junction_hist': int(
+            getattr(sm, 'min_turn_votes_to_start_junction_hist', 1)
+        ),
+        'reset_junction_hist_when_no_turn_signal': bool(
+            getattr(sm, 'reset_junction_hist_when_no_turn_signal', True)
+        ),
+        'turn_relock_window_steps': int(getattr(sm, 'turn_relock_window_steps', 12)),
+        'turn_relock_votes': int(getattr(sm, 'turn_relock_votes', 3)),
+        'turn_relock_hist_size': int(getattr(sm, 'turn_relock_hist_size', 5)),
+        'allow_turn_relock_once': bool(getattr(sm, 'allow_turn_relock_once', True)),
+        'soft_turn_steps': int(getattr(sm, 'soft_turn_steps', 14)),
+        'provisional_turn_window_steps': int(getattr(sm, 'provisional_turn_window_steps', 6)),
+        'provisional_turn_commit_votes': int(getattr(sm, 'provisional_turn_commit_votes', 4)),
+        'provisional_turn_mix_ratio': float(getattr(sm, 'provisional_turn_mix_ratio', 0.35)),
+        'provisional_turn_min_observe_steps': int(
+            getattr(sm, 'provisional_turn_min_observe_steps', 3)
+        ),
+        'provisional_turn_recent_consistency_steps': int(
+            getattr(sm, 'provisional_turn_recent_consistency_steps', 3)
+        ),
+        'provisional_turn_margin_votes': int(getattr(sm, 'provisional_turn_margin_votes', 2)),
+    }
 
 
 def _plot_state_timeline(trace_rows: List[Dict[str, Any]], out_png: str) -> None:
@@ -457,6 +519,7 @@ def run_replay(args: argparse.Namespace) -> None:
     # 2) 层级状态机
     sm = _build_state_machine(cfg)
     sm.reset()
+    threshold_snapshot = _snapshot_state_machine_thresholds(sm)
 
     # 3) 逐帧回放
     trace_rows: List[Dict[str, Any]] = []
@@ -756,6 +819,7 @@ def run_replay(args: argparse.Namespace) -> None:
         'num_turn_timeout_exits': int(num_turn_timeout_exits),
         'num_recover_signal_exits': int(num_recover_signal_exits),
         'num_low_turn_low_omega_exits': int(num_low_turn_low_omega_exits),
+        'thresholds': threshold_snapshot,
         # 追溯信息
         'run_dir': run_dir,
         'config_path': config_path,

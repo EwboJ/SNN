@@ -119,6 +119,9 @@ class HierarchicalNavigatorStateMachine:
         provisional_turn_window_steps: int = 6,
         provisional_turn_commit_votes: int = 4,
         provisional_turn_mix_ratio: float = 0.35,
+        provisional_turn_min_observe_steps: int = 3,
+        provisional_turn_recent_consistency_steps: int = 3,
+        provisional_turn_margin_votes: int = 2,
     ) -> None:
         # 参数做安全裁剪，避免异常配置导致状态机不可用
         self.stage_window_size = max(1, int(stage_window_size))
@@ -158,6 +161,9 @@ class HierarchicalNavigatorStateMachine:
         self.provisional_turn_window_steps = max(1, int(provisional_turn_window_steps))
         self.provisional_turn_commit_votes = max(1, int(provisional_turn_commit_votes))
         self.provisional_turn_mix_ratio = max(0.0, min(1.0, float(provisional_turn_mix_ratio)))
+        self.provisional_turn_min_observe_steps = max(1, int(provisional_turn_min_observe_steps))
+        self.provisional_turn_recent_consistency_steps = max(1, int(provisional_turn_recent_consistency_steps))
+        self.provisional_turn_margin_votes = max(1, int(provisional_turn_margin_votes))
 
         # 历史窗口（用于投票迟滞）
         self._stage_hist = deque(maxlen=self.stage_window_size)
@@ -314,6 +320,38 @@ class HierarchicalNavigatorStateMachine:
             return recent_1[-1] == 'Turn'
         return False
 
+    @staticmethod
+    def _get_recent_consistent_turn_dir(hist: Any, k: int) -> Optional[str]:
+        """Return Left/Right when the last k entries are fully consistent."""
+        kk = max(1, int(k))
+        seq = list(hist or [])
+        if len(seq) < kk:
+            return None
+        recent = seq[-kk:]
+        first = recent[0]
+        if first not in ('Left', 'Right'):
+            return None
+        if all(x == first for x in recent):
+            return str(first)
+        return None
+
+    @staticmethod
+    def _get_recent_consistent_steps(hist: Any) -> int:
+        """Count how many trailing entries are the same turn direction."""
+        seq = list(hist or [])
+        if not seq:
+            return 0
+        last = seq[-1]
+        if last not in ('Left', 'Right'):
+            return 0
+        cnt = 0
+        for x in reversed(seq):
+            if x == last:
+                cnt += 1
+            else:
+                break
+        return int(cnt)
+
     def _fixed_turn_omega(self, turn_dir: Optional[str]) -> float:
         if turn_dir == 'Left':
             return self.left_turn_omega
@@ -372,6 +410,11 @@ class HierarchicalNavigatorStateMachine:
         provisional_turn_candidate = None
         provisional_turn_commit_ready = False
         provisional_turn_hist = list(self._provisional_turn_hist)
+        provisional_turn_recent_dir = None
+        provisional_turn_recent_consistent_steps = 0
+        provisional_turn_margin = 0
+        provisional_turn_observe_ready = False
+        provisional_turn_commit_block_reason = ''
 
         if self.state == NavState.APPROACH:
             _turn_signal_for_junction_hist = (
@@ -517,10 +560,6 @@ class HierarchicalNavigatorStateMachine:
                 self.provisional_turn_dir = junction_candidate
                 self.locked_turn_dir = None
                 self._provisional_turn_hist.clear()
-                if junction_pred is not None:
-                    self._provisional_turn_hist.append(junction_pred)
-                elif junction_candidate is not None:
-                    self._provisional_turn_hist.append(junction_candidate)
                 provisional_turn_hist = list(self._provisional_turn_hist)
                 provisional_turn_window_open = True
                 # 选择最精确的 reason 标签
@@ -570,18 +609,48 @@ class HierarchicalNavigatorStateMachine:
             _prov_right_votes = int(_prov_counts.get('Right', 0))
             provisional_turn_hist = list(self._provisional_turn_hist)
             provisional_turn_window_open = (self.state_step <= self.provisional_turn_window_steps)
-
-            if (_prov_left_votes >= self.provisional_turn_commit_votes
-                    and _prov_left_votes >= _prov_right_votes):
-                provisional_turn_candidate = 'Left'
-            elif (_prov_right_votes >= self.provisional_turn_commit_votes
-                    and _prov_right_votes > _prov_left_votes):
-                provisional_turn_candidate = 'Right'
-
-            provisional_turn_commit_ready = bool(
-                provisional_turn_candidate is not None
-                and (stage_majority == 'Turn' or turn_votes >= majority_thr)
+            provisional_turn_recent_consistent_steps = self._get_recent_consistent_steps(
+                self._provisional_turn_hist
             )
+            provisional_turn_recent_dir = self._get_recent_consistent_turn_dir(
+                self._provisional_turn_hist,
+                self.provisional_turn_recent_consistency_steps
+            )
+            provisional_turn_observe_ready = (
+                self.state_step >= self.provisional_turn_min_observe_steps
+            )
+            provisional_turn_margin = abs(_prov_left_votes - _prov_right_votes)
+
+            if provisional_turn_recent_dir is not None:
+                provisional_turn_candidate = provisional_turn_recent_dir
+            elif _prov_left_votes > _prov_right_votes:
+                provisional_turn_candidate = 'Left'
+            elif _prov_right_votes > _prov_left_votes:
+                provisional_turn_candidate = 'Right'
+            else:
+                provisional_turn_candidate = None
+
+            _turn_signal_strong = (stage_majority == 'Turn' or turn_votes >= majority_thr)
+            _recent_ok = (provisional_turn_recent_dir is not None)
+            _margin_ok = (provisional_turn_margin >= self.provisional_turn_margin_votes)
+            provisional_turn_commit_ready = bool(
+                provisional_turn_observe_ready
+                and _turn_signal_strong
+                and _recent_ok
+                and _margin_ok
+            )
+
+            if not provisional_turn_commit_ready:
+                if not provisional_turn_observe_ready:
+                    provisional_turn_commit_block_reason = 'observe_not_ready'
+                elif not _turn_signal_strong:
+                    provisional_turn_commit_block_reason = 'turn_signal_weak'
+                elif not _recent_ok:
+                    provisional_turn_commit_block_reason = 'no_recent_consistency'
+                elif not _margin_ok:
+                    provisional_turn_commit_block_reason = 'margin_too_small'
+                else:
+                    provisional_turn_commit_block_reason = 'commit_not_ready'
 
             if provisional_turn_commit_ready:
                 self.locked_turn_dir = provisional_turn_candidate
@@ -591,7 +660,8 @@ class HierarchicalNavigatorStateMachine:
                     f'candidate={provisional_turn_candidate}, '
                     f'left_votes={_prov_left_votes}, '
                     f'right_votes={_prov_right_votes}, '
-                    f'commit_votes={self.provisional_turn_commit_votes})'
+                    f'recent_dir={provisional_turn_recent_dir}, '
+                    f'margin={provisional_turn_margin})'
                 )
                 self._turn_relock_used = False
                 self._turn_relock_hist.clear()
@@ -599,6 +669,8 @@ class HierarchicalNavigatorStateMachine:
                 self.provisional_turn_dir = None
             else:
                 _turn_signal_faded = (
+                    provisional_turn_observe_ready
+                    and
                     stage_majority != 'Turn'
                     and turn_votes < max(1, self.stage_enter_turn_votes - 1)
                 )
@@ -606,22 +678,37 @@ class HierarchicalNavigatorStateMachine:
                     self.state_step >= self.provisional_turn_window_steps
                     and not provisional_turn_commit_ready
                 )
-                if _turn_signal_faded or _window_expired_without_commit:
+                if _window_expired_without_commit:
+                    transition_info = self._transition(
+                        NavState.APPROACH,
+                        f'provisional_turn_rejected_to_approach('
+                        f'block_reason={provisional_turn_commit_block_reason}, '
+                        f'turn_votes={turn_votes}, '
+                        f'stage_majority={stage_majority}, '
+                        f'window_expired=True)'
+                    )
+                    self.locked_turn_dir = None
+                    self.provisional_turn_dir = None
+                    self._turn_relock_hist.clear()
+                    self._provisional_turn_hist.clear()
+                elif _turn_signal_faded:
                     if approach_votes >= majority_thr:
                         transition_info = self._transition(
                             NavState.APPROACH,
                             f'provisional_turn_rejected_to_approach('
+                            f'block_reason={provisional_turn_commit_block_reason}, '
                             f'turn_votes={turn_votes}, '
                             f'stage_majority={stage_majority}, '
-                            f'window_expired={_window_expired_without_commit})'
+                            f'window_expired=False)'
                         )
                     else:
                         transition_info = self._transition(
                             NavState.STRAIGHTKEEP,
                             f'provisional_turn_rejected_to_straightkeep('
+                            f'block_reason={provisional_turn_commit_block_reason}, '
                             f'turn_votes={turn_votes}, '
                             f'stage_majority={stage_majority}, '
-                            f'window_expired={_window_expired_without_commit})'
+                            f'window_expired=False)'
                         )
                         self._junction_hist.clear()
                     self.locked_turn_dir = None
@@ -842,6 +929,9 @@ class HierarchicalNavigatorStateMachine:
                 'provisional_turn_window_steps': self.provisional_turn_window_steps,
                 'provisional_turn_commit_votes': self.provisional_turn_commit_votes,
                 'provisional_turn_mix_ratio': self.provisional_turn_mix_ratio,
+                'provisional_turn_min_observe_steps': self.provisional_turn_min_observe_steps,
+                'provisional_turn_recent_consistency_steps': self.provisional_turn_recent_consistency_steps,
+                'provisional_turn_margin_votes': self.provisional_turn_margin_votes,
             },
             'omega_components': {
                 'straight_keep_raw': float(omega_raw),
@@ -880,6 +970,11 @@ class HierarchicalNavigatorStateMachine:
             'provisional_turn_candidate': provisional_turn_candidate,
             'provisional_turn_commit_ready': bool(provisional_turn_commit_ready),
             'provisional_turn_window_open': bool(provisional_turn_window_open),
+            'provisional_turn_recent_dir': provisional_turn_recent_dir,
+            'provisional_turn_recent_consistent_steps': int(provisional_turn_recent_consistent_steps),
+            'provisional_turn_margin': int(provisional_turn_margin),
+            'provisional_turn_observe_ready': bool(provisional_turn_observe_ready),
+            'provisional_turn_commit_block_reason': str(provisional_turn_commit_block_reason),
             'transition': transition_info,
         }
 
