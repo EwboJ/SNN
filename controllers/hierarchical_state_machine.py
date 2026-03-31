@@ -107,6 +107,9 @@ class HierarchicalNavigatorStateMachine:
         min_approach_steps_before_junction_lock: int = 3,
         # APPROACH 中 junction 锁存需要的最低 turn 票数
         min_turn_votes_before_junction_lock: int = 2,
+        start_junction_hist_on_turn_signal: bool = True,
+        min_turn_votes_to_start_junction_hist: int = 1,
+        reset_junction_hist_when_no_turn_signal: bool = True,
     ) -> None:
         # 参数做安全裁剪，避免异常配置导致状态机不可用
         self.stage_window_size = max(1, int(stage_window_size))
@@ -135,6 +138,9 @@ class HierarchicalNavigatorStateMachine:
         self.straight_recover_hold_steps = max(1, int(straight_recover_hold_steps))
         self.min_approach_steps_before_junction_lock = max(0, int(min_approach_steps_before_junction_lock))
         self.min_turn_votes_before_junction_lock = max(0, int(min_turn_votes_before_junction_lock))
+        self.start_junction_hist_on_turn_signal = bool(start_junction_hist_on_turn_signal)
+        self.min_turn_votes_to_start_junction_hist = max(0, int(min_turn_votes_to_start_junction_hist))
+        self.reset_junction_hist_when_no_turn_signal = bool(reset_junction_hist_when_no_turn_signal)
 
         # 历史窗口（用于投票迟滞）
         self._stage_hist = deque(maxlen=self.stage_window_size)
@@ -274,6 +280,17 @@ class HierarchicalNavigatorStateMachine:
             return 'Right'
         return None
 
+    def _is_turn_rising(self) -> bool:
+        # Keep compatibility with previous behavior: latest stage is Turn => rising.
+        hist_len = len(self._stage_hist)
+        if hist_len >= 2:
+            recent_2 = list(self._stage_hist)[-2:]
+            return recent_2[-1] == 'Turn'
+        if hist_len >= 1:
+            recent_1 = list(self._stage_hist)[-1:]
+            return recent_1[-1] == 'Turn'
+        return False
+
     def _fixed_turn_omega(self, turn_dir: Optional[str]) -> float:
         if turn_dir == 'Left':
             return self.left_turn_omega
@@ -323,9 +340,29 @@ class HierarchicalNavigatorStateMachine:
             self._stage_hist.append(stage_pred)
 
         # 仅在 APPROACH 缓存 junction 方向，避免旧窗口污染
+        stage_counts = self._get_stage_counts()
+        turn_votes = int(stage_counts.get('Turn', 0))
+        _turn_rising = self._is_turn_rising()
+        junction_hist_update_allowed = False
+        junction_hist_reset_applied = False
+
         if self.state == NavState.APPROACH:
-            if junction_pred is not None:
-                self._junction_hist.append(junction_pred)
+            _turn_signal_for_junction_hist = (
+                turn_votes >= self.min_turn_votes_to_start_junction_hist
+                or stage_pred == 'Turn'
+                or _turn_rising
+            )
+            junction_hist_update_allowed = (
+                (not self.start_junction_hist_on_turn_signal)
+                or _turn_signal_for_junction_hist
+            )
+            if junction_hist_update_allowed:
+                if junction_pred is not None:
+                    self._junction_hist.append(junction_pred)
+            elif self.reset_junction_hist_when_no_turn_signal and turn_votes == 0:
+                if self._junction_hist:
+                    self._junction_hist.clear()
+                    junction_hist_reset_applied = True
         elif self.state in (NavState.BOOT, NavState.STRAIGHTKEEP):
             self._junction_hist.clear()
 
@@ -375,7 +412,7 @@ class HierarchicalNavigatorStateMachine:
         elif self.state == NavState.APPROACH:
             # ===== APPROACH 转移优先级：TURN 进入 > fallback =====
             # 判断 Turn 票数是否正在上升（最近两帧趋势）
-            _turn_rising = False
+            _turn_rising = self._is_turn_rising()
             _hist_len = len(self._stage_hist)
             if _hist_len >= 2:
                 # 检查最近两帧中至少有一帧是 Turn
@@ -604,6 +641,9 @@ class HierarchicalNavigatorStateMachine:
                 'straight_recover_hold_steps': self.straight_recover_hold_steps,
                 'min_approach_steps_before_junction_lock': self.min_approach_steps_before_junction_lock,
                 'min_turn_votes_before_junction_lock': self.min_turn_votes_before_junction_lock,
+                'start_junction_hist_on_turn_signal': self.start_junction_hist_on_turn_signal,
+                'min_turn_votes_to_start_junction_hist': self.min_turn_votes_to_start_junction_hist,
+                'reset_junction_hist_when_no_turn_signal': self.reset_junction_hist_when_no_turn_signal,
             },
             'omega_components': {
                 'straight_keep_raw': float(omega_raw),
@@ -626,6 +666,8 @@ class HierarchicalNavigatorStateMachine:
             'straight_recover_hold_count': int(self._straight_recover_hold_count),
             'junction_lock_allowed': bool(junction_lock_allowed),
             'junction_lock_block_reason': str(junction_lock_block_reason),
+            'junction_hist_update_allowed': bool(junction_hist_update_allowed),
+            'junction_hist_reset_applied': bool(junction_hist_reset_applied),
             'transition': transition_info,
         }
 
