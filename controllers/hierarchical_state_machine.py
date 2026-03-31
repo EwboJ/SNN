@@ -110,6 +110,10 @@ class HierarchicalNavigatorStateMachine:
         start_junction_hist_on_turn_signal: bool = True,
         min_turn_votes_to_start_junction_hist: int = 1,
         reset_junction_hist_when_no_turn_signal: bool = True,
+        turn_relock_window_steps: int = 6,
+        turn_relock_votes: int = 4,
+        allow_turn_relock_once: bool = True,
+        soft_turn_steps: int = 14,
     ) -> None:
         # 参数做安全裁剪，避免异常配置导致状态机不可用
         self.stage_window_size = max(1, int(stage_window_size))
@@ -141,6 +145,10 @@ class HierarchicalNavigatorStateMachine:
         self.start_junction_hist_on_turn_signal = bool(start_junction_hist_on_turn_signal)
         self.min_turn_votes_to_start_junction_hist = max(0, int(min_turn_votes_to_start_junction_hist))
         self.reset_junction_hist_when_no_turn_signal = bool(reset_junction_hist_when_no_turn_signal)
+        self.turn_relock_window_steps = max(0, int(turn_relock_window_steps))
+        self.turn_relock_votes = max(1, int(turn_relock_votes))
+        self.allow_turn_relock_once = bool(allow_turn_relock_once)
+        self.soft_turn_steps = max(1, int(soft_turn_steps))
 
         # 历史窗口（用于投票迟滞）
         self._stage_hist = deque(maxlen=self.stage_window_size)
@@ -160,6 +168,7 @@ class HierarchicalNavigatorStateMachine:
         self._recover_support_count: int = 0
         # 新增：低 turn + 低 omega 持续计数
         self._straight_recover_hold_count: int = 0
+        self._turn_relock_used: bool = False
         self._stage_hist.clear()
         self._junction_hist.clear()
 
@@ -363,6 +372,12 @@ class HierarchicalNavigatorStateMachine:
                 if self._junction_hist:
                     self._junction_hist.clear()
                     junction_hist_reset_applied = True
+        elif self.state == NavState.TURN:
+            # TURN 早期纠错窗口内继续累计 junction 票数，用于重锁方向判断
+            if self.state_step <= self.turn_relock_window_steps:
+                junction_hist_update_allowed = True
+                if junction_pred is not None:
+                    self._junction_hist.append(junction_pred)
         elif self.state in (NavState.BOOT, NavState.STRAIGHTKEEP):
             self._junction_hist.clear()
 
@@ -384,8 +399,13 @@ class HierarchicalNavigatorStateMachine:
         fallback_blocked_by_junction_lock = False
         # 新增 debug 字段
         turn_exit_ready = False
+        turn_soft_exit_ready = False
         junction_lock_allowed = True
         junction_lock_block_reason = ''
+        relock_applied = False
+        relock_from = ''
+        relock_to = ''
+        relock_reason = ''
 
         # ===== 3) 状态转移逻辑（含迟滞） =====
         if self.state == NavState.BOOT:
@@ -475,6 +495,7 @@ class HierarchicalNavigatorStateMachine:
                 )
                 self._recover_support_count = 0
                 self._straight_recover_hold_count = 0
+                self._turn_relock_used = False
             else:
                 # ===== APPROACH -> STRAIGHTKEEP (保守 fallback) =====
                 # 必须同时满足所有条件才允许 fallback
@@ -500,7 +521,30 @@ class HierarchicalNavigatorStateMachine:
                             fallback_blocked_by_junction_lock = True
 
         elif self.state == NavState.TURN:
-            # TURN 期间方向锁存不可改写（关键约束）
+            # TURN 期间方向一般不改写；仅在早期窗口允许一次纠错重锁
+            _turn_relock_window_open = (self.state_step <= self.turn_relock_window_steps)
+            _turn_signal_strong = (turn_votes >= majority_thr or stage_majority == 'Turn')
+            _relock_quota_ok = ((not self.allow_turn_relock_once) or (not self._turn_relock_used))
+            if (_turn_relock_window_open
+                    and _turn_signal_strong
+                    and _relock_quota_ok
+                    and self.locked_turn_dir in ('Left', 'Right')):
+                _opposite_dir = 'Right' if self.locked_turn_dir == 'Left' else 'Left'
+                _opposite_votes = int(junction_counts.get(_opposite_dir, 0))
+                if _opposite_votes >= self.turn_relock_votes:
+                    relock_applied = True
+                    relock_from = str(self.locked_turn_dir)
+                    relock_to = _opposite_dir
+                    relock_reason = (
+                        f'turn_relock_in_early_window('
+                        f'opposite_votes={_opposite_votes}, '
+                        f'threshold={self.turn_relock_votes}, '
+                        f'turn_votes={turn_votes}, '
+                        f'stage_majority={stage_majority})'
+                    )
+                    self.locked_turn_dir = _opposite_dir
+                    self._turn_relock_used = True
+
             # ===== Recover 支持累计逻辑（渐减模式，吸收抖动） =====
             if recover_votes >= majority_thr:
                 self._recover_support_count += 1
@@ -519,6 +563,7 @@ class HierarchicalNavigatorStateMachine:
             # ===== TURN -> RECOVER 多条件退出逻辑 =====
             # 只有过了最小 TURN 步数才允许进入 RECOVER 判断
             turn_exit_ready = (self.state_step >= self.min_turn_steps)
+            turn_soft_exit_ready = (self.state_step > self.soft_turn_steps)
 
             if turn_exit_ready:
                 # 条件 a: Recover 信号已稳定确认
@@ -528,6 +573,10 @@ class HierarchicalNavigatorStateMachine:
                 # 条件 b: 低 turn 票数 + 低 omega 持续足够步数
                 _exit_by_low_turn_omega = (
                     self._straight_recover_hold_count >= self.straight_recover_hold_steps
+                )
+                # 条件 c: 软超时后，只要出现最小 recover 支持即可退出
+                _exit_by_soft_turn_recover = (
+                    turn_soft_exit_ready and self._recover_support_count >= 1
                 )
 
                 if _exit_by_recover_signal:
@@ -544,6 +593,14 @@ class HierarchicalNavigatorStateMachine:
                         f'turn_votes={turn_votes}, '
                         f'omega_raw={omega_raw:.3f}, '
                         f'hold_count={self._straight_recover_hold_count})'
+                    )
+                elif _exit_by_soft_turn_recover:
+                    transition_info = self._transition(
+                        NavState.RECOVER,
+                        f'recover_signal_after_soft_turn_steps('
+                        f'state_step={self.state_step}, '
+                        f'soft_turn_steps={self.soft_turn_steps}, '
+                        f'support={self._recover_support_count})'
                     )
 
             # 最终兜底：timeout 强制退出
@@ -644,6 +701,10 @@ class HierarchicalNavigatorStateMachine:
                 'start_junction_hist_on_turn_signal': self.start_junction_hist_on_turn_signal,
                 'min_turn_votes_to_start_junction_hist': self.min_turn_votes_to_start_junction_hist,
                 'reset_junction_hist_when_no_turn_signal': self.reset_junction_hist_when_no_turn_signal,
+                'turn_relock_window_steps': self.turn_relock_window_steps,
+                'turn_relock_votes': self.turn_relock_votes,
+                'allow_turn_relock_once': self.allow_turn_relock_once,
+                'soft_turn_steps': self.soft_turn_steps,
             },
             'omega_components': {
                 'straight_keep_raw': float(omega_raw),
@@ -663,11 +724,16 @@ class HierarchicalNavigatorStateMachine:
             'fallback_blocked_by_junction_lock': bool(fallback_blocked_by_junction_lock),
             # ===== 新增 debug 字段 =====
             'turn_exit_ready': bool(turn_exit_ready),
+            'turn_soft_exit_ready': bool(turn_soft_exit_ready),
             'straight_recover_hold_count': int(self._straight_recover_hold_count),
             'junction_lock_allowed': bool(junction_lock_allowed),
             'junction_lock_block_reason': str(junction_lock_block_reason),
             'junction_hist_update_allowed': bool(junction_hist_update_allowed),
             'junction_hist_reset_applied': bool(junction_hist_reset_applied),
+            'relock_applied': bool(relock_applied),
+            'relock_from': str(relock_from),
+            'relock_to': str(relock_to),
+            'relock_reason': str(relock_reason),
             'transition': transition_info,
         }
 
