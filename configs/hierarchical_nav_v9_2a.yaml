@@ -1,0 +1,69 @@
+# 层级导航统一配置
+# 用途:
+# - replay 离线复现
+# - ROS2 在线节点
+# 说明:
+# - 默认值面向 48x64 输入主线
+# - checkpoint 路径为示例相对路径, 可按实验结果替换
+
+system:
+  image_h: 48              # 输入图像高度, 与训练 img_h 对齐
+  image_w: 64              # 输入图像宽度, 与训练 img_w 对齐
+  control_rate_hz: 10      # 状态机更新频率(Hz)
+
+models:
+  junction_lr_ckpt: "./checkpoint/corridor_task/corridor_task_junction_lr_APLIF_ADD_T4/best_model.ckpt"      # 左右判定模型
+  stage3_ckpt: "./checkpoint/corridor_task/corridor_task_stage3_APLIF_ADD_T4/best_model.ckpt"                # 三阶段模型
+  straight_keep_ckpt: "./checkpoint/corridor/corridor_regression_dim1_rate_APLIF_ADD_T4_seq4/best_model.ckpt"            # 直行纠偏回归模型
+
+state_machine:
+  boot_steps: 6                       # 启动预热步数, 抑制首帧抖动
+  stage_window_size: 7                # stage3 多帧投票窗口大小
+  stage_enter_turn_votes: 5           # 进入 Turn 所需最少票数
+  stage_exit_turn_votes: 5            # 退出 Turn 所需最少票数
+  junction_window_size: 5             # junction 左右投票窗口大小
+  junction_lock_votes: 4              # 锁定 Left/Right 所需最少票数
+  recover_min_steps: 8                # Recover 最少保持步数
+  recover_blend_steps: 12             # Recover 到直行阶段的融合步数
+  straightkeep_suppress_in_turn: true # Turn 期间抑制 straight_keep 输出
+
+  # ----- TURN 退出增强 -----
+  min_turn_steps: 10                  # TURN 最小持续步数, 在此之前不允许退出 TURN
+  # v9.2a: 仅降低 soft_exit_min_turn_steps
+  soft_exit_min_turn_steps: 10        # soft exit 最小启用步数（仅本实验项）
+  recover_support_steps_needed: 2     # Recover 信号累计确认所需有效支持步数(渐减模式)
+  turn_exit_vote_threshold: 3         # turn_votes 低于此值时, 配合低 omega 可退出 TURN
+  straight_recover_omega_thresh: 0.12 # TURN 退出条件: |omega_raw| 低于此值视为可安全切回直行
+  straight_recover_hold_steps: 3      # 低 turn + 低 omega 需持续的步数才可退出 TURN
+
+  # ----- Junction 锁存延迟 -----
+  min_approach_steps_before_junction_lock: 20  # APPROACH 中 junction 最早锁存的步数门槛, 防止早期锁错
+  min_turn_votes_before_junction_lock: 2       # junction 锁存需要的最低 turn 票数, Turn 信号太弱时延迟锁存
+
+  start_junction_hist_on_turn_signal: true     # 是否在出现 turn 信号后才开始累计 junction 历史, 抑制 APPROACH 早期噪声
+  min_turn_votes_to_start_junction_hist: 1     # 启动 junction 历史累计所需的最小 turn 票数
+  reset_junction_hist_when_no_turn_signal: true # APPROACH 且长时间无 turn 信号时重置 junction 历史, 避免错误方向滞留
+  # ----- PROVISIONAL_TURN 提交确认 -----
+  provisional_turn_window_steps: 6             # PROVISIONAL_TURN 最长观察窗口步数
+  provisional_turn_commit_votes: 4             # 兼容旧规则：窗口内达到该票数可作为候选基础
+  provisional_turn_mix_ratio: 0.35             # PROVISIONAL_TURN 控制混合比例（小幅转向偏置）
+  provisional_turn_min_observe_steps: 3        # 最小观察步数，未达到前禁止提交
+  provisional_turn_recent_consistency_steps: 3 # 最近连续一致步数阈值，用于方向稳定性判定
+  provisional_turn_margin_votes: 2             # 主方向相对次方向的最小领先票数
+  provisional_turn_use_omega_gate: true        # 是否启用 omega 方向一致性门控，抑制仅靠 junction 连续误判的早提交
+  provisional_turn_omega_sign_thresh: 0.06     # omega 符号判定阈值，|omega| 小于该值视为无方向提示
+  provisional_turn_require_omega_agreement: true # 当存在 omega 方向提示时，提交方向需与其一致才允许 commit
+turn_control:
+  left_omega: 1.2             # 固定左转角速度(rad/s)
+  right_omega: -1.2           # 固定右转角速度(rad/s)
+  use_fixed_turn_rate: true   # Turn 阶段使用固定角速度
+  max_turn_steps: 20          # Turn 最长持续步数, 防止卡死
+
+straight_keep:
+  omega_clip: 1.2             # 回归输出角速度裁剪阈值
+  use_clip: true              # 是否启用裁剪
+
+logging:
+  save_debug_json: true       # 保存逐步状态与决策信息(json)
+  save_csv: true              # 保存关键时序信息(csv)
+  verbose: true               # 控制台打印详细日志
