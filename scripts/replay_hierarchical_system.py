@@ -298,6 +298,10 @@ def _build_state_machine(cfg: Dict[str, Any]) -> HierarchicalNavigatorStateMachi
         turn_relock_hist_size=sm_cfg.get('turn_relock_hist_size', 5),
         allow_turn_relock_once=sm_cfg.get('allow_turn_relock_once', True),
         soft_turn_steps=sm_cfg.get('soft_turn_steps', 14),
+        soft_exit_min_turn_steps=sm_cfg.get('soft_exit_min_turn_steps', 12),
+        soft_exit_recover_votes_needed=sm_cfg.get('soft_exit_recover_votes_needed', 1),
+        soft_exit_low_omega_thresh=sm_cfg.get('soft_exit_low_omega_thresh', 0.18),
+        soft_exit_turn_scale_end=sm_cfg.get('soft_exit_turn_scale_end', 0.55),
         provisional_turn_window_steps=sm_cfg.get('provisional_turn_window_steps', 6),
         provisional_turn_commit_votes=sm_cfg.get('provisional_turn_commit_votes', 4),
         provisional_turn_mix_ratio=sm_cfg.get('provisional_turn_mix_ratio', 0.35),
@@ -350,6 +354,10 @@ def _snapshot_state_machine_thresholds(
         'turn_relock_hist_size': int(getattr(sm, 'turn_relock_hist_size', 5)),
         'allow_turn_relock_once': bool(getattr(sm, 'allow_turn_relock_once', True)),
         'soft_turn_steps': int(getattr(sm, 'soft_turn_steps', 14)),
+        'soft_exit_min_turn_steps': int(getattr(sm, 'soft_exit_min_turn_steps', 12)),
+        'soft_exit_recover_votes_needed': int(getattr(sm, 'soft_exit_recover_votes_needed', 1)),
+        'soft_exit_low_omega_thresh': float(getattr(sm, 'soft_exit_low_omega_thresh', 0.18)),
+        'soft_exit_turn_scale_end': float(getattr(sm, 'soft_exit_turn_scale_end', 0.55)),
         'provisional_turn_window_steps': int(getattr(sm, 'provisional_turn_window_steps', 6)),
         'provisional_turn_commit_votes': int(getattr(sm, 'provisional_turn_commit_votes', 4)),
         'provisional_turn_mix_ratio': float(getattr(sm, 'provisional_turn_mix_ratio', 0.35)),
@@ -409,7 +417,14 @@ def _plot_state_timeline(trace_rows: List[Dict[str, Any]], out_png: str) -> None
         return
 
     steps = [int(r['step_idx']) for r in trace_rows]
-    state_map = {'BOOT': 0, 'STRAIGHTKEEP': 1, 'APPROACH': 2, 'TURN': 3, 'RECOVER': 4}
+    state_map = {
+        'BOOT': 0,
+        'STRAIGHTKEEP': 1,
+        'APPROACH': 2,
+        'PROVISIONAL_TURN': 3,
+        'TURN': 4,
+        'RECOVER': 5,
+    }
     stage_map = {'Approach': 0, 'Turn': 1, 'Recover': 2}
     turn_map = {'Left': 0, 'Right': 1}
 
@@ -429,8 +444,8 @@ def _plot_state_timeline(trace_rows: List[Dict[str, Any]], out_png: str) -> None
 
     ax = axes[0]
     ax.plot(steps, state_vals, drawstyle='steps-post', lw=1.8, color='#1E88E5')
-    ax.set_yticks([0, 1, 2, 3, 4])
-    ax.set_yticklabels(['BOOT', 'STRAIGHTKEEP', 'APPROACH', 'TURN', 'RECOVER'])
+    ax.set_yticks([0, 1, 2, 3, 4, 5])
+    ax.set_yticklabels(['BOOT', 'STRAIGHTKEEP', 'APPROACH', 'PROVISIONAL_TURN', 'TURN', 'RECOVER'])
     ax.set_ylabel('State')
     ax.set_title('Hierarchical State Timeline')
     ax.grid(alpha=0.25)
@@ -546,6 +561,7 @@ def run_replay(args: argparse.Namespace) -> None:
     num_turn_timeout_exits = 0
     num_recover_signal_exits = 0
     num_low_turn_low_omega_exits = 0
+    num_soft_exit_exits = 0
 
     # 新增：系统级研究分析追踪变量
     turn_signal_peak_votes = 0        # Turn 票数历史峰值
@@ -604,6 +620,8 @@ def run_replay(args: argparse.Namespace) -> None:
                     num_turn_timeout_exits += 1
                 elif 'recover_signal_confirmed' in reason_lc:
                     num_recover_signal_exits += 1
+                elif 'soft_exit' in reason_lc:
+                    num_soft_exit_exits += 1
                 elif 'recover_by_low_turn_and_low_omega' in reason_lc:
                     num_low_turn_low_omega_exits += 1
             # 新增：检测 fallback 并记录 step_idx
@@ -666,6 +684,10 @@ def run_replay(args: argparse.Namespace) -> None:
             'junction_lock_block_reason': str(debug.get('junction_lock_block_reason', '')),
             'current_recover_votes': int(_safe_float(debug.get('current_recover_votes', 0), 0)),
             'turn_exit_ready': bool(debug.get('turn_exit_ready', False)),
+            'turn_soft_exit_ready': bool(debug.get('turn_soft_exit_ready', False)),
+            'turn_exit_reason_final': str(debug.get('turn_exit_reason_final', '')),
+            'turn_component_scale': _safe_float(debug.get('turn_component_scale', 1.0), 1.0),
+            'soft_exit_triggered': bool(debug.get('soft_exit_triggered', False)),
             'straight_recover_hold_count': int(
                 _safe_float(debug.get('straight_recover_hold_count', 0), 0)),
             'provisional_turn_omega_dir_hint': (
@@ -698,6 +720,10 @@ def run_replay(args: argparse.Namespace) -> None:
             # 额外保留便于深入排查
             'clip_applied': clip_applied,
             'turn_timeout_triggered': bool(debug.get('turn_timeout_triggered', False)),
+            'turn_soft_exit_ready': bool(debug.get('turn_soft_exit_ready', False)),
+            'turn_exit_reason_final': str(debug.get('turn_exit_reason_final', '')),
+            'turn_component_scale': _safe_float(debug.get('turn_component_scale', 1.0), 1.0),
+            'soft_exit_triggered': bool(debug.get('soft_exit_triggered', False)),
             # 新增 fallback 分析字段
             'fallback_blocked_by_turn_signal': bool(
                 debug.get('fallback_blocked_by_turn_signal', False)),
@@ -738,6 +764,10 @@ def run_replay(args: argparse.Namespace) -> None:
         'junction_lock_block_reason',
         'current_recover_votes',
         'turn_exit_ready',
+        'turn_soft_exit_ready',
+        'turn_exit_reason_final',
+        'turn_component_scale',
+        'soft_exit_triggered',
         'straight_recover_hold_count',
         'provisional_turn_omega_dir_hint',
         'provisional_turn_omega_agree',
@@ -847,6 +877,7 @@ def run_replay(args: argparse.Namespace) -> None:
         'num_turn_timeout_exits': int(num_turn_timeout_exits),
         'num_recover_signal_exits': int(num_recover_signal_exits),
         'num_low_turn_low_omega_exits': int(num_low_turn_low_omega_exits),
+        'num_soft_exit_exits': int(num_soft_exit_exits),
         'thresholds': threshold_snapshot,
         # 追溯信息
         'run_dir': run_dir,

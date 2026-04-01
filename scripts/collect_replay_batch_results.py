@@ -44,6 +44,7 @@ COLLECT_FIELDS = [
     'first_locked_turn_dir',
     'most_frequent_locked_turn_dir',
     'corrected_eval_dir',
+    'exit_mode',
     'turn_dir_match',
     'corrected_turn_dir_match',
     'has_late_correction',
@@ -54,6 +55,10 @@ COLLECT_FIELDS = [
     'turn_duration_steps',
     'recover_duration_steps',
     'num_clip_applied',
+    'num_turn_timeout_exits',
+    'num_recover_signal_exits',
+    'num_low_turn_low_omega_exits',
+    'num_soft_exit_exits',
     'unique_state_sequence',
     'used_valid_only',
     'original_total_steps',
@@ -161,12 +166,31 @@ def _collect_all_runs(exp_root: str) -> List[Dict[str, Any]]:
             and first_locked_turn_dir != most_frequent_locked_turn_dir
         )
 
+        # 退出模式相关计数（缺失时安全兜底为 0）
+        num_turn_timeout_exits = _to_int(_safe_get(summary, 'num_turn_timeout_exits', 0)) or 0
+        num_recover_signal_exits = _to_int(_safe_get(summary, 'num_recover_signal_exits', 0)) or 0
+        num_low_turn_low_omega_exits = _to_int(_safe_get(summary, 'num_low_turn_low_omega_exits', 0)) or 0
+        num_soft_exit_exits = _to_int(_safe_get(summary, 'num_soft_exit_exits', 0)) or 0
+
+        # 兼容多个计数同时 > 0，按优先级确定主退出模式
+        if num_soft_exit_exits > 0:
+            exit_mode = 'soft_exit'
+        elif num_recover_signal_exits > 0:
+            exit_mode = 'recover_signal'
+        elif num_low_turn_low_omega_exits > 0:
+            exit_mode = 'low_turn_low_omega'
+        elif num_turn_timeout_exits > 0:
+            exit_mode = 'timeout'
+        else:
+            exit_mode = 'unknown'
+
         row: Dict[str, Any] = {
             'run_name':                      run_name,
             'gt_turn_dir':                   gt_turn_dir,
             'first_locked_turn_dir':         first_locked_turn_dir,
             'most_frequent_locked_turn_dir': most_frequent_locked_turn_dir,
             'corrected_eval_dir':            corrected_eval_dir,
+            'exit_mode':                     exit_mode,
             'turn_dir_match':                _safe_get(summary, 'turn_dir_match', ''),
             'corrected_turn_dir_match':      corrected_turn_dir_match,
             'has_late_correction':           has_late_correction,
@@ -177,6 +201,10 @@ def _collect_all_runs(exp_root: str) -> List[Dict[str, Any]]:
             'turn_duration_steps':           _safe_get(summary, 'turn_duration_steps', ''),
             'recover_duration_steps':        _safe_get(summary, 'recover_duration_steps', ''),
             'num_clip_applied':              _safe_get(summary, 'num_clip_applied', ''),
+            'num_turn_timeout_exits':        num_turn_timeout_exits,
+            'num_recover_signal_exits':      num_recover_signal_exits,
+            'num_low_turn_low_omega_exits':  num_low_turn_low_omega_exits,
+            'num_soft_exit_exits':           num_soft_exit_exits,
             'unique_state_sequence':         _format_sequence(unique_seq),
             'used_valid_only':               _safe_get(summary, 'used_valid_only', ''),
             'original_total_steps':          _safe_get(summary, 'original_total_steps', ''),
@@ -243,22 +271,41 @@ def _compute_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             full_seq_count += 1
     full_sequence_success_rate = full_seq_count / total_runs
 
-    # timeout_trigger_rate：若 summary 中有 turn_timeout 相关字段
-    timeout_count = 0
-    has_timeout_info = False
+    # 退出模式触发率：直接使用 replay_summary 中的退出计数字段
+    timeout_runs: List[str] = []
+    recover_signal_runs: List[str] = []
+    low_turn_low_omega_runs: List[str] = []
+    soft_exit_runs: List[str] = []
+
     for r in rows:
         raw = r.get('_raw', {})
-        # 检查几种可能的超时字段
-        if 'turn_timeout' in raw:
-            has_timeout_info = True
-            if raw['turn_timeout']:
-                timeout_count += 1
-        elif 'fallback_step_list' in raw:
-            has_timeout_info = True
-            fb_list = raw.get('fallback_step_list', [])
-            if isinstance(fb_list, list) and len(fb_list) > 0:
-                timeout_count += 1
-    timeout_trigger_rate = timeout_count / total_runs if has_timeout_info else None
+        if not isinstance(raw, dict):
+            raw = {}
+        run_name = str(r.get('run_name', ''))
+
+        num_turn_timeout_exits = _to_int(raw.get('num_turn_timeout_exits', 0)) or 0
+        num_recover_signal_exits = _to_int(raw.get('num_recover_signal_exits', 0)) or 0
+        num_low_turn_low_omega_exits = _to_int(raw.get('num_low_turn_low_omega_exits', 0)) or 0
+        num_soft_exit_exits = _to_int(raw.get('num_soft_exit_exits', 0)) or 0
+
+        timeout_run = (num_turn_timeout_exits > 0)
+        recover_signal_run = (num_recover_signal_exits > 0)
+        low_turn_low_omega_run = (num_low_turn_low_omega_exits > 0)
+        soft_exit_run = (num_soft_exit_exits > 0)
+
+        if timeout_run:
+            timeout_runs.append(run_name)
+        if recover_signal_run:
+            recover_signal_runs.append(run_name)
+        if low_turn_low_omega_run:
+            low_turn_low_omega_runs.append(run_name)
+        if soft_exit_run:
+            soft_exit_runs.append(run_name)
+
+    timeout_trigger_rate = len(timeout_runs) / total_runs
+    recover_signal_rate = len(recover_signal_runs) / total_runs
+    low_turn_low_omega_rate = len(low_turn_low_omega_runs) / total_runs
+    soft_exit_rate = len(soft_exit_runs) / total_runs
 
     # mean_turn_duration_steps
     turn_durations = [_to_float(r.get('turn_duration_steps'))
@@ -279,6 +326,13 @@ def _compute_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         'single_recover_success_rate': single_recover_success_rate,
         'full_sequence_success_rate':  full_sequence_success_rate,
         'timeout_trigger_rate':        timeout_trigger_rate,
+        'recover_signal_rate':         recover_signal_rate,
+        'low_turn_low_omega_rate':     low_turn_low_omega_rate,
+        'soft_exit_rate':              soft_exit_rate,
+        'timeout_runs':                timeout_runs,
+        'recover_signal_runs':         recover_signal_runs,
+        'low_turn_low_omega_runs':     low_turn_low_omega_runs,
+        'soft_exit_runs':              soft_exit_runs,
         'mean_turn_duration_steps':    mean_turn_duration,
         'mean_recover_duration_steps': mean_recover_duration,
     }
@@ -316,6 +370,13 @@ def _fmt_float(val: Optional[float], decimals: int = 2) -> str:
     if val is None:
         return 'N/A'
     return f'{val:.{decimals}f}'
+
+
+def _fmt_run_list(val: Any) -> str:
+    """格式化 run 列表。"""
+    if isinstance(val, list) and len(val) > 0:
+        return ', '.join(str(x) for x in val)
+    return 'None'
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +421,9 @@ def _write_md(rows: List[Dict[str, Any]], stats: Dict[str, Any], out_md: str) ->
     lines.append(f'| single_recover_success_rate | {_fmt_pct(stats.get("single_recover_success_rate"))} |')
     lines.append(f'| full_sequence_success_rate | {_fmt_pct(stats.get("full_sequence_success_rate"))} |')
     lines.append(f'| timeout_trigger_rate | {_fmt_pct(stats.get("timeout_trigger_rate"))} |')
+    lines.append(f'| recover_signal_rate | {_fmt_pct(stats.get("recover_signal_rate"))} |')
+    lines.append(f'| low_turn_low_omega_rate | {_fmt_pct(stats.get("low_turn_low_omega_rate"))} |')
+    lines.append(f'| soft_exit_rate | {_fmt_pct(stats.get("soft_exit_rate"))} |')
     lines.append(f'| mean_turn_duration_steps | {_fmt_float(stats.get("mean_turn_duration_steps"))} |')
     lines.append(f'| mean_recover_duration_steps | {_fmt_float(stats.get("mean_recover_duration_steps"))} |')
     lines.append('')
@@ -378,6 +442,11 @@ def _write_md(rows: List[Dict[str, Any]], stats: Dict[str, Any], out_md: str) ->
         ('turn_dir_match',                '1st Match'),
         ('corrected_turn_dir_match',      'Corr Match'),
         ('has_late_correction',           'Late Corr'),
+        ('exit_mode',                     'Exit Mode'),
+        ('num_turn_timeout_exits',        'Timeout Cnt'),
+        ('num_recover_signal_exits',      'Recover Sig Cnt'),
+        ('num_low_turn_low_omega_exits',  'LowTurnLowOmega Cnt'),
+        ('num_soft_exit_exits',           'SoftExit Cnt'),
         ('num_turn_entries',              '#Turn'),
         ('num_recover_entries',           '#Recov'),
         ('first_turn_step',              '1st Turn'),
@@ -406,6 +475,12 @@ def _write_md(rows: List[Dict[str, Any]], stats: Dict[str, Any], out_md: str) ->
         lines.append('| ' + ' | '.join(cells) + ' |')
 
     lines.append('')
+    lines.append('### Exit Mode Breakdown')
+    lines.append(f'- timeout: {_fmt_run_list(stats.get("timeout_runs"))}')
+    lines.append(f'- recover_signal: {_fmt_run_list(stats.get("recover_signal_runs"))}')
+    lines.append(f'- low_turn_low_omega: {_fmt_run_list(stats.get("low_turn_low_omega_runs"))}')
+    lines.append(f'- soft_exit: {_fmt_run_list(stats.get("soft_exit_runs"))}')
+    lines.append('')
     lines.append('---')
     lines.append(f'*由 `collect_replay_batch_results.py` 自动生成*')
     lines.append('')
@@ -432,6 +507,13 @@ def _print_stats(stats: Dict[str, Any]) -> None:
     print(f'  single_recover_success_rate : {_fmt_pct(stats.get("single_recover_success_rate"))}')
     print(f'  full_sequence_success_rate  : {_fmt_pct(stats.get("full_sequence_success_rate"))}')
     print(f'  timeout_trigger_rate        : {_fmt_pct(stats.get("timeout_trigger_rate"))}')
+    print(f'  recover_signal_rate         : {_fmt_pct(stats.get("recover_signal_rate"))}')
+    print(f'  low_turn_low_omega_rate     : {_fmt_pct(stats.get("low_turn_low_omega_rate"))}')
+    print(f'  soft_exit_rate              : {_fmt_pct(stats.get("soft_exit_rate"))}')
+    print(f'  timeout_runs                : {_fmt_run_list(stats.get("timeout_runs"))}')
+    print(f'  recover_signal_runs         : {_fmt_run_list(stats.get("recover_signal_runs"))}')
+    print(f'  low_turn_low_omega_runs     : {_fmt_run_list(stats.get("low_turn_low_omega_runs"))}')
+    print(f'  soft_exit_runs              : {_fmt_run_list(stats.get("soft_exit_runs"))}')
     print(f'  mean_turn_duration_steps    : {_fmt_float(stats.get("mean_turn_duration_steps"))}')
     print(f'  mean_recover_duration_steps : {_fmt_float(stats.get("mean_recover_duration_steps"))}')
     print('=' * 64)

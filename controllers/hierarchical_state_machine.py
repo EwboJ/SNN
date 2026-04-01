@@ -116,6 +116,10 @@ class HierarchicalNavigatorStateMachine:
         turn_relock_hist_size: int = 5,
         allow_turn_relock_once: bool = True,
         soft_turn_steps: int = 14,
+        soft_exit_min_turn_steps: int = 12,
+        soft_exit_recover_votes_needed: int = 1,
+        soft_exit_low_omega_thresh: float = 0.18,
+        soft_exit_turn_scale_end: float = 0.55,
         provisional_turn_window_steps: int = 6,
         provisional_turn_commit_votes: int = 4,
         provisional_turn_mix_ratio: float = 0.35,
@@ -161,6 +165,10 @@ class HierarchicalNavigatorStateMachine:
         self.turn_relock_hist_size = max(1, int(turn_relock_hist_size))
         self.allow_turn_relock_once = bool(allow_turn_relock_once)
         self.soft_turn_steps = max(1, int(soft_turn_steps))
+        self.soft_exit_min_turn_steps = max(1, int(soft_exit_min_turn_steps))
+        self.soft_exit_recover_votes_needed = max(1, int(soft_exit_recover_votes_needed))
+        self.soft_exit_low_omega_thresh = max(0.0, float(soft_exit_low_omega_thresh))
+        self.soft_exit_turn_scale_end = max(0.0, min(1.0, float(soft_exit_turn_scale_end)))
         self.provisional_turn_window_steps = max(1, int(provisional_turn_window_steps))
         self.provisional_turn_commit_votes = max(1, int(provisional_turn_commit_votes))
         self.provisional_turn_mix_ratio = max(0.0, min(1.0, float(provisional_turn_mix_ratio)))
@@ -495,6 +503,8 @@ class HierarchicalNavigatorStateMachine:
         # 新增 debug 字段
         turn_exit_ready = False
         turn_soft_exit_ready = False
+        turn_exit_reason_final = ''
+        soft_exit_triggered = False
         junction_lock_allowed = True
         junction_lock_block_reason = ''
         relock_applied = False
@@ -814,7 +824,8 @@ class HierarchicalNavigatorStateMachine:
             # ===== TURN -> RECOVER 多条件退出逻辑 =====
             # 只有过了最小 TURN 步数才允许进入 RECOVER 判断
             turn_exit_ready = (self.state_step >= self.min_turn_steps)
-            turn_soft_exit_ready = (self.state_step > self.soft_turn_steps)
+            soft_exit_ready = (self.state_step >= self.soft_exit_min_turn_steps)
+            turn_soft_exit_ready = soft_exit_ready
 
             if turn_exit_ready:
                 # 条件 a: Recover 信号已稳定确认
@@ -825,41 +836,61 @@ class HierarchicalNavigatorStateMachine:
                 _exit_by_low_turn_omega = (
                     self._straight_recover_hold_count >= self.straight_recover_hold_steps
                 )
-                # 条件 c: 软超时后，只要出现最小 recover 支持即可退出
-                _exit_by_soft_turn_recover = (
-                    turn_soft_exit_ready and self._recover_support_count >= 1
+                _soft_exit_low_omega = (abs(omega_raw) <= self.soft_exit_low_omega_thresh)
+                # 条件 c: soft exit，优先使用当前帧 recover_votes 或低 omega + 低 turn
+                _exit_by_soft_exit = (
+                    soft_exit_ready and (
+                        recover_votes >= self.soft_exit_recover_votes_needed
+                        or (_soft_exit_low_omega and _low_turn)
+                    )
                 )
 
                 if _exit_by_recover_signal:
+                    turn_exit_reason_final = 'recover_signal'
                     transition_info = self._transition(
                         NavState.RECOVER,
                         f'recover_signal_confirmed('
                         f'support={self._recover_support_count}, '
-                        f'needed={self.recover_support_steps_needed})'
+                        f'needed={self.recover_support_steps_needed}, '
+                        f'recover_votes={recover_votes}, '
+                        f'majority={majority_thr})'
+                    )
+                elif _exit_by_soft_exit:
+                    turn_exit_reason_final = 'soft_exit'
+                    soft_exit_triggered = True
+                    transition_info = self._transition(
+                        NavState.RECOVER,
+                        f'soft_exit('
+                        f'state_step={self.state_step}, '
+                        f'soft_exit_min_turn_steps={self.soft_exit_min_turn_steps}, '
+                        f'recover_votes={recover_votes}, '
+                        f'soft_exit_recover_votes_needed={self.soft_exit_recover_votes_needed}, '
+                        f'omega_raw={omega_raw:.3f}, '
+                        f'soft_exit_low_omega_thresh={self.soft_exit_low_omega_thresh:.3f}, '
+                        f'turn_votes={turn_votes}, '
+                        f'turn_exit_vote_threshold={self.turn_exit_vote_threshold})'
                     )
                 elif _exit_by_low_turn_omega:
+                    turn_exit_reason_final = 'low_turn_low_omega'
                     transition_info = self._transition(
                         NavState.RECOVER,
                         f'recover_by_low_turn_and_low_omega('
                         f'turn_votes={turn_votes}, '
+                        f'turn_exit_vote_threshold={self.turn_exit_vote_threshold}, '
                         f'omega_raw={omega_raw:.3f}, '
-                        f'hold_count={self._straight_recover_hold_count})'
-                    )
-                elif _exit_by_soft_turn_recover:
-                    transition_info = self._transition(
-                        NavState.RECOVER,
-                        f'recover_signal_after_soft_turn_steps('
-                        f'state_step={self.state_step}, '
-                        f'soft_turn_steps={self.soft_turn_steps}, '
-                        f'support={self._recover_support_count})'
+                        f'omega_thresh={self.straight_recover_omega_thresh:.3f}, '
+                        f'hold_count={self._straight_recover_hold_count}, '
+                        f'hold_needed={self.straight_recover_hold_steps})'
                     )
 
             # 最终兜底：timeout 强制退出
             if transition_info is None and self.state_step >= self.max_turn_steps:
                 turn_timeout_triggered = True
+                turn_exit_reason_final = 'timeout'
                 transition_info = self._transition(
                     NavState.RECOVER,
                     f'turn_timeout(max_turn_steps={self.max_turn_steps}, '
+                    f'state_step={self.state_step}, '
                     f'recover_support={self._recover_support_count})'
                 )
                 self._recover_support_count = 0
@@ -884,6 +915,7 @@ class HierarchicalNavigatorStateMachine:
         turn_omega = self._fixed_turn_omega(_turn_control_dir)
         recover_alpha = 1.0
         turn_mix_ratio = 0.0
+        turn_component_scale = 1.0
         provisional_turn_effective_mix_ratio = 0.0
 
         if self.state == NavState.BOOT:
@@ -911,7 +943,20 @@ class HierarchicalNavigatorStateMachine:
         elif self.state == NavState.TURN:
             # TURN 阶段按配置切换控制策略，且锁存方向始终主导
             if self.use_fixed_turn_rate:
-                omega_cmd_final = turn_omega
+                if self.state_step < self.soft_exit_min_turn_steps:
+                    turn_component_scale = 1.0
+                else:
+                    # 在 TURN 尾段线性衰减固定转向分量，帮助更自然进入 RECOVER
+                    _turn_scale_span = max(1, self.max_turn_steps - self.soft_exit_min_turn_steps)
+                    _turn_scale_progress = min(
+                        1.0,
+                        (self.state_step - self.soft_exit_min_turn_steps) / float(_turn_scale_span)
+                    )
+                    turn_component_scale = (
+                        1.0 - _turn_scale_progress * (1.0 - self.soft_exit_turn_scale_end)
+                    )
+                effective_turn_omega = turn_component_scale * turn_omega
+                omega_cmd_final = effective_turn_omega
             else:
                 # 允许少量 straight_keep 混合；suppress=True 时混合更弱
                 turn_mix_ratio = 0.1 if self.straightkeep_suppress_in_turn else 0.3
@@ -979,6 +1024,10 @@ class HierarchicalNavigatorStateMachine:
                 'turn_relock_hist_size': self.turn_relock_hist_size,
                 'allow_turn_relock_once': self.allow_turn_relock_once,
                 'soft_turn_steps': self.soft_turn_steps,
+                'soft_exit_min_turn_steps': self.soft_exit_min_turn_steps,
+                'soft_exit_recover_votes_needed': self.soft_exit_recover_votes_needed,
+                'soft_exit_low_omega_thresh': self.soft_exit_low_omega_thresh,
+                'soft_exit_turn_scale_end': self.soft_exit_turn_scale_end,
                 'provisional_turn_window_steps': self.provisional_turn_window_steps,
                 'provisional_turn_commit_votes': self.provisional_turn_commit_votes,
                 'provisional_turn_mix_ratio': self.provisional_turn_mix_ratio,
@@ -992,6 +1041,7 @@ class HierarchicalNavigatorStateMachine:
             'omega_components': {
                 'straight_keep_raw': float(omega_raw),
                 'turn_component': float(turn_omega),
+                'turn_component_scale': float(turn_component_scale),
                 'recover_alpha': float(recover_alpha),
                 'turn_mix_ratio': float(turn_mix_ratio),
                 'use_fixed_turn_rate': bool(self.use_fixed_turn_rate),
@@ -1008,6 +1058,9 @@ class HierarchicalNavigatorStateMachine:
             # ===== 新增 debug 字段 =====
             'turn_exit_ready': bool(turn_exit_ready),
             'turn_soft_exit_ready': bool(turn_soft_exit_ready),
+            'turn_exit_reason_final': str(turn_exit_reason_final),
+            'turn_component_scale': float(turn_component_scale),
+            'soft_exit_triggered': bool(soft_exit_triggered),
             'straight_recover_hold_count': int(self._straight_recover_hold_count),
             'junction_lock_allowed': bool(junction_lock_allowed),
             'junction_lock_block_reason': str(junction_lock_block_reason),
