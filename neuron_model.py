@@ -289,6 +289,16 @@ def build_neuron(neuron_type: str = 'APLIF', **kwargs):
     if neuron_type == 'LIF':
         tau = kwargs.pop('tau', 2.0)
 
+        # 清掉不属于 LIF 的参数
+        kwargs.pop('init_tau', None)
+        kwargs.pop('tau_adp', None)
+        kwargs.pop('init_tau_adp', None)
+        kwargs.pop('beta', None)
+        kwargs.pop('learn_tau_adp', None)
+        kwargs.pop('learn_beta', None)
+        kwargs.pop('use_extra_exp_leak', None)
+        kwargs.pop('extra_exp_leak_scale', None)
+
         def _builder():
             return LIFNode(
                 tau=tau,
@@ -299,6 +309,16 @@ def build_neuron(neuron_type: str = 'APLIF', **kwargs):
 
     elif neuron_type == 'PLIF':
         init_tau = kwargs.pop('init_tau', 2.0)
+
+        # 清掉不属于 PLIF 的参数
+        kwargs.pop('tau', None)
+        kwargs.pop('tau_adp', None)
+        kwargs.pop('init_tau_adp', None)
+        kwargs.pop('beta', None)
+        kwargs.pop('learn_tau_adp', None)
+        kwargs.pop('learn_beta', None)
+        kwargs.pop('use_extra_exp_leak', None)
+        kwargs.pop('extra_exp_leak_scale', None)
 
         def _builder():
             return ParametricLIFNode(
@@ -316,6 +336,10 @@ def build_neuron(neuron_type: str = 'APLIF', **kwargs):
         learn_beta = kwargs.pop('learn_beta', False)
         use_extra_exp_leak = kwargs.pop('use_extra_exp_leak', False)
         extra_exp_leak_scale = kwargs.pop('extra_exp_leak_scale', 0.0)
+
+        # 清掉不属于 ALIF 的参数
+        kwargs.pop('init_tau', None)
+        kwargs.pop('init_tau_adp', None)
 
         def _builder():
             return ALIFNode(
@@ -339,6 +363,10 @@ def build_neuron(neuron_type: str = 'APLIF', **kwargs):
         learn_beta = kwargs.pop('learn_beta', False)
         use_extra_exp_leak = kwargs.pop('use_extra_exp_leak', False)
         extra_exp_leak_scale = kwargs.pop('extra_exp_leak_scale', 0.0)
+
+        # 清掉不属于 APLIF 的参数
+        kwargs.pop('tau', None)
+        kwargs.pop('tau_adp', None)
 
         def _builder():
             return APLIFNode(
