@@ -679,6 +679,24 @@ def main():
     parser.add_argument('--neuron_type', default='APLIF', type=str,
                         choices=['LIF', 'PLIF', 'ALIF', 'APLIF'],
                         help='神经元类型')
+    parser.add_argument('--init_tau', default=2.0, type=float,
+                        help='PLIF/APLIF 的初始膜时间常数')
+    parser.add_argument('--tau', default=2.0, type=float,
+                        help='LIF/ALIF 的固定膜时间常数')
+    parser.add_argument('--init_tau_adp', default=20.0, type=float,
+                        help='APLIF 的初始阈值自适应时间常数')
+    parser.add_argument('--tau_adp', default=20.0, type=float,
+                        help='ALIF 的固定阈值自适应时间常数')
+    parser.add_argument('--adapt_beta', default=1.8, type=float,
+                        help='ALIF/APLIF 的阈值自适应强度 beta')
+    parser.add_argument('--learn_tau_adp', action='store_true',
+                        help='是否学习阈值自适应时间常数')
+    parser.add_argument('--learn_beta', action='store_true',
+                        help='是否学习阈值自适应强度 beta')
+    parser.add_argument('--use_extra_exp_leak', action='store_true',
+                        help='启用额外 exp 非线性漏电项（默认关闭）')
+    parser.add_argument('--extra_exp_leak_scale', default=0.0, type=float,
+                        help='额外 exp 非线性漏电项的缩放系数')
     parser.add_argument('--residual_mode', default='ADD', type=str,
                         choices=['standard', 'ADD'],
                         help='残差连接模式')
@@ -926,7 +944,17 @@ def main():
     writer = None
     if args.enable_tensorboard:
         writer = SummaryWriter(os.path.join(exp_out_dir, 'runs'))
-
+    neuron_kwargs = dict(
+        tau=args.tau,
+        init_tau=args.init_tau,
+        tau_adp=args.tau_adp,
+        init_tau_adp=args.init_tau_adp,
+        beta=args.adapt_beta,
+        learn_tau_adp=args.learn_tau_adp,
+        learn_beta=args.learn_beta,
+        use_extra_exp_leak=args.use_extra_exp_leak,
+        extra_exp_leak_scale=args.extra_exp_leak_scale,
+    )
     # ======================== 构建网络 ========================
     if is_corridor_task:
         from models.snn_corridor import build_corridor_net
@@ -941,6 +969,16 @@ def main():
             raw_in_channels=in_channels,
             use_tanh=False,
             framediff_gain=args.framediff_gain,
+
+            tau=args.tau,
+            init_tau=args.init_tau,
+            tau_adp=args.tau_adp,
+            init_tau_adp=args.init_tau_adp,
+            beta=args.adapt_beta,
+            learn_tau_adp=args.learn_tau_adp,
+            learn_beta=args.learn_beta,
+            use_extra_exp_leak=args.use_extra_exp_leak,
+            extra_exp_leak_scale=args.extra_exp_leak_scale,
         )
     elif is_corridor:
         from models.snn_corridor import build_corridor_net
@@ -957,14 +995,30 @@ def main():
             v_max=args.v_max,
             w_max=args.w_max,
             framediff_gain=args.framediff_gain,
+
+            tau=args.tau,
+            init_tau=args.init_tau,
+            tau_adp=args.tau_adp,
+            init_tau_adp=args.init_tau_adp,
+            beta=args.adapt_beta,
+            learn_tau_adp=args.learn_tau_adp,
+            learn_beta=args.learn_beta,
+            use_extra_exp_leak=args.use_extra_exp_leak,
+            extra_exp_leak_scale=args.extra_exp_leak_scale,
         )
     else:
         net = resnet110(
+            # num_classes=num_classes,
+            # T=args.T,
+            # neuron_type=args.neuron_type,
+            # residual_mode=args.residual_mode,
+            # in_channels=in_channels,
             num_classes=num_classes,
             T=args.T,
             neuron_type=args.neuron_type,
             residual_mode=args.residual_mode,
             in_channels=in_channels,
+            neuron_kwargs=neuron_kwargs,
         )
     print(net)
     net.to(args.device)
@@ -1105,6 +1159,16 @@ def main():
         'exp_name': exp_name,
         'seed': args.seed,
         'dataset': args.dataset,
+
+        'tau': args.tau,
+        'init_tau': args.init_tau,
+        'tau_adp': args.tau_adp,
+        'init_tau_adp': args.init_tau_adp,
+        'adapt_beta': args.adapt_beta,
+        'learn_tau_adp': args.learn_tau_adp,
+        'learn_beta': args.learn_beta,
+        'use_extra_exp_leak': args.use_extra_exp_leak,
+        'extra_exp_leak_scale': args.extra_exp_leak_scale,
     }
     if is_corridor_task:
         config.update({

@@ -177,6 +177,20 @@ class Bottleneck(nn.Module):
 class SorResNet(nn.Module):
 
     def __init__(
+        # self,
+        # block: Type[Union[BasicBlock, Bottleneck]],
+        # layers: List[int],
+        # num_classes: int = 10,
+        # zero_init_residual: bool = False,
+        # groups: int = 1,
+        # width_per_group: int = 64,
+        # replace_stride_with_dilation: Optional[List[bool]] = None,
+        # norm_layer: Optional[Callable[..., nn.Module]] = None,
+        # return_features: bool = False,
+        # T: int = 8,
+        # neuron_type: str = 'APLIF',
+        # residual_mode: str = 'ADD',
+        # in_channels: int = 3
         self,
         block: Type[Union[BasicBlock, Bottleneck]],
         layers: List[int],
@@ -190,7 +204,8 @@ class SorResNet(nn.Module):
         T: int = 8,
         neuron_type: str = 'APLIF',
         residual_mode: str = 'ADD',
-        in_channels: int = 3
+        in_channels: int = 3,
+        neuron_kwargs: Optional[dict] = None,
     ) -> None:
         super(SorResNet, self).__init__()
         self.return_features = return_features  # 控制是否返回中间特征
@@ -199,7 +214,9 @@ class SorResNet(nn.Module):
         self.residual_mode = residual_mode
         
         # 构建神经元工厂
-        self._neuron_builder = build_neuron(neuron_type)
+        # self._neuron_builder = build_neuron(neuron_type)
+        self.neuron_kwargs = neuron_kwargs or {}
+        self._neuron_builder = build_neuron(neuron_type, **self.neuron_kwargs)
         
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
