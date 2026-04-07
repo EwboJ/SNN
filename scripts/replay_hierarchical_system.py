@@ -214,6 +214,103 @@ def _collect_frames(
     return frames, label_fields, original_count, skipped_count
 
 
+def _parse_timestamp_ns(val: Any) -> Optional[int]:
+    """安全解析 timestamp_ns，失败返回 None。"""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except Exception:
+        try:
+            return int(float(s))
+        except Exception:
+            return None
+
+
+def _can_use_time_sampling(frames: List[Dict[str, Any]]) -> bool:
+    """判断是否可对当前帧序列使用 timestamp_ns 时间采样。"""
+    if not frames:
+        return False
+    has_timestamp_field = False
+    has_parseable_ts = False
+    for fr in frames:
+        row = fr.get('label_row', {})
+        if not isinstance(row, dict):
+            continue
+        if 'timestamp_ns' in row:
+            has_timestamp_field = True
+            if _parse_timestamp_ns(row.get('timestamp_ns')) is not None:
+                has_parseable_ts = True
+    return has_timestamp_field and has_parseable_ts
+
+
+def _apply_frame_stride(
+    frames: List[Dict[str, Any]],
+    frame_stride: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """按固定步长抽帧。"""
+    stride = max(1, int(frame_stride))
+    if stride <= 1:
+        return frames, 0
+    sampled = [fr for i, fr in enumerate(frames) if (i % stride) == 0]
+    skipped = len(frames) - len(sampled)
+    return sampled, skipped
+
+
+def _apply_time_sampling(
+    frames: List[Dict[str, Any]],
+    sample_dt_ms: float,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """按 timestamp_ns 做时间间隔采样。"""
+    dt_ms = float(sample_dt_ms)
+    if dt_ms <= 0.0:
+        return frames, 0
+
+    min_dt_ns = dt_ms * 1e6
+    sampled: List[Dict[str, Any]] = []
+    last_keep_ts: Optional[int] = None
+
+    for fr in frames:
+        row = fr.get('label_row', {})
+        ts = _parse_timestamp_ns(row.get('timestamp_ns') if isinstance(row, dict) else None)
+        if ts is None:
+            # 缺失时间戳时跳过，避免破坏时间间隔采样约束
+            continue
+        if last_keep_ts is None:
+            sampled.append(fr)
+            last_keep_ts = ts
+            continue
+        if (ts - last_keep_ts) >= min_dt_ns:
+            sampled.append(fr)
+            last_keep_ts = ts
+
+    skipped = len(frames) - len(sampled)
+    return sampled, skipped
+
+
+def _apply_sampling(
+    frames: List[Dict[str, Any]],
+    frame_stride: int,
+    sample_dt_ms: float,
+) -> Tuple[List[Dict[str, Any]], int, str]:
+    """
+    统一采样入口：
+    1) 若 sample_dt_ms > 0 且 timestamp_ns 可用，优先时间采样
+    2) 否则按 frame_stride 采样
+    返回: (采样后帧, 采样跳过帧数, 采样模式)
+    """
+    if float(sample_dt_ms) > 0.0 and _can_use_time_sampling(frames):
+        sampled, skipped = _apply_time_sampling(frames, sample_dt_ms)
+        return sampled, skipped, 'time'
+
+    sampled, skipped = _apply_frame_stride(frames, frame_stride)
+    mode = 'stride' if max(1, int(frame_stride)) > 1 else 'none'
+    return sampled, skipped, mode
+
+
 def _normalize_phase(phase: str) -> str:
     """将 phase 文本规整到 Approach/Turn/Recover；无法识别返回空串。"""
     s = str(phase or '').strip().lower()
@@ -517,9 +614,18 @@ def run_replay(args: argparse.Namespace) -> None:
 
     # 收集帧（支持 valid_only 过滤）
     valid_only = bool(getattr(args, 'valid_only', False))
+    frame_stride = max(1, int(getattr(args, 'frame_stride', 1)))
+    sample_dt_ms = max(0.0, float(getattr(args, 'sample_dt_ms', 0.0)))
     frames, label_fields, original_total, skipped_invalid = _collect_frames(
         run_dir, valid_only=valid_only
     )
+    after_valid_filter_total = len(frames)
+    frames, skipped_by_sampling, sampling_mode = _apply_sampling(
+        frames=frames,
+        frame_stride=frame_stride,
+        sample_dt_ms=sample_dt_ms,
+    )
+    after_sampling_total = len(frames)
     if args.max_steps is not None and args.max_steps > 0:
         frames = frames[:args.max_steps]
 
@@ -528,7 +634,11 @@ def run_replay(args: argparse.Namespace) -> None:
     vprint(f'  配置文件:   {config_path}')
     vprint(f'  run 目录:   {run_dir}')
     vprint(f'  原始帧数:   {original_total}')
-    vprint(f'  有效帧数:   {len(frames)}  (跳过无效帧: {skipped_invalid})')
+    vprint(f'  valid 过滤后帧数: {after_valid_filter_total}  (跳过无效帧: {skipped_invalid})')
+    vprint(f'  采样后帧数: {after_sampling_total}  (采样跳过: {skipped_by_sampling})')
+    vprint(f'  sample_dt_ms: {sample_dt_ms}')
+    vprint(f'  frame_stride: {frame_stride}  (sampling_mode={sampling_mode})')
+    vprint(f'  实际回放帧数: {len(frames)}')
     vprint(f'  valid_only: {valid_only}')
     vprint(f'  输出目录:   {out_dir}')
     vprint(f'  logging:    save_debug_json={save_debug_json}, '
@@ -868,7 +978,10 @@ def run_replay(args: argparse.Namespace) -> None:
         'used_total_steps': len(trace_rows),
         'original_total_steps': original_total,
         'used_valid_only': valid_only,
+        'used_frame_stride': frame_stride,
+        'used_sample_dt_ms': sample_dt_ms,
         'skipped_invalid_steps': skipped_invalid,
+        'skipped_by_sampling_steps': skipped_by_sampling,
         # ===== 新增：TURN 信号分析 =====
         'turn_signal_peak_votes': int(turn_signal_peak_votes),
         'junction_lock_first_step': junction_lock_first_step,
@@ -940,12 +1053,20 @@ def main() -> None:
                         help='推理设备，例如 cpu / cuda:0（默认自动选择）')
     parser.add_argument('--max_steps', type=int, default=0,
                         help='仅回放前 N 帧（0 表示全部）')
+    parser.add_argument('--frame_stride', type=int, default=1,
+                        help='步长采样：每隔 N 帧保留 1 帧（默认 1 表示不采样）')
+    parser.add_argument('--sample_dt_ms', type=float, default=0.0,
+                        help='时间采样间隔(ms)，>0 且存在 timestamp_ns 时优先启用')
     # 新增：valid 过滤开关
     parser.add_argument('--valid_only', action='store_true', default=False,
                         help='仅回放 labels.csv 中 valid=1/true 的帧（默认回放全部）')
     args = parser.parse_args()
     if args.max_steps <= 0:
         args.max_steps = None
+    if args.frame_stride <= 0:
+        args.frame_stride = 1
+    if args.sample_dt_ms <= 0:
+        args.sample_dt_ms = 0.0
 
     run_replay(args)
 
