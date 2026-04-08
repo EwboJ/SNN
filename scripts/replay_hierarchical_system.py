@@ -936,6 +936,10 @@ def run_replay(args: argparse.Namespace) -> None:
     turn_exit_reason_primary = _get_turn_exit_reason_primary(trace_rows)
     turn_duration_steps = sum(1 for s in state_seq if s == 'TURN')
     recover_duration_steps = sum(1 for s in state_seq if s == 'RECOVER')
+    # 系统级成功指标：
+    # - returned_to_straightkeep：最后一个去重状态是否回到 STRAIGHTKEEP
+    # - task_success：方向正确 + 至少进入过 TURN/RECOVER + 最终回到 STRAIGHTKEEP
+    returned_to_straightkeep = bool(unique_state_sequence) and (unique_state_sequence[-1] == 'STRAIGHTKEEP')
 
     # final_locked_turn_dir：仅记录 run 结束时状态，不作为主评价指标
     final_locked_turn_dir = ''
@@ -984,6 +988,12 @@ def run_replay(args: argparse.Namespace) -> None:
             turn_dir_match = False
     else:
         turn_dir_match = None
+    task_success = (
+        (turn_dir_match is True)
+        and (int(num_turn_entries) >= 1)
+        and (int(num_recover_entries) >= 1)
+        and bool(returned_to_straightkeep)
+    )
 
     summary = {
         'total_steps': len(trace_rows),
@@ -1003,6 +1013,8 @@ def run_replay(args: argparse.Namespace) -> None:
         'recover_duration_steps': int(recover_duration_steps),
         'num_clip_applied': int(num_clip_applied),
         'unique_state_sequence': unique_state_sequence,
+        'returned_to_straightkeep': bool(returned_to_straightkeep),
+        'task_success': bool(task_success),
         # ===== 新增：valid 过滤相关统计 =====
         'used_total_steps': len(trace_rows),
         'original_total_steps': original_total,
