@@ -355,6 +355,34 @@ def _first_step_with_state(trace_rows: List[Dict[str, Any]], target_state: str) 
     return None
 
 
+def _parse_turn_exit_reason(reason: Any) -> str:
+    """将 TURN->RECOVER 的 transition_reason 归一为主退出原因标签。"""
+    reason_lc = str(reason or '').lower()
+    if 'recover_signal_confirmed' in reason_lc:
+        return 'recover_signal'
+    if 'soft_exit' in reason_lc:
+        return 'soft_exit'
+    if 'recover_by_low_turn_and_low_omega' in reason_lc:
+        return 'low_turn_low_omega'
+    if 'turn_timeout' in reason_lc:
+        return 'timeout'
+    return 'none'
+
+
+def _get_turn_exit_reason_primary(trace_rows: List[Dict[str, Any]]) -> str:
+    """
+    从 trace_rows 中提取主 TURN 退出原因：
+    - 取首个 TURN -> RECOVER 转移的 reason 进行解析
+    - 若不存在该转移，则返回 none
+    """
+    for r in trace_rows:
+        from_state = str(r.get('transition_from', ''))
+        to_state = str(r.get('transition_to', ''))
+        if from_state == 'TURN' and to_state == 'RECOVER':
+            return _parse_turn_exit_reason(r.get('transition_reason', ''))
+    return 'none'
+
+
 def _build_state_machine(cfg: Dict[str, Any]) -> HierarchicalNavigatorStateMachine:
     """根据 yaml 参数构建状态机（与配置字段完整对齐）。"""
     sm_cfg = deepcopy(cfg.get('state_machine', {}) or {})
@@ -905,6 +933,7 @@ def run_replay(args: argparse.Namespace) -> None:
     unique_state_sequence = _compress_state_sequence(state_seq)
     first_turn_step = _first_step_with_state(trace_rows, 'TURN')
     first_recover_step = _first_step_with_state(trace_rows, 'RECOVER')
+    turn_exit_reason_primary = _get_turn_exit_reason_primary(trace_rows)
     turn_duration_steps = sum(1 for s in state_seq if s == 'TURN')
     recover_duration_steps = sum(1 for s in state_seq if s == 'RECOVER')
 
@@ -991,6 +1020,7 @@ def run_replay(args: argparse.Namespace) -> None:
         'num_recover_signal_exits': int(num_recover_signal_exits),
         'num_low_turn_low_omega_exits': int(num_low_turn_low_omega_exits),
         'num_soft_exit_exits': int(num_soft_exit_exits),
+        'turn_exit_reason_primary': turn_exit_reason_primary,
         'thresholds': threshold_snapshot,
         # 追溯信息
         'run_dir': run_dir,
