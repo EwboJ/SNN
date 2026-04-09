@@ -46,7 +46,8 @@ import json
 import os
 import re
 import sys
-from collections import Counter
+import time
+from collections import Counter, deque
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -56,6 +57,11 @@ try:
     import yaml
 except ImportError as exc:  # pragma: no cover
     raise RuntimeError('缺少依赖 PyYAML，请先安装: pip install pyyaml') from exc
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
 
 
 # 允许脚本在仓库根目录直接运行
@@ -84,6 +90,18 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return float(default)
+
+
+def _truncate_tail(text: Any, max_len: int = 28) -> str:
+    """截断过长文本，优先保留尾部（便于看文件名后缀）。"""
+    s = str(text)
+    if max_len <= 0:
+        return ''
+    if len(s) <= max_len:
+        return s
+    if max_len <= 3:
+        return s[-max_len:]
+    return '...' + s[-(max_len - 3):]
 
 
 def _resolve_path(path_str: str, base_dir: Optional[str] = None) -> str:
@@ -684,7 +702,29 @@ def run_replay(args: argparse.Namespace) -> None:
     has_label_name = 'label_name' in label_fields
     has_valid_field = 'valid' in label_fields
 
-    for idx, fr in enumerate(frames):
+    # 新增计时变量：用于实时进度与滚动平均耗时
+    replay_start_time = time.perf_counter()
+    recent_step_times = deque(maxlen=30)
+    total_frames = len(frames)
+
+    # 替换主循环：优先使用 tqdm，未安装时自动退化为普通循环
+    if tqdm is not None:
+        progress = tqdm(
+            enumerate(frames),
+            total=total_frames,
+            desc='[Replay]',
+            dynamic_ncols=True,
+            unit='frame',
+            smoothing=0.1,
+            leave=True,
+        )
+    else:
+        progress = enumerate(frames)
+        if verbose:
+            print('[Replay][Warn] 未安装 tqdm，已退化为普通循环（可执行: pip install tqdm）')
+
+    for idx, fr in progress:
+        step_t0 = time.perf_counter()
         image_name = fr['image_name']
         image_path = fr['image_path']
         label_row = fr.get('label_row', {}) or {}
@@ -847,6 +887,36 @@ def run_replay(args: argparse.Namespace) -> None:
         # 保留完整状态机 debug 字段，便于核查新逻辑是否实际生效
         debug_row.update(deepcopy(debug))
         debug_rows.append(debug_row)
+
+        step_dt = time.perf_counter() - step_t0
+        recent_step_times.append(step_dt)
+        if tqdm is not None:
+            avg_step_time = (
+                sum(recent_step_times) / len(recent_step_times)
+                if recent_step_times else step_dt
+            )
+            if avg_step_time <= 0:
+                avg_step_time = step_dt if step_dt > 0 else 1e-9
+            progress.set_postfix(
+                {
+                    'step': idx,
+                    'state': state_now if state_now else 'NA',
+                    'lock': locked_dir_str if locked_dir_str else '-',
+                    'ms': f'{avg_step_time * 1000.0:.1f}',
+                    'fps': f'{1.0 / avg_step_time:.1f}',
+                    'img': _truncate_tail(image_name, max_len=30),
+                },
+                refresh=False,
+            )
+
+    if tqdm is not None:
+        progress.close()
+        total_elapsed = time.perf_counter() - replay_start_time
+        avg_fps = (float(total_frames) / total_elapsed) if total_elapsed > 0 else 0.0
+        vprint(
+            f'[Replay] 回放循环耗时: {total_elapsed:.2f}s, '
+            f'平均速度: {avg_fps:.2f} frame/s'
+        )
 
     # 4) replay_trace.csv（保持基础功能，默认保存）
     trace_csv = os.path.join(out_dir, 'replay_trace.csv')
