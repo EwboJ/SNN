@@ -80,6 +80,8 @@ class SpikeMonitor:
     def __init__(self):
         self.layer_spikes = {}
         self.layer_elements = {}
+        self.layer_sample_spikes = {}
+        self.layer_sample_elements = {}
         self.handles = []
 
     def register(self, net):
@@ -93,11 +95,32 @@ class SpikeMonitor:
             if isinstance(out, torch.Tensor):
                 self.layer_spikes[name] = out.sum().item()
                 self.layer_elements[name] = out.numel()
+
+                # 额外记录样本级 spikes/elements，支持细粒度代理功耗分析
+                out_detached = out.detach()
+                if out_detached.ndim == 0:
+                    sample_spikes = out_detached.reshape(1).to(
+                        device='cpu', dtype=torch.float64)
+                    sample_elements = torch.ones(
+                        1, dtype=torch.float64, device='cpu')
+                else:
+                    bsz = int(out_detached.shape[0])
+                    flat = out_detached.reshape(bsz, -1)
+                    sample_spikes = flat.sum(dim=1).to(
+                        device='cpu', dtype=torch.float64)
+                    sample_elements = torch.full(
+                        (bsz,), float(flat.shape[1]),
+                        dtype=torch.float64, device='cpu')
+
+                self.layer_sample_spikes[name] = sample_spikes
+                self.layer_sample_elements[name] = sample_elements
         return fn
 
     def reset(self):
         self.layer_spikes.clear()
         self.layer_elements.clear()
+        self.layer_sample_spikes.clear()
+        self.layer_sample_elements.clear()
 
     def avg_rate(self):
         s = sum(self.layer_spikes.values())
@@ -106,6 +129,43 @@ class SpikeMonitor:
 
     def total_spikes(self):
         return sum(self.layer_spikes.values())
+
+    def sample_rates_counts(self):
+        """
+        返回当前 forward 的样本级指标:
+          - sample_rates: 每个样本的 spike_rate
+          - sample_counts: 每个样本的 spike_count
+        """
+        if not self.layer_sample_spikes:
+            return [], []
+
+        names = sorted(self.layer_sample_spikes.keys())
+        first = self.layer_sample_spikes.get(names[0])
+        if not isinstance(first, torch.Tensor):
+            return [], []
+
+        bsz = int(first.numel())
+        if bsz <= 0:
+            return [], []
+
+        sample_spikes = torch.zeros(bsz, dtype=torch.float64, device='cpu')
+        sample_elements = torch.zeros(bsz, dtype=torch.float64, device='cpu')
+        for name in names:
+            spikes = self.layer_sample_spikes.get(name)
+            elems = self.layer_sample_elements.get(name)
+            if not isinstance(spikes, torch.Tensor) or not isinstance(elems, torch.Tensor):
+                continue
+            n = min(bsz, int(spikes.numel()), int(elems.numel()))
+            if n <= 0:
+                continue
+            sample_spikes[:n] += spikes.reshape(-1)[:n]
+            sample_elements[:n] += elems.reshape(-1)[:n]
+
+        sample_rates = torch.where(
+            sample_elements > 0,
+            sample_spikes / sample_elements,
+            torch.zeros_like(sample_spikes))
+        return sample_rates.tolist(), sample_spikes.tolist()
 
     def group_rates(self):
         groups = OrderedDict()
@@ -784,6 +844,8 @@ def main():
     all_run_names = []
     all_image_names = []
     all_frame_idx = []
+    all_sample_spike_rates = []
+    all_sample_spike_counts = []
     total_spikes = 0
     total_frames = 0
     all_spike_rates = []
@@ -808,10 +870,16 @@ def main():
                     all_spike_rates.append(sr)
                     total_spikes += monitor.total_spikes()
                     total_frames += B
+                    sample_rates_t, sample_counts_t = monitor.sample_rates_counts()
+                    if len(sample_rates_t) != B or len(sample_counts_t) != B:
+                        sample_rates_t = [sr] * B
+                        sample_counts_t = [monitor.total_spikes() / max(B, 1)] * B
 
                     for i in range(B):
                         all_preds.append(_to_float_scalar(out_t[i]))
                         all_labels.append(_to_float_scalar(label[i, t]))
+                        all_sample_spike_rates.append(float(sample_rates_t[i]))
+                        all_sample_spike_counts.append(float(sample_counts_t[i]))
 
                         # 元信息提取：phase / t_rel_ms / run_name / image_name / frame_idx
                         ph = _extract_phase(meta, bidx=i, tidx=t)
@@ -848,10 +916,16 @@ def main():
 
                 B = label.shape[0]
                 total_frames += B
+                sample_rates_fr, sample_counts_fr = monitor.sample_rates_counts()
+                if len(sample_rates_fr) != B or len(sample_counts_fr) != B:
+                    sample_rates_fr = [sr] * B
+                    sample_counts_fr = [monitor.total_spikes() / max(B, 1)] * B
 
                 for i in range(B):
                     all_preds.append(_to_float_scalar(out_fr[i]))
                     all_labels.append(_to_float_scalar(label[i]))
+                    all_sample_spike_rates.append(float(sample_rates_fr[i]))
+                    all_sample_spike_counts.append(float(sample_counts_fr[i]))
 
                     # 元信息提取：单帧模式
                     ph = _extract_phase(meta, bidx=i, tidx=None)
@@ -946,13 +1020,31 @@ def main():
 
     # Phase 统计
     phase_stats = {}
+    phase_spike_stats = {
+        'Correcting': {
+            'mean_spike_rate': 0.0,
+            'mean_spike_count': 0.0,
+            'count': 0,
+        },
+        'Settled': {
+            'mean_spike_rate': 0.0,
+            'mean_spike_count': 0.0,
+            'count': 0,
+        },
+    }
     phase_available = any(str(p).strip() for p in all_phases)
     if phase_available:
         phase_errs = defaultdict(list)
-        for p, r in zip(all_phases, residuals):
+        phase_spike_rates = defaultdict(list)
+        phase_spike_counts = defaultdict(list)
+        for p, r, sr_s, sc_s in zip(
+            all_phases, residuals, all_sample_spike_rates, all_sample_spike_counts
+        ):
             p_norm = _normalize_phase_name(p)
             if p_norm:
                 phase_errs[p_norm].append(r)
+                phase_spike_rates[p_norm].append(float(sr_s))
+                phase_spike_counts[p_norm].append(float(sc_s))
 
         for ph, errs in phase_errs.items():
             errs_arr = np.array(errs)
@@ -961,6 +1053,17 @@ def main():
                 'rmse': round(
                     float(np.sqrt(np.mean(errs_arr ** 2))), 6),
                 'count': len(errs_arr),
+            }
+        for ph in phase_spike_rates.keys():
+            rate_arr = np.array(phase_spike_rates[ph], dtype=np.float64)
+            cnt_arr = np.array(phase_spike_counts[ph], dtype=np.float64)
+            n = int(min(len(rate_arr), len(cnt_arr)))
+            if n <= 0:
+                continue
+            phase_spike_stats[ph] = {
+                'mean_spike_rate': round(float(np.mean(rate_arr[:n])), 6),
+                'mean_spike_count': round(float(np.mean(cnt_arr[:n])), 6),
+                'count': n,
             }
 
         if phase_stats:
@@ -1036,6 +1139,7 @@ def main():
         'group_rates': {k: round(v, 6) for k, v in grp_rates.items()},
         'phase_available': bool(phase_available),
         'phase_stats': phase_stats if phase_stats else {},
+        'phase_spike_stats': phase_spike_stats,
     }
     if seq_len:
         metrics['seq_len'] = seq_len
@@ -1053,7 +1157,8 @@ def main():
         # 保持逐样本导出，并补充 phase / t_rel_ms / run_name / image_name / frame_idx
         writer.writerow([
             'index', 'prediction', 'ground_truth', 'residual',
-            'phase', 't_rel_ms', 'run_name', 'image_name', 'frame_idx'
+            'phase', 't_rel_ms', 'run_name', 'image_name', 'frame_idx',
+            'sample_spike_rate', 'sample_spike_count'
         ])
         for i in range(len(all_preds)):
             writer.writerow([
@@ -1066,6 +1171,10 @@ def main():
                 all_run_names[i] if i < len(all_run_names) else '',
                 all_image_names[i] if i < len(all_image_names) else '',
                 all_frame_idx[i] if i < len(all_frame_idx) else '',
+                round(float(all_sample_spike_rates[i]), 6)
+                if i < len(all_sample_spike_rates) else '',
+                round(float(all_sample_spike_counts[i]), 6)
+                if i < len(all_sample_spike_counts) else '',
             ])
     print(f'  [✓] {csv_path}')
 

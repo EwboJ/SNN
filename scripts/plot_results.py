@@ -84,6 +84,9 @@ class SpikeMonitor:
     def __init__(self):
         self.layer_spikes = {}
         self.layer_elements = {}
+        self.layer_sample_spikes = {}
+        self.layer_sample_elements = {}
+        self.current_batch_size = None
         self.handles = []
 
     def register(self, net):
@@ -96,11 +99,43 @@ class SpikeMonitor:
             if isinstance(out, torch.Tensor):
                 self.layer_spikes[name] = out.sum().item()
                 self.layer_elements[name] = out.numel()
+
+                out_detached = out.detach()
+                if out_detached.ndim == 0:
+                    sample_spikes = out_detached.reshape(1).to(
+                        device='cpu', dtype=torch.float64)
+                    sample_elements = torch.ones(
+                        1, dtype=torch.float64, device='cpu')
+                else:
+                    bsz = self.current_batch_size
+                    batch_axis = 0
+                    if bsz is not None and bsz > 0:
+                        if out_detached.shape[0] == bsz:
+                            batch_axis = 0
+                        elif out_detached.ndim > 1 and out_detached.shape[1] == bsz:
+                            batch_axis = 1
+                        else:
+                            for ax_i, ax_n in enumerate(out_detached.shape):
+                                if ax_n == bsz:
+                                    batch_axis = ax_i
+                                    break
+                    moved = out_detached.movedim(batch_axis, 0)
+                    flat = moved.reshape(moved.shape[0], -1)
+                    sample_spikes = flat.sum(dim=1).to(
+                        device='cpu', dtype=torch.float64)
+                    sample_elements = torch.full(
+                        (flat.shape[0],), float(flat.shape[1]),
+                        dtype=torch.float64, device='cpu')
+
+                self.layer_sample_spikes[name] = sample_spikes
+                self.layer_sample_elements[name] = sample_elements
         return fn
 
     def reset(self):
         self.layer_spikes.clear()
         self.layer_elements.clear()
+        self.layer_sample_spikes.clear()
+        self.layer_sample_elements.clear()
 
     def avg_rate(self):
         s = sum(self.layer_spikes.values())
@@ -109,6 +144,52 @@ class SpikeMonitor:
 
     def total_spikes(self):
         return sum(self.layer_spikes.values())
+
+    def set_batch_size(self, batch_size):
+        """设置当前 forward 的 batch 大小，用于样本级 spike 统计。"""
+        self.current_batch_size = int(batch_size) if batch_size is not None else None
+
+    def sample_rates_counts(self, expected_batch_size=None):
+        """
+        返回当前 forward 的样本级指标:
+          - sample_rates: 每个样本的 spike_rate
+          - sample_counts: 每个样本的 spike_count
+        """
+        if not self.layer_sample_spikes:
+            return [], []
+
+        names = sorted(self.layer_sample_spikes.keys())
+        first = self.layer_sample_spikes.get(names[0])
+        if not isinstance(first, torch.Tensor):
+            return [], []
+
+        bsz = expected_batch_size
+        if bsz is None:
+            bsz = self.current_batch_size
+        if bsz is None:
+            bsz = int(first.numel())
+        bsz = int(max(0, bsz))
+        if bsz <= 0:
+            return [], []
+
+        sample_spikes = torch.zeros(bsz, dtype=torch.float64, device='cpu')
+        sample_elements = torch.zeros(bsz, dtype=torch.float64, device='cpu')
+        for name in names:
+            spikes = self.layer_sample_spikes.get(name)
+            elems = self.layer_sample_elements.get(name)
+            if not isinstance(spikes, torch.Tensor) or not isinstance(elems, torch.Tensor):
+                continue
+            n = min(bsz, int(spikes.numel()), int(elems.numel()))
+            if n <= 0:
+                continue
+            sample_spikes[:n] += spikes.reshape(-1)[:n]
+            sample_elements[:n] += elems.reshape(-1)[:n]
+
+        sample_rates = torch.where(
+            sample_elements > 0,
+            sample_spikes / sample_elements,
+            torch.zeros_like(sample_spikes))
+        return sample_rates.tolist(), sample_spikes.tolist()
 
     def group_rates(self):
         groups = OrderedDict()
@@ -397,8 +478,8 @@ def plot_per_class_metrics(per_class, out_dir):
 # 5. 逐样本预测导出
 # ============================================================================
 def export_predictions_csv(test_ds, all_preds, all_labels, all_probs,
-                           sample_spike_rates, class_names, num_actions,
-                           out_dir):
+                           sample_spike_rates, sample_spike_counts,
+                           class_names, num_actions, out_dir):
     """
     导出逐样本预测结果到 predictions.csv 和 errors_only.csv。
     """
@@ -414,7 +495,8 @@ def export_predictions_csv(test_ds, all_preds, all_labels, all_probs,
     header = ['sample_id', 'run_name', 'frame_idx',
               'true_label', 'pred_label', 'correct']
     header += [f'prob_{i}' for i in range(num_actions)]
-    header += ['spike_rate', 'split']
+    # 兼容保留 spike_rate（历史字段），并新增样本级细粒度字段
+    header += ['spike_rate', 'sample_spike_rate', 'sample_spike_count', 'split']
     header += has_fields
 
     rows = []
@@ -446,6 +528,10 @@ def export_predictions_csv(test_ds, all_preds, all_labels, all_probs,
         # spike_rate
         sr = sample_spike_rates[i] if i < len(sample_spike_rates) else 0.0
         row.append(f'{sr:.6f}')
+        # sample_spike_rate / sample_spike_count
+        row.append(f'{sr:.6f}')
+        sc = sample_spike_counts[i] if i < len(sample_spike_counts) else 0.0
+        row.append(f'{float(sc):.6f}')
         # split
         row.append('test')
         # 可选 metadata
@@ -731,6 +817,7 @@ def main():
     all_preds, all_labels = [], []
     all_probs = []
     sample_spike_rates = []
+    sample_spike_counts = []
     total_spikes, total_frames = 0, 0
     all_spike_rates = []
 
@@ -738,6 +825,7 @@ def main():
         for images, labels in tqdm(loader, desc='Inference'):
             monitor.reset()
             images = images.float().to(args.device)
+            monitor.set_batch_size(images.shape[0])
             out = net(images)
 
             if is_discrete:
@@ -748,10 +836,18 @@ def main():
                 all_probs.append(probs)
 
             batch_sr = monitor.avg_rate()
-            total_spikes += monitor.total_spikes()
+            batch_total_spikes = monitor.total_spikes()
+            total_spikes += batch_total_spikes
             total_frames += images.shape[0]
             all_spike_rates.append(batch_sr)
-            sample_spike_rates.extend([batch_sr] * images.shape[0])
+            sample_rates_batch, sample_counts_batch = monitor.sample_rates_counts(
+                expected_batch_size=images.shape[0])
+            if (len(sample_rates_batch) != images.shape[0]
+                    or len(sample_counts_batch) != images.shape[0]):
+                sample_rates_batch = [batch_sr] * images.shape[0]
+                sample_counts_batch = [batch_total_spikes / max(images.shape[0], 1)] * images.shape[0]
+            sample_spike_rates.extend([float(v) for v in sample_rates_batch])
+            sample_spike_counts.extend([float(v) for v in sample_counts_batch])
             functional.reset_net(net)
 
     if is_discrete and all_probs:
@@ -808,7 +904,8 @@ def main():
         # 4d. 逐样本预测导出
         export_predictions_csv(
             test_ds, all_preds, all_labels, all_probs,
-            sample_spike_rates, class_names, num_actions, args.out_dir)
+            sample_spike_rates, sample_spike_counts,
+            class_names, num_actions, args.out_dir)
         run_metrics = export_run_level_summary(args.out_dir, class_names)
         print(f'  [i] Frame-level Accuracy: {accuracy:.4f}')
         if run_metrics:
@@ -841,6 +938,46 @@ def main():
         plot_training_curves(tb_dir, args.out_dir)
     else:
         print('  [!] 未找到 TensorBoard 目录，跳过训练曲线')
+
+    # 代理功耗细粒度统计（按 true class / 正误分组）
+    class_spike_stats = OrderedDict()
+    correct_vs_error_spike_stats = {
+        'correct': {'mean_spike_rate': 0.0, 'mean_spike_count': 0.0, 'count': 0},
+        'error': {'mean_spike_rate': 0.0, 'mean_spike_count': 0.0, 'count': 0},
+    }
+    if is_discrete and len(all_labels) > 0:
+        n = len(all_labels)
+
+        def _sample_sr(i):
+            return float(sample_spike_rates[i]) if i < len(sample_spike_rates) else 0.0
+
+        def _sample_sc(i):
+            return float(sample_spike_counts[i]) if i < len(sample_spike_counts) else 0.0
+
+        def _agg_indices(indices):
+            if not indices:
+                return {'mean_spike_rate': 0.0, 'mean_spike_count': 0.0, 'count': 0}
+            rates = np.array([_sample_sr(i) for i in indices], dtype=np.float64)
+            counts = np.array([_sample_sc(i) for i in indices], dtype=np.float64)
+            return {
+                'mean_spike_rate': round(float(np.mean(rates)), 6),
+                'mean_spike_count': round(float(np.mean(counts)), 6),
+                'count': int(len(indices)),
+            }
+
+        for cls_id in range(num_actions):
+            cls_indices = [i for i in range(n) if int(all_labels[i]) == cls_id]
+            cls_name = class_names[cls_id] if cls_id < len(class_names) else f'class_{cls_id}'
+            st = _agg_indices(cls_indices)
+            st['class_id'] = int(cls_id)
+            class_spike_stats[cls_name] = st
+
+        correct_indices = [i for i in range(n) if int(all_preds[i]) == int(all_labels[i])]
+        error_indices = [i for i in range(n) if int(all_preds[i]) != int(all_labels[i])]
+        correct_vs_error_spike_stats = {
+            'correct': _agg_indices(correct_indices),
+            'error': _agg_indices(error_indices),
+        }
 
     # ---- 保存 metrics.json ----
     print('\n[5/5] 保存 metrics.json...')
@@ -899,9 +1036,13 @@ def main():
         'avg_spike_rate': round(float(avg_sr), 6),
         'sparsity': round(1.0 - float(avg_sr), 6),
         'spikes_per_image': round(spikes_per_img, 1),
+        'total_spikes': round(float(total_spikes), 1),
         'test_samples': total_frames,
         'total_test_frames': total_frames,
         'group_rates': {k: round(v, 6) for k, v in group_rates.items()},
+        'class_spike_stats': class_spike_stats if is_discrete else {},
+        'correct_vs_error_spike_stats': (
+            correct_vs_error_spike_stats if is_discrete else {}),
         'source': 'plot_results.py',
     }
     if is_discrete:
