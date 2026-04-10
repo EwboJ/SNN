@@ -373,6 +373,35 @@ def _first_step_with_state(trace_rows: List[Dict[str, Any]], target_state: str) 
     return None
 
 
+def _extract_state_segments(
+    trace_rows: List[Dict[str, Any]],
+    target_state: str,
+) -> List[List[int]]:
+    """
+    提取 target_state 的连续段，返回 [[start_step, end_step], ...]。
+    """
+    segments: List[List[int]] = []
+    start_step: Optional[int] = None
+    prev_step: Optional[int] = None
+
+    for r in trace_rows:
+        step = int(_safe_float(r.get('step_idx', 0), 0))
+        st = str(r.get('state', ''))
+        if st == target_state:
+            if start_step is None:
+                start_step = step
+            prev_step = step
+        else:
+            if start_step is not None and prev_step is not None:
+                segments.append([int(start_step), int(prev_step)])
+                start_step = None
+                prev_step = None
+
+    if start_step is not None and prev_step is not None:
+        segments.append([int(start_step), int(prev_step)])
+    return segments
+
+
 def _parse_turn_exit_reason(reason: Any) -> str:
     """将 TURN->RECOVER 的 transition_reason 归一为主退出原因标签。"""
     reason_lc = str(reason or '').lower()
@@ -1004,6 +1033,19 @@ def run_replay(args: argparse.Namespace) -> None:
     first_turn_step = _first_step_with_state(trace_rows, 'TURN')
     first_recover_step = _first_step_with_state(trace_rows, 'RECOVER')
     turn_exit_reason_primary = _get_turn_exit_reason_primary(trace_rows)
+    final_state = str(trace_rows[-1].get('state', '')) if trace_rows else ''
+    turn_state_segments = _extract_state_segments(trace_rows, 'TURN')
+    recover_state_segments = _extract_state_segments(trace_rows, 'RECOVER')
+    turn_segment_count = len(turn_state_segments)
+    recover_segment_count = len(recover_state_segments)
+    straightkeep_return_count = 0
+    for i in range(1, len(state_seq)):
+        if state_seq[i] == 'STRAIGHTKEEP' and state_seq[i - 1] != 'STRAIGHTKEEP':
+            straightkeep_return_count += 1
+    if first_recover_step is not None:
+        first_steps_after_first_recover = max(0, len(trace_rows) - int(first_recover_step) - 1)
+    else:
+        first_steps_after_first_recover = 0
     turn_duration_steps = sum(1 for s in state_seq if s == 'TURN')
     recover_duration_steps = sum(1 for s in state_seq if s == 'RECOVER')
     # 系统级成功指标：
@@ -1079,8 +1121,15 @@ def run_replay(args: argparse.Namespace) -> None:
         'turn_dir_match': turn_dir_match,
         'first_turn_step': first_turn_step,
         'first_recover_step': first_recover_step,
+        'first_steps_after_first_recover': int(first_steps_after_first_recover),
         'turn_duration_steps': int(turn_duration_steps),
         'recover_duration_steps': int(recover_duration_steps),
+        'final_state': final_state,
+        'turn_state_segments': turn_state_segments,
+        'recover_state_segments': recover_state_segments,
+        'straightkeep_return_count': int(straightkeep_return_count),
+        'turn_segment_count': int(turn_segment_count),
+        'recover_segment_count': int(recover_segment_count),
         'num_clip_applied': int(num_clip_applied),
         'unique_state_sequence': unique_state_sequence,
         'returned_to_straightkeep': bool(returned_to_straightkeep),
