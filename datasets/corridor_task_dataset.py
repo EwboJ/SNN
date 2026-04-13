@@ -26,6 +26,7 @@
 import os
 import csv
 import json
+import math
 from collections import Counter, OrderedDict
 from typing import Optional, Dict, List, Any
 
@@ -76,24 +77,105 @@ def _load_task_labels_csv(csv_path: str) -> List[Dict[str, Any]]:
       run_name, split, t_rel_ms, phase
     """
     rows = []
+    skipped_bad_rows = 0
+
+    def _safe_float(v, default=0.0):
+        """
+        安全 float 转换：
+          - None / '' / 仅空格 / 非法字符串 -> default
+          - 合法数值 -> float(v)
+        """
+        if v is None:
+            return float(default)
+        if isinstance(v, str):
+            s = v.strip()
+            if s == '':
+                return float(default)
+            try:
+                fv = float(s)
+            except (TypeError, ValueError):
+                return float(default)
+            if not math.isfinite(fv):
+                return float(default)
+            return fv
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(fv):
+            return float(default)
+        return fv
+
+    def _safe_int(v, default=0):
+        """
+        安全 int 转换：
+          - None / '' / 仅空格 / 非法字符串 -> default
+          - 合法整数 / 浮点字符串 -> int(...)
+        """
+        if v is None:
+            return default
+        if isinstance(v, str):
+            s = v.strip()
+            if s == '':
+                return default
+            try:
+                return int(s)
+            except (TypeError, ValueError):
+                try:
+                    fv = float(s)
+                except (TypeError, ValueError):
+                    return default
+                if not math.isfinite(fv):
+                    return default
+                return int(fv)
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                return default
+            if not math.isfinite(fv):
+                return default
+            return int(fv)
+
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        for line_no, row in enumerate(reader, start=2):
+            # 关键字段：缺失或损坏时跳过该行，避免数据集构建崩溃
+            image_name = (row.get('image_name') or '').strip()
+            label_id = _safe_int(row.get('label_id'), None)
+            timestamp_ns = _safe_int(row.get('timestamp_ns'), None)
+            if (not image_name) or (label_id is None) or (timestamp_ns is None):
+                skipped_bad_rows += 1
+                print(
+                    f"[CorridorTaskDataset][Warn] 跳过损坏行: "
+                    f"{os.path.basename(csv_path)}:{line_no} "
+                    f"(image_name='{image_name}', label_id={row.get('label_id')}, "
+                    f"timestamp_ns={row.get('timestamp_ns')})"
+                )
+                continue
+
             rows.append({
-                'image_name': row['image_name'],
-                'label_id': int(row['label_id']),
+                'image_name': image_name,
+                'label_id': label_id,
                 'label_name': row.get('label_name', ''),
-                'timestamp_ns': int(row['timestamp_ns']),
-                'linear_x': float(row.get('linear_x', 0)),
-                'angular_z': float(row.get('angular_z', 0)),
-                'valid': int(row.get('valid', 1)),
-                'orig_action_id': int(row.get('orig_action_id', -1)),
+                'timestamp_ns': timestamp_ns,
+                'linear_x': _safe_float(row.get('linear_x', 0.0), 0.0),
+                'angular_z': _safe_float(row.get('angular_z', 0.0), 0.0),
+                'valid': _safe_int(row.get('valid', 1), 1),
+                'orig_action_id': _safe_int(row.get('orig_action_id', -1), -1),
                 'orig_action_name': row.get('orig_action_name', ''),
                 'run_name': row.get('run_name', ''),
                 'split': row.get('split', ''),
-                't_rel_ms': float(row.get('t_rel_ms', 0)),
+                't_rel_ms': _safe_float(row.get('t_rel_ms', 0), 0.0),
                 'phase': row.get('phase', ''),
             })
+    if skipped_bad_rows > 0:
+        print(
+            f"[CorridorTaskDataset][Warn] {os.path.basename(csv_path)} "
+            f"共跳过损坏行: {skipped_bad_rows}"
+        )
     return rows
 
 

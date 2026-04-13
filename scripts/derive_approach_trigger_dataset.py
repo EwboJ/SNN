@@ -20,6 +20,7 @@ import csv
 import json
 import shutil
 import argparse
+import math
 from collections import OrderedDict, defaultdict
 
 
@@ -58,6 +59,71 @@ def safe_float(v, default=None):
         return float(v)
     except (TypeError, ValueError):
         return default
+
+
+def to_csv_float(v, default=0.0):
+    """
+    统一 CSV 浮点写出清洗函数，确保可被 float() 解析。
+    规则：
+      - None -> default
+      - ''   -> default
+      - 非法值 / nan / inf -> default
+      - 合法值 -> float(v)
+    """
+    if v is None:
+        return float(default)
+
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return float(default)
+        try:
+            fv = float(s)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(fv):
+            return float(default)
+        return fv
+
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(fv):
+        return float(default)
+    return fv
+
+
+def _is_nonempty_parseable_float(v):
+    """判断原始值是否“非空且可解析为有限浮点数”."""
+    if v is None:
+        return False
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return False
+        try:
+            fv = float(s)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(fv)
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(fv)
+
+
+def _format_csv_float(v):
+    """
+    将浮点数格式化为可解析字符串，并至少保留一位小数：
+      0      -> '0.0'
+      -356.7 -> '-356.7'
+    """
+    s = f"{float(v):.3f}".rstrip("0").rstrip(".")
+    if "." not in s:
+        s += ".0"
+    return s
 
 
 def normalize_action_name(name):
@@ -281,12 +347,6 @@ def collect_positive_negative_frames(
     return samples, stats
 
 
-def _format_t_rel_ms(v):
-    if v == "" or v is None:
-        return ""
-    return f"{float(v):.3f}".rstrip("0").rstrip(".")
-
-
 def _safe_link_or_copy(src_path, dst_path, copy_mode="symlink"):
     """
     copy_mode:
@@ -363,6 +423,8 @@ def write_derived_run(
     missing_images = 0
     copy_mode_stats = defaultdict(int)
     seen_image_names = set()
+    t_rel_ms_nonempty_parseable = 0
+    t_rel_ms_default_filled = 0
 
     for sample in samples:
         frame = sample["frame"]
@@ -381,13 +443,24 @@ def write_derived_run(
         copy_mode_stats[mode_used] += 1
         seen_image_names.add(image_name)
 
+        # t_rel_ms 统一数值清洗：
+        # - NearTurnEvent: 写真实负值（可解析数值字符串）
+        # - Straight: 空值会被默认填成 0.0
+        raw_t_rel = sample.get("t_rel_ms", None)
+        nonempty_parseable = _is_nonempty_parseable_float(raw_t_rel)
+        cleaned_t_rel = to_csv_float(raw_t_rel, default=0.0)
+        if nonempty_parseable:
+            t_rel_ms_nonempty_parseable += 1
+        else:
+            t_rel_ms_default_filled += 1
+
         rows_out.append({
             "image_name": image_name,
             "label_id": int(sample["label_id"]),
             "label_name": sample["label_name"],
             "orig_action_name": frame["action_name"],
             "timestamp_ns": int(frame["timestamp_ns"]),
-            "t_rel_ms": _format_t_rel_ms(sample["t_rel_ms"]),
+            "t_rel_ms": _format_csv_float(cleaned_t_rel),
             "valid": int(frame["valid"]),
             "source_run": frame["source_run"],
             "source_split": frame["source_split"],
@@ -442,6 +515,8 @@ def write_derived_run(
         "label_distribution": dict(label_distribution),
         "detected_turn_count": len(turns),
         "missing_images_skipped": missing_images,
+        "t_rel_ms_nonempty_parseable": t_rel_ms_nonempty_parseable,
+        "t_rel_ms_default_filled": t_rel_ms_default_filled,
     }
     return run_stats
 
@@ -464,6 +539,8 @@ def _init_split_summary():
         "runs_written": 0,
         "runs_skipped": 0,
         "samples_total": 0,
+        "t_rel_ms_nonempty_parseable": 0,
+        "t_rel_ms_default_filled": 0,
         "label_distribution": {
             LABEL_ID_TO_NAME[0]: 0,
             LABEL_ID_TO_NAME[1]: 0,
@@ -475,12 +552,16 @@ def _init_split_summary():
 def _accumulate_run_summary(split_summary, run_stats):
     split_summary["runs_written"] += 1
     split_summary["samples_total"] += run_stats["sample_count"]
+    split_summary["t_rel_ms_nonempty_parseable"] += run_stats.get("t_rel_ms_nonempty_parseable", 0)
+    split_summary["t_rel_ms_default_filled"] += run_stats.get("t_rel_ms_default_filled", 0)
     split_summary["label_distribution"][LABEL_ID_TO_NAME[0]] += run_stats["label_distribution"].get(LABEL_ID_TO_NAME[0], 0)
     split_summary["label_distribution"][LABEL_ID_TO_NAME[1]] += run_stats["label_distribution"].get(LABEL_ID_TO_NAME[1], 0)
     split_summary["runs"][run_stats["run_name"]] = {
         "sample_count": run_stats["sample_count"],
         "label_distribution": run_stats["label_distribution"],
         "detected_turn_count": run_stats["detected_turn_count"],
+        "t_rel_ms_nonempty_parseable": run_stats.get("t_rel_ms_nonempty_parseable", 0),
+        "t_rel_ms_default_filled": run_stats.get("t_rel_ms_default_filled", 0),
     }
 
 
@@ -713,6 +794,8 @@ def run_derive(args):
         "runs_written": 0,
         "runs_skipped": 0,
         "samples_total": 0,
+        "t_rel_ms_nonempty_parseable": 0,
+        "t_rel_ms_default_filled": 0,
         "label_distribution": {
             LABEL_ID_TO_NAME[0]: 0,
             LABEL_ID_TO_NAME[1]: 0,
@@ -724,6 +807,8 @@ def run_derive(args):
         totals["runs_written"] += ss["runs_written"]
         totals["runs_skipped"] += ss["runs_skipped"]
         totals["samples_total"] += ss["samples_total"]
+        totals["t_rel_ms_nonempty_parseable"] += ss.get("t_rel_ms_nonempty_parseable", 0)
+        totals["t_rel_ms_default_filled"] += ss.get("t_rel_ms_default_filled", 0)
         totals["label_distribution"][LABEL_ID_TO_NAME[0]] += ss["label_distribution"][LABEL_ID_TO_NAME[0]]
         totals["label_distribution"][LABEL_ID_TO_NAME[1]] += ss["label_distribution"][LABEL_ID_TO_NAME[1]]
     summary["totals"] = totals
@@ -745,6 +830,8 @@ def run_derive(args):
         print(f"  runs_written  : {ss['runs_written']}")
         print(f"  runs_skipped  : {ss['runs_skipped']}")
         print(f"  samples_total : {ss['samples_total']}")
+        print(f"  t_rel_ms_nonempty_parseable : {ss.get('t_rel_ms_nonempty_parseable', 0)}")
+        print(f"  t_rel_ms_default_filled_0.0 : {ss.get('t_rel_ms_default_filled', 0)}")
         print(
             "  label_dist    : "
             f"{LABEL_ID_TO_NAME[0]}={ss['label_distribution'][LABEL_ID_TO_NAME[0]]}, "
@@ -756,13 +843,17 @@ def run_derive(args):
                 print(
                     f"    - {rn}: total={rst['sample_count']}, "
                     f"{LABEL_ID_TO_NAME[0]}={rst['label_distribution'].get(LABEL_ID_TO_NAME[0], 0)}, "
-                    f"{LABEL_ID_TO_NAME[1]}={rst['label_distribution'].get(LABEL_ID_TO_NAME[1], 0)}"
+                    f"{LABEL_ID_TO_NAME[1]}={rst['label_distribution'].get(LABEL_ID_TO_NAME[1], 0)}, "
+                    f"t_rel_ok={rst.get('t_rel_ms_nonempty_parseable', 0)}, "
+                    f"t_rel_fill0={rst.get('t_rel_ms_default_filled', 0)}"
                 )
     print("-" * 88)
     print(f"totals.runs_seen     : {totals['runs_seen']}")
     print(f"totals.runs_written  : {totals['runs_written']}")
     print(f"totals.runs_skipped  : {totals['runs_skipped']}")
     print(f"totals.samples_total : {totals['samples_total']}")
+    print(f"totals.t_rel_ms_nonempty_parseable : {totals.get('t_rel_ms_nonempty_parseable', 0)}")
+    print(f"totals.t_rel_ms_default_filled_0.0 : {totals.get('t_rel_ms_default_filled', 0)}")
     print(
         "totals.label_dist    : "
         f"{LABEL_ID_TO_NAME[0]}={totals['label_distribution'][LABEL_ID_TO_NAME[0]]}, "
