@@ -76,6 +76,13 @@ for font in ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans']:
         continue
 plt.rcParams['axes.unicode_minus'] = False
 
+DEFAULT_TASK_CLASS_NAMES = {
+    'action3_balanced': ['Left', 'Straight', 'Right'],
+    'junction_lr': ['Left', 'Right'],
+    'stage3': ['Approach', 'Turn', 'Recover'],
+    'stage4': ['Follow', 'Approach', 'Turn', 'Recover'],
+}
+
 
 # ============================================================================
 # SpikeMonitor
@@ -569,6 +576,135 @@ def _safe_int(v, default=None):
         return default
 
 
+def normalize_task_name(task_name):
+    """
+    Normalize task_name for robust template lookup.
+    """
+    if task_name is None:
+        return ''
+    try:
+        name = str(task_name)
+    except Exception:
+        return ''
+    name = name.strip()
+    if not name:
+        return ''
+
+    normalized = name.lower().replace('-', '_').strip()
+    if normalized.startswith('stage3'):
+        return 'stage3'
+    if normalized.startswith('stage4'):
+        return 'stage4'
+    if normalized.startswith('junction_lr'):
+        return 'junction_lr'
+    if normalized.startswith('action3_balanced'):
+        return 'action3_balanced'
+    return normalized
+
+
+def parse_cli_class_names(cli_class_names):
+    """
+    Parse comma-separated class names from CLI/config input.
+    Returns list[str] or None.
+    """
+    if cli_class_names is None:
+        return None
+
+    if isinstance(cli_class_names, str):
+        text = cli_class_names.strip()
+        if not text:
+            return None
+        names = [part.strip() for part in text.split(',')]
+    elif isinstance(cli_class_names, (list, tuple)):
+        names = [str(part).strip() for part in cli_class_names]
+    else:
+        text = str(cli_class_names).strip()
+        if not text:
+            return None
+        names = [part.strip() for part in text.split(',')]
+
+    names = [n for n in names if n]
+    return names if names else None
+
+
+def _generate_generic_class_names(num_actions):
+    """Fallback generic class names by class count."""
+    n = _safe_int(num_actions, None)
+    if n is None or n <= 0:
+        return []
+    if n == 2:
+        return ['class_0', 'class_1']
+    if n == 3:
+        return ['class_0', 'class_1', 'class_2']
+    if n == 4:
+        return ['class_0', 'class_1', 'class_2', 'class_3']
+    return [f'class_{i}' for i in range(n)]
+
+
+def _ensure_class_names_for_count(class_names, num_actions, warn_prefix=''):
+    """
+    Ensure class_names length matches the expected class count.
+    If mismatch, rebuild generic names to avoid crashes.
+    """
+    n = _safe_int(num_actions, None)
+    if n is None or n <= 0:
+        return parse_cli_class_names(class_names) or []
+
+    names = parse_cli_class_names(class_names) or []
+    if len(names) != n:
+        prefix = f'{warn_prefix}: ' if warn_prefix else ''
+        print(f'  [!] {prefix}class_names length={len(names)} != '
+              f'num_actions={n}, fallback to generic names')
+        return _generate_generic_class_names(n)
+    return names
+
+
+def resolve_class_names(task_name, num_actions, cfg=None, data_root=None,
+                        cli_class_names=None):
+    """
+    Resolve class names with robust compatibility.
+    Priority:
+      1) config.class_names
+      2) --class_names
+      3) normalized task mapping
+      4) generic class_i fallback
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+
+    n = _safe_int(num_actions, None)
+    if n is None or n <= 0:
+        n = _safe_int(cfg.get('task_num_classes', cfg.get('num_classes', None)), None)
+    if n is None or n <= 0:
+        n = 3
+
+    cfg_class_names = parse_cli_class_names(cfg.get('class_names', None))
+    if cfg_class_names:
+        if len(cfg_class_names) == n:
+            return cfg_class_names
+        print(f'  [!] config.class_names length={len(cfg_class_names)} '
+              f'!= num_actions={n}, ignore config.class_names')
+
+    cli_names = parse_cli_class_names(cli_class_names)
+    if cli_names:
+        if len(cli_names) == n:
+            return cli_names
+        print(f'  [!] --class_names length={len(cli_names)} '
+              f'!= num_actions={n}, ignore --class_names')
+
+    normalized = normalize_task_name(task_name)
+    if not normalized:
+        inferred = _infer_task_name_from_path(data_root, default_name='')
+        normalized = normalize_task_name(inferred)
+    mapped = DEFAULT_TASK_CLASS_NAMES.get(normalized, None)
+    if mapped:
+        if len(mapped) == n:
+            return list(mapped)
+        print(f'  [!] default mapping for "{normalized}" has {len(mapped)} classes '
+              f'!= num_actions={n}, fallback to generic names')
+
+    return _generate_generic_class_names(n)
+
+
 def _majority_vote_int(values):
     """
     多数投票（整数标签）。
@@ -588,12 +724,31 @@ def _majority_vote_int(values):
 def _infer_task_name_from_path(data_root, default_name='action3_balanced'):
     """当 ckpt 缺 task_name 时，尝试从 data_root 推断任务名。"""
     if not data_root:
-        return default_name
-    path_l = str(data_root).lower()
+        return normalize_task_name(default_name)
+    path_l = str(data_root).lower().replace('-', '_').strip()
     for n in ('stage3', 'stage4', 'junction_lr', 'action3_balanced'):
         if n in path_l:
             return n
-    return default_name
+    return normalize_task_name(default_name)
+
+
+def _infer_missing_task_name(data_root, num_actions, default_name=''):
+    """
+    Conservative fallback used only when raw task_name is missing.
+    Inference is based on data_root + num_actions, and normalized.
+    """
+    inferred_from_path = _infer_task_name_from_path(data_root, default_name='')
+    if inferred_from_path:
+        return normalize_task_name(inferred_from_path)
+
+    cls_n = _safe_int(num_actions, None)
+    if cls_n == 2:
+        return 'junction_lr'
+    if cls_n == 4:
+        return 'stage4'
+    if cls_n == 3:
+        return 'action3_balanced'
+    return normalize_task_name(default_name)
 
 
 def export_run_level_summary(out_dir, class_names=None):
@@ -696,6 +851,9 @@ def main():
                         help='输出目录')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--class_names', type=str, default=None,
+                        help='Comma-separated class names, e.g. '
+                             'Approach,Turn,Recover')
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -718,33 +876,44 @@ def main():
     neuron_type = cfg.get('neuron_type', 'APLIF')
     residual_mode = cfg.get('residual_mode', 'ADD')
     epoch = ckpt.get('epoch', '?') if isinstance(ckpt, dict) else '?'
-    task_name = cfg.get('task_name', '')
+    task_name_raw = cfg.get('task_name', '')
+    if task_name_raw is None:
+        task_name_raw = ''
+    elif not isinstance(task_name_raw, str):
+        task_name_raw = str(task_name_raw)
+    task_name_raw = task_name_raw.strip()
+    task_name_normalized = normalize_task_name(task_name_raw)
     task_num_classes = cfg.get('task_num_classes', cfg.get('num_classes', None))
 
     # corridor_task 已知任务 -> 类名映射表
-    _TASK_CLASS_NAMES = {
-        'action3_balanced': ['Left', 'Straight', 'Right'],
-        'junction_lr':      ['Left', 'Right'],
-        'stage3':           ['Approach', 'Turn', 'Recover'],
-        'stage4':           ['Follow', 'Approach', 'Turn', 'Recover'],
-    }
-
     if is_corridor_task:
         # corridor_task: 从 config 读取 task_name / task_num_classes
-        task_name = cfg.get('task_name', '')
-        if not task_name:
-            task_name = _infer_task_name_from_path(
-                args.data_root, default_name='action3_balanced')
-        num_actions = cfg.get('task_num_classes', cfg.get('num_classes', 3))
+        num_actions = _safe_int(
+            cfg.get('task_num_classes', cfg.get('num_classes', None)), None)
+        if num_actions is None or num_actions <= 0:
+            num_actions = _safe_int(task_num_classes, None)
+        if num_actions is None or num_actions <= 0:
+            num_actions = 3
         task_num_classes = num_actions
+        if not task_name_raw:
+            task_name_raw = _infer_missing_task_name(
+                args.data_root, num_actions, default_name='')
         mode = 'discrete'  # corridor_task 都是离散分类
         control_dim = 1
         action_set = str(num_actions)  # 兼容字段
-        exp_name = f"{task_name}_{neuron_type}_{residual_mode}_T{T}"
+        task_name_normalized = normalize_task_name(task_name_raw)
+        exp_task_name = task_name_raw if task_name_raw else (
+            task_name_normalized if task_name_normalized else 'unknown_task')
+        exp_name = f"{exp_task_name}_{neuron_type}_{residual_mode}_T{T}"
         # 优先按 task_name 查表，未知任务则自动生成
-        class_names = _TASK_CLASS_NAMES.get(
-            task_name,
-            [f'class_{i}' for i in range(num_actions)])
+        class_names = resolve_class_names(
+            task_name=task_name_raw,
+            num_actions=num_actions,
+            cfg=cfg,
+            data_root=args.data_root,
+            cli_class_names=args.class_names)
+        class_names = _ensure_class_names_for_count(
+            class_names, num_actions, warn_prefix='corridor_task class_names')
     else:
         mode = cfg.get('mode', 'discrete')
         action_set = str(cfg.get('action_set', '3'))
@@ -755,14 +924,18 @@ def main():
         names_3 = ['Left', 'Straight', 'Right']
         names_5 = ['Forward', 'Backward', 'Left', 'Right', 'Stop']
         class_names = names_3 if action_set == '3' else names_5
+        class_names = _ensure_class_names_for_count(
+            class_names, num_actions, warn_prefix='default class_names')
 
     is_discrete = (mode == 'discrete')
 
     print(f'  Config: {exp_name}, dataset={dataset_type}, mode={mode}, '
           f'encoding={encoding}, epoch={epoch}')
     if is_corridor_task:
+        task_name_normalized = normalize_task_name(task_name_raw)
         print(f'  dataset_type : {dataset_type}')
-        print(f'  task_name    : {task_name}')
+        print(f'  task_name_raw        : {task_name_raw}')
+        print(f'  task_name_normalized : {task_name_normalized}')
         print(f'  num_actions  : {num_actions}')
         print(f'  class_names  : {class_names}')
 
@@ -875,10 +1048,12 @@ def main():
 
     # 4a. 混淆矩阵
     if is_discrete:
+        class_names = _ensure_class_names_for_count(
+            class_names, num_actions, warn_prefix='confusion_matrix class_names')
         cm = np.zeros((num_actions, num_actions), dtype=int)
         for p, l in zip(all_preds, all_labels):
             cm[l][p] += 1
-        plot_confusion_matrix(cm, class_names[:num_actions], args.out_dir,
+        plot_confusion_matrix(cm, class_names, args.out_dir,
                               accuracy)
 
         # Per-class metrics
@@ -988,31 +1163,29 @@ def main():
     if dataset_meta not in ('corridor_task', 'corridor'):
         dataset_meta = 'corridor_task' if is_corridor_task else 'corridor'
 
-    task_name_meta = cfg.get('task_name', task_name)
-    if is_corridor_task and not task_name_meta:
-        task_name_meta = _infer_task_name_from_path(
-            args.data_root, default_name='action3_balanced')
+    task_name_raw_meta = cfg.get('task_name', None)
+    if task_name_raw_meta is None:
+        task_name_raw_meta = ''
+    elif not isinstance(task_name_raw_meta, str):
+        task_name_raw_meta = str(task_name_raw_meta)
+    task_name_raw_meta = task_name_raw_meta.strip()
+    # Only infer when task_name is missing.
+    if is_corridor_task and not task_name_raw_meta:
+        infer_num_actions = _safe_int(
+            cfg.get('task_num_classes', cfg.get('num_classes', num_actions)),
+            num_actions)
+        task_name_raw_meta = _infer_missing_task_name(
+            args.data_root, infer_num_actions, default_name='')
 
     task_num_classes_meta = cfg.get('task_num_classes', task_num_classes)
     if task_num_classes_meta is None:
         task_num_classes_meta = cfg.get('num_classes', num_actions)
-    # corridor_task 任务名兜底到固定集合，便于后续汇总脚本稳定识别
-    if is_corridor_task:
-        known_tasks = set(_TASK_CLASS_NAMES.keys())
-        if task_name_meta not in known_tasks:
-            inferred = _infer_task_name_from_path(args.data_root, default_name='')
-            if inferred in known_tasks:
-                task_name_meta = inferred
-            else:
-                cls_n = _safe_int(task_num_classes_meta, num_actions)
-                if cls_n == 2:
-                    task_name_meta = 'junction_lr'
-                elif cls_n == 4:
-                    task_name_meta = 'stage4'
-                elif cls_n == 3 and 'stage3' in str(args.data_root).lower():
-                    task_name_meta = 'stage3'
-                else:
-                    task_name_meta = 'action3_balanced'
+    task_name_normalized_meta = normalize_task_name(task_name_raw_meta)
+    if is_corridor_task and not task_name_normalized_meta:
+        infer_num_actions = _safe_int(task_num_classes_meta, num_actions)
+        task_name_normalized_meta = normalize_task_name(
+            _infer_missing_task_name(
+                args.data_root, infer_num_actions, default_name=''))
 
     seq_len_meta = cfg.get('seq_len', None)
     stride_meta = cfg.get('stride', None)
@@ -1022,7 +1195,10 @@ def main():
         'exp_name': exp_name,
         'epoch': epoch,
         'dataset': dataset_meta,
-        'task_name': task_name_meta,
+        'task_name': task_name_raw_meta,
+        'task_name_raw': task_name_raw_meta,
+        'task_name_normalized': task_name_normalized_meta,
+        'normalized_task_name': task_name_normalized_meta,
         'task_num_classes': _safe_int(task_num_classes_meta, task_num_classes_meta),
         'neuron_type': cfg.get('neuron_type', neuron_type),
         'residual_mode': cfg.get('residual_mode', residual_mode),
