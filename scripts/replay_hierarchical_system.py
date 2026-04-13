@@ -92,6 +92,43 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _percentile(values: List[float], q: float) -> float:
+    """计算百分位数（线性插值），空列表返回 0.0。"""
+    if not values:
+        return 0.0
+    arr = sorted(float(v) for v in values)
+    if len(arr) == 1:
+        return arr[0]
+    qq = max(0.0, min(100.0, float(q)))
+    rank = (qq / 100.0) * (len(arr) - 1)
+    low = int(rank)
+    high = min(low + 1, len(arr) - 1)
+    frac = rank - low
+    return arr[low] * (1.0 - frac) + arr[high] * frac
+
+
+def _summarize_timing_ms(values: List[float]) -> Dict[str, float]:
+    """汇总耗时序列，统一输出 avg/p50/p90/p95/max。"""
+    if not values:
+        return {
+            'avg': 0.0,
+            'p50': 0.0,
+            'p90': 0.0,
+            'p95': 0.0,
+            'max': 0.0,
+            'count': 0.0,
+        }
+    arr = [float(v) for v in values]
+    return {
+        'avg': sum(arr) / len(arr),
+        'p50': _percentile(arr, 50.0),
+        'p90': _percentile(arr, 90.0),
+        'p95': _percentile(arr, 95.0),
+        'max': max(arr),
+        'count': float(len(arr)),
+    }
+
+
 def _truncate_tail(text: Any, max_len: int = 28) -> str:
     """截断过长文本，优先保留尾部（便于看文件名后缀）。"""
     s = str(text)
@@ -665,11 +702,20 @@ def run_replay(args: argparse.Namespace) -> None:
     cfg = _load_yaml(config_path)
     cfg_dir = os.path.dirname(config_path)
 
+    # 基准模式与输出控制
+    benchmark_only = bool(getattr(args, 'benchmark_only', False))
+    benchmark_warmup = max(0, int(getattr(args, 'benchmark_warmup', 50)))
+    benchmark_steps = max(1, int(getattr(args, 'benchmark_steps', 500)))
+    no_save_outputs = bool(getattr(args, 'no_save_outputs', False))
+
     # logging 配置（真正生效）
     log_cfg = deepcopy(cfg.get('logging', {}) or {})
     save_debug_json = bool(log_cfg.get('save_debug_json', True))
     save_csv = bool(log_cfg.get('save_csv', True))
     verbose = bool(log_cfg.get('verbose', True))
+    # benchmark_only 时关闭长日志，减少非推理开销干扰
+    if benchmark_only:
+        verbose = False
 
     def vprint(msg: str) -> None:
         if verbose:
@@ -703,6 +749,8 @@ def run_replay(args: argparse.Namespace) -> None:
     after_sampling_total = len(frames)
     if args.max_steps is not None and args.max_steps > 0:
         frames = frames[:args.max_steps]
+    if benchmark_only:
+        frames = frames[:benchmark_steps]
 
     vprint('=' * 72)
     vprint('[Replay] 层级导航系统离线回放')
@@ -716,6 +764,9 @@ def run_replay(args: argparse.Namespace) -> None:
     vprint(f'  实际回放帧数: {len(frames)}')
     vprint(f'  valid_only: {valid_only}')
     vprint(f'  输出目录:   {out_dir}')
+    vprint(f'  no_save_outputs: {no_save_outputs}')
+    if benchmark_only:
+        vprint(f'  benchmark:  only=True, warmup={benchmark_warmup}, steps={benchmark_steps}')
     vprint(f'  logging:    save_debug_json={save_debug_json}, '
            f'save_csv={save_csv}, verbose={verbose}')
     vprint('=' * 72)
@@ -759,13 +810,22 @@ def run_replay(args: argparse.Namespace) -> None:
     has_label_name = 'label_name' in label_fields
     has_valid_field = 'valid' in label_fields
 
-    # 新增计时变量：用于实时进度与滚动平均耗时
+    # 新增计时变量：用于实时进度与 benchmark_only 分析
     replay_start_time = time.perf_counter()
     recent_step_times = deque(maxlen=30)
     total_frames = len(frames)
 
-    # 替换主循环：优先使用 tqdm，未安装时自动退化为普通循环
-    if tqdm is not None:
+    # benchmark_only 的逐帧耗时缓存（单位 ms）
+    benchmark_preprocess_ms: List[float] = []
+    benchmark_stage3_ms: List[float] = []
+    benchmark_junction_ms: List[float] = []
+    benchmark_straight_ms: List[float] = []
+    benchmark_state_machine_ms: List[float] = []
+    benchmark_total_step_ms: List[float] = []
+
+    # 仅非 benchmark 模式启用 tqdm，避免进度条额外开销影响纯性能测量
+    use_tqdm = (tqdm is not None) and (not benchmark_only)
+    if use_tqdm:
         progress = tqdm(
             enumerate(frames),
             total=total_frames,
@@ -777,7 +837,7 @@ def run_replay(args: argparse.Namespace) -> None:
         )
     else:
         progress = enumerate(frames)
-        if verbose:
+        if (not benchmark_only) and verbose and (tqdm is None):
             print('[Replay][Warn] 未安装 tqdm，已退化为普通循环（可执行: pip install tqdm）')
 
     for idx, fr in progress:
@@ -796,17 +856,43 @@ def run_replay(args: argparse.Namespace) -> None:
         gt_label_name = str(label_row.get('label_name', '')).strip() if has_label_name else ''
         valid_flag = str(label_row.get('valid', '')).strip() if has_valid_field else ''
 
+        # 分模块计时：读图+预处理、三模型推理、状态机更新
+        io_t0 = time.perf_counter()
         with Image.open(image_path) as img:
             img_rgb = img.convert('RGB')
-            stage_out = stage3_infer.predict(img_rgb)
-            junction_out = junction_infer.predict(img_rgb)
-            straight_out = straight_infer.predict(img_rgb)
+        preprocess_ms = (time.perf_counter() - io_t0) * 1000.0
 
+        stage3_t0 = time.perf_counter()
+        stage_out = stage3_infer.predict(img_rgb)
+        stage3_ms = (time.perf_counter() - stage3_t0) * 1000.0
+
+        junction_t0 = time.perf_counter()
+        junction_out = junction_infer.predict(img_rgb)
+        junction_ms = (time.perf_counter() - junction_t0) * 1000.0
+
+        straight_t0 = time.perf_counter()
+        straight_out = straight_infer.predict(img_rgb)
+        straight_ms = (time.perf_counter() - straight_t0) * 1000.0
+
+        sm_t0 = time.perf_counter()
         sm_out = sm.update({
             'stage3': stage_out,
             'junction_lr': junction_out,
             'straight_keep': straight_out,
         })
+        state_machine_ms = (time.perf_counter() - sm_t0) * 1000.0
+        step_ms = (time.perf_counter() - step_t0) * 1000.0
+
+        if benchmark_only:
+            # warmup 帧不计入 benchmark 统计
+            if idx >= benchmark_warmup:
+                benchmark_preprocess_ms.append(preprocess_ms)
+                benchmark_stage3_ms.append(stage3_ms)
+                benchmark_junction_ms.append(junction_ms)
+                benchmark_straight_ms.append(straight_ms)
+                benchmark_state_machine_ms.append(state_machine_ms)
+                benchmark_total_step_ms.append(step_ms)
+            continue
 
         debug = sm_out.get('debug', {}) if isinstance(sm_out.get('debug', {}), dict) else {}
         transition = debug.get('transition', None)
@@ -945,15 +1031,15 @@ def run_replay(args: argparse.Namespace) -> None:
         debug_row.update(deepcopy(debug))
         debug_rows.append(debug_row)
 
-        step_dt = time.perf_counter() - step_t0
+        step_dt = max(1e-12, step_ms / 1000.0)
         recent_step_times.append(step_dt)
-        if tqdm is not None:
+        if use_tqdm:
             avg_step_time = (
                 sum(recent_step_times) / len(recent_step_times)
                 if recent_step_times else step_dt
             )
             if avg_step_time <= 0:
-                avg_step_time = step_dt if step_dt > 0 else 1e-9
+                avg_step_time = step_dt
             progress.set_postfix(
                 {
                     'step': idx,
@@ -966,7 +1052,7 @@ def run_replay(args: argparse.Namespace) -> None:
                 refresh=False,
             )
 
-    if tqdm is not None:
+    if use_tqdm:
         progress.close()
         total_elapsed = time.perf_counter() - replay_start_time
         avg_fps = (float(total_frames) / total_elapsed) if total_elapsed > 0 else 0.0
@@ -974,6 +1060,48 @@ def run_replay(args: argparse.Namespace) -> None:
             f'[Replay] 回放循环耗时: {total_elapsed:.2f}s, '
             f'平均速度: {avg_fps:.2f} frame/s'
         )
+
+    # 4) replay_trace.csv（保持基础功能，默认保存）
+    if benchmark_only:
+        warmup_used = min(benchmark_warmup, total_frames)
+        measured_frames = len(benchmark_total_step_ms)
+        total_stats = _summarize_timing_ms(benchmark_total_step_ms)
+        stage3_stats = _summarize_timing_ms(benchmark_stage3_ms)
+        junction_stats = _summarize_timing_ms(benchmark_junction_ms)
+        straight_stats = _summarize_timing_ms(benchmark_straight_ms)
+        sm_stats = _summarize_timing_ms(benchmark_state_machine_ms)
+        io_stats = _summarize_timing_ms(benchmark_preprocess_ms)
+        achieved_hz = (1000.0 / total_stats['avg']) if total_stats['avg'] > 0 else 0.0
+
+        print('\n[Benchmark] 纯性能基准测试')
+        print(f'  total frames used: {total_frames}')
+        print(f'  warmup frames: {warmup_used}')
+        print(f'  measured frames: {measured_frames}')
+
+        if measured_frames <= 0:
+            print('  [Warn] 测量帧为 0，请减小 --benchmark_warmup 或增大 --benchmark_steps')
+            return
+
+        print('  overall:')
+        print(f'    avg_step_ms: {total_stats["avg"]:.4f}')
+        print(f'    p50_step_ms: {total_stats["p50"]:.4f}')
+        print(f'    p90_step_ms: {total_stats["p90"]:.4f}')
+        print(f'    p95_step_ms: {total_stats["p95"]:.4f}')
+        print(f'    max_step_ms: {total_stats["max"]:.4f}')
+        print(f'    achieved_hz: {achieved_hz:.2f}')
+
+        print('  breakdown by module:')
+        print(f'    stage3_ms:        avg={stage3_stats["avg"]:.4f}, p50={stage3_stats["p50"]:.4f}, '
+              f'p90={stage3_stats["p90"]:.4f}, p95={stage3_stats["p95"]:.4f}, max={stage3_stats["max"]:.4f}')
+        print(f'    junction_ms:      avg={junction_stats["avg"]:.4f}, p50={junction_stats["p50"]:.4f}, '
+              f'p90={junction_stats["p90"]:.4f}, p95={junction_stats["p95"]:.4f}, max={junction_stats["max"]:.4f}')
+        print(f'    straight_keep_ms: avg={straight_stats["avg"]:.4f}, p50={straight_stats["p50"]:.4f}, '
+              f'p90={straight_stats["p90"]:.4f}, p95={straight_stats["p95"]:.4f}, max={straight_stats["max"]:.4f}')
+        print(f'    state_machine_ms: avg={sm_stats["avg"]:.4f}, p50={sm_stats["p50"]:.4f}, '
+              f'p90={sm_stats["p90"]:.4f}, p95={sm_stats["p95"]:.4f}, max={sm_stats["max"]:.4f}')
+        print(f'    preprocess_ms:    avg={io_stats["avg"]:.4f}, p50={io_stats["p50"]:.4f}, '
+              f'p90={io_stats["p90"]:.4f}, p95={io_stats["p95"]:.4f}, max={io_stats["max"]:.4f}')
+        return
 
     # 4) replay_trace.csv（保持基础功能，默认保存）
     trace_csv = os.path.join(out_dir, 'replay_trace.csv')
@@ -1019,13 +1147,17 @@ def run_replay(args: argparse.Namespace) -> None:
         'run_name',
     ]
     # 出于兼容性，始终输出 replay_trace.csv；save_csv 用于显式记录与提示
-    if not save_csv:
-        vprint('  [i] logging.save_csv=False，但为兼容仍输出 replay_trace.csv')
-    with open(trace_csv, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=trace_fields)
-        writer.writeheader()
-        for r in trace_rows:
-            writer.writerow(r)
+    if no_save_outputs:
+        trace_csv = ''
+        vprint('  [i] no_save_outputs=True，跳过 replay_trace.csv 写出')
+    else:
+        if not save_csv:
+            vprint('  [i] logging.save_csv=False，但为兼容仍输出 replay_trace.csv')
+        with open(trace_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=trace_fields)
+            writer.writeheader()
+            for r in trace_rows:
+                writer.writerow(r)
 
     # 5) replay_summary.json（系统级统计增强）
     state_seq = [str(r.get('state', '')) for r in trace_rows]
@@ -1170,28 +1302,41 @@ def run_replay(args: argparse.Namespace) -> None:
         },
     }
     summary_json = os.path.join(out_dir, 'replay_summary.json')
-    with open(summary_json, 'w', encoding='utf-8') as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    if no_save_outputs:
+        summary_json = ''
+        vprint('  [i] no_save_outputs=True，跳过 replay_summary.json 写出')
+    else:
+        with open(summary_json, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
 
     # 6) replay_debug.json（可选）
-    debug_json = os.path.join(out_dir, 'replay_debug.json')
-    if save_debug_json:
+    debug_json = ''
+    if no_save_outputs:
+        if save_debug_json:
+            vprint('  [i] no_save_outputs=True，跳过 replay_debug.json 写出')
+    elif save_debug_json:
+        debug_json = os.path.join(out_dir, 'replay_debug.json')
         with open(debug_json, 'w', encoding='utf-8') as f:
             json.dump(debug_rows, f, ensure_ascii=False, indent=2)
-    else:
-        debug_json = ''
 
     # 7) 绘制时间轴
-    timeline_png = os.path.join(out_dir, 'state_timeline.png')
-    _plot_state_timeline(trace_rows, timeline_png)
+    timeline_png = ''
+    if no_save_outputs:
+        vprint('  [i] no_save_outputs=True，跳过 state_timeline.png 绘制')
+    else:
+        timeline_png = os.path.join(out_dir, 'state_timeline.png')
+        _plot_state_timeline(trace_rows, timeline_png)
 
     # 结束日志
     print('\n[Replay] 完成')
-    print(f'  - trace:    {trace_csv}')
-    print(f'  - summary:  {summary_json}')
-    print(f'  - timeline: {timeline_png}')
-    if save_debug_json:
-        print(f'  - debug:    {debug_json}')
+    if no_save_outputs:
+        print('  - outputs: skipped (--no_save_outputs)')
+    else:
+        print(f'  - trace:    {trace_csv}')
+        print(f'  - summary:  {summary_json}')
+        print(f'  - timeline: {timeline_png}')
+        if save_debug_json:
+            print(f'  - debug:    {debug_json}')
     if fallback_step_list:
         print(f'  - fallback 发生步: {fallback_step_list}')
     if junction_lock_first_step is not None:
@@ -1221,6 +1366,14 @@ def main() -> None:
     # 新增：valid 过滤开关
     parser.add_argument('--valid_only', action='store_true', default=False,
                         help='仅回放 labels.csv 中 valid=1/true 的帧（默认回放全部）')
+    parser.add_argument('--benchmark_only', action='store_true', default=False,
+                        help='仅执行纯性能基准测试（不写任何回放结果文件）')
+    parser.add_argument('--benchmark_warmup', type=int, default=50,
+                        help='benchmark 预热帧数（不计入统计）')
+    parser.add_argument('--benchmark_steps', type=int, default=500,
+                        help='benchmark 总处理帧数上限')
+    parser.add_argument('--no_save_outputs', action='store_true', default=False,
+                        help='禁止写 trace/debug/summary/timeline 文件')
     args = parser.parse_args()
     if args.max_steps <= 0:
         args.max_steps = None
@@ -1228,6 +1381,10 @@ def main() -> None:
         args.frame_stride = 1
     if args.sample_dt_ms <= 0:
         args.sample_dt_ms = 0.0
+    if args.benchmark_warmup < 0:
+        args.benchmark_warmup = 0
+    if args.benchmark_steps <= 0:
+        args.benchmark_steps = 1
 
     run_replay(args)
 
