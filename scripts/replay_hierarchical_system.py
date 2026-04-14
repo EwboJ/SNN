@@ -64,6 +64,7 @@ except ImportError:  # pragma: no cover
     tqdm = None
 
 
+
 # 允许脚本在仓库根目录直接运行
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_THIS_DIR)
@@ -74,6 +75,7 @@ from inference.corridor_module_infer import (  # noqa: E402
     JunctionLRInfer,
     Stage3Infer,
     StraightKeepInfer,
+    ApproachTriggerInfer,
 )
 from controllers.hierarchical_state_machine import (  # noqa: E402
     HierarchicalNavigatorStateMachine,
@@ -786,6 +788,19 @@ def run_replay(args: argparse.Namespace) -> None:
     sm.reset()
     threshold_snapshot = _snapshot_state_machine_thresholds(sm)
 
+    # 2b) 可选：加载 approach_trigger 轻量触发模型
+    approach_trigger_infer = None
+    _trigger_ckpt_raw = str(model_cfg.get('approach_trigger_ckpt', '') or '')
+    if _trigger_ckpt_raw:
+        _trigger_ckpt = _resolve_path(_trigger_ckpt_raw, base_dir=cfg_dir)
+        if os.path.isfile(_trigger_ckpt):
+            approach_trigger_infer = ApproachTriggerInfer(_trigger_ckpt, device=args.device)
+            vprint(f'  approach_trigger: 已加载 ({_trigger_ckpt})')
+        else:
+            vprint(f'  approach_trigger: checkpoint 不存在，跳过 ({_trigger_ckpt})')
+    else:
+        vprint('  approach_trigger: 未配置，使用旧逻辑')
+
     # 3) 逐帧回放
     trace_rows: List[Dict[str, Any]] = []
     debug_rows: List[Dict[str, Any]] = []
@@ -874,12 +889,25 @@ def run_replay(args: argparse.Namespace) -> None:
         straight_out = straight_infer.predict(img_rgb)
         straight_ms = (time.perf_counter() - straight_t0) * 1000.0
 
-        sm_t0 = time.perf_counter()
-        sm_out = sm.update({
+        # 可选：approach_trigger 推理
+        trigger_out = None
+        trigger_ms = 0.0
+        if approach_trigger_infer is not None:
+            trigger_t0 = time.perf_counter()
+            trigger_out = approach_trigger_infer.predict(img_rgb)
+            trigger_ms = (time.perf_counter() - trigger_t0) * 1000.0
+
+        # 组装状态机输入
+        sm_input: Dict[str, Any] = {
             'stage3': stage_out,
             'junction_lr': junction_out,
             'straight_keep': straight_out,
-        })
+        }
+        if trigger_out is not None:
+            sm_input['approach_trigger'] = trigger_out
+
+        sm_t0 = time.perf_counter()
+        sm_out = sm.update(sm_input)
         state_machine_ms = (time.perf_counter() - sm_t0) * 1000.0
         step_ms = (time.perf_counter() - step_t0) * 1000.0
 
@@ -998,6 +1026,14 @@ def run_replay(args: argparse.Namespace) -> None:
             'timestamp_ns': label_row.get('timestamp_ns', ''),
             'frame_idx': label_row.get('frame_idx', ''),
             'run_name': run_name,
+            # approach_trigger 可选列
+            'trigger_pred': (
+                str(trigger_out.get('pred_label', '')) if trigger_out else ''
+            ),
+            'trigger_confidence': (
+                _safe_float(trigger_out.get('confidence', 0.0), 0.0)
+                if trigger_out else ''
+            ),
         }
         trace_rows.append(row)
 
@@ -1029,6 +1065,9 @@ def run_replay(args: argparse.Namespace) -> None:
         }
         # 保留完整状态机 debug 字段，便于核查新逻辑是否实际生效
         debug_row.update(deepcopy(debug))
+        # 新增：approach_trigger 信息保留到 debug_json
+        if trigger_out is not None:
+            debug_row['approach_trigger'] = deepcopy(trigger_out)
         debug_rows.append(debug_row)
 
         step_dt = max(1e-12, step_ms / 1000.0)
@@ -1145,6 +1184,9 @@ def run_replay(args: argparse.Namespace) -> None:
         'timestamp_ns',
         'frame_idx',
         'run_name',
+        # approach_trigger 可选列
+        'trigger_pred',
+        'trigger_confidence',
     ]
     # 出于兼容性，始终输出 replay_trace.csv；save_csv 用于显式记录与提示
     if no_save_outputs:

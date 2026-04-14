@@ -1,11 +1,12 @@
 """
-统一的走廊导航三模块推理封装（离线/在线共享，不依赖 ROS2）
+统一的走廊导航模块推理封装（离线/在线共享，不依赖 ROS2）
 ===========================================================
 
-本文件提供三个可复用推理类：
-  1) JunctionLRInfer   : 路口左右二分类
-  2) Stage3Infer       : 三阶段分类（Approach/Turn/Recover）
-  3) StraightKeepInfer : 直行纠偏回归（输出 omega）
+本文件提供四个可复用推理类：
+  1) JunctionLRInfer      : 路口左右二分类
+  2) Stage3Infer          : 三阶段分类（Approach/Turn/Recover）
+  3) StraightKeepInfer    : 直行纠偏回归（输出 omega）
+  4) ApproachTriggerInfer : 接近路口触发二分类（Straight/NearTurnEvent）
 
 设计目标：
   - 统一 checkpoint 加载方式（优先读取 ckpt['config']）
@@ -31,6 +32,12 @@
   python inference/corridor_module_infer.py ^
       --module straight_keep ^
       --ckpt checkpoint/corridor/straight_keep_reg_APLIF_ADD_T4_seq4/best_model.ckpt ^
+      --image demo.jpg
+
+  # approach_trigger（二分类：Straight / NearTurnEvent）
+  python inference/corridor_module_infer.py ^
+      --module approach_trigger ^
+      --ckpt checkpoint/corridor_task/approach_trigger_sameenv_shortwin/best_model.ckpt ^
       --image demo.jpg
 """
 
@@ -441,6 +448,66 @@ class StraightKeepInfer(_BaseCorridorInfer):
     __call__ = predict
 
 
+class ApproachTriggerInfer(_BaseCorridorInfer):
+    """
+    接近路口触发二分类推理封装。
+
+    标签:
+      0 -> Straight      (直行段，尚未接近路口)
+      1 -> NearTurnEvent  (即将到达路口/事件区)
+
+    用途:
+      - 为 STRAIGHTKEEP -> APPROACH 提供轻量触发信号
+      - 不参与 TURN / RECOVER 判定
+
+    主线配置对齐:
+      - approach_trigger_sameenv_shortwin
+    """
+
+    LABELS: Sequence[str] = ('Straight', 'NearTurnEvent')
+
+    def __init__(self, ckpt_path: str, device: Optional[str] = None) -> None:
+        super().__init__(
+            ckpt_path,
+            device=device,
+            head_type='discrete',
+            default_num_actions=2,
+            default_control_dim=1,
+            default_encoding='rate',
+            default_T=4,
+            default_neuron_type='APLIF',
+            default_residual_mode='ADD',
+            default_img_h=48,
+            default_img_w=64,
+        )
+
+    @torch.no_grad()
+    def predict(self, image: ImageInput) -> Dict[str, Any]:
+        """单帧推理，返回结构化 dict。"""
+        logits = self._forward_single(image)
+        probs_t = torch.softmax(logits, dim=0)
+        pred_id = int(torch.argmax(probs_t).item())
+        labels = list(self.LABELS)
+        if self.num_actions != len(labels):
+            labels = [f'class_{i}' for i in range(self.num_actions)]
+
+        probs = {
+            labels[i]: float(probs_t[i].item())
+            for i in range(min(len(labels), probs_t.numel()))
+        }
+
+        pred_label = labels[pred_id] if pred_id < len(labels) else str(pred_id)
+        confidence = float(probs_t[pred_id].item())
+        return {
+            'pred_label': pred_label,
+            'pred_id': pred_id,
+            'probs': probs,
+            'confidence': confidence,
+        }
+
+    __call__ = predict
+
+
 def _build_infer(module_name: str, ckpt: str, device: Optional[str]) -> _BaseCorridorInfer:
     module_name = module_name.lower().strip()
     if module_name == 'junction_lr':
@@ -449,6 +516,8 @@ def _build_infer(module_name: str, ckpt: str, device: Optional[str]) -> _BaseCor
         return Stage3Infer(ckpt_path=ckpt, device=device)
     if module_name == 'straight_keep':
         return StraightKeepInfer(ckpt_path=ckpt, device=device)
+    if module_name == 'approach_trigger':
+        return ApproachTriggerInfer(ckpt_path=ckpt, device=device)
     raise ValueError(f'未知 module: {module_name}')
 
 
@@ -460,7 +529,7 @@ def main() -> None:
         '--module',
         type=str,
         required=True,
-        choices=['junction_lr', 'stage3', 'straight_keep'],
+        choices=['junction_lr', 'stage3', 'straight_keep', 'approach_trigger'],
         help='选择推理模块',
     )
     parser.add_argument('--ckpt', type=str, required=True, help='checkpoint 路径')

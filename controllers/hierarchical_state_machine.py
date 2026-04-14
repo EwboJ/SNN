@@ -222,6 +222,8 @@ class HierarchicalNavigatorStateMachine:
         self._approach_arm_count: int = 0
         # 新增：RECOVER 回正稳定计数
         self._recover_recenter_hold_count: int = 0
+        # 新增：approach_trigger 连续 NearTurnEvent 计数
+        self._trigger_arm_count: int = 0
         # 新增：仅供 STRAIGHTKEEP 事件触发使用的轻量 junction 提示历史
         self._straight_junction_hint_hist = deque(
             maxlen=max(2, self.approach_arm_junction_consistency_steps)
@@ -438,10 +440,19 @@ class HierarchicalNavigatorStateMachine:
         stage_out = deepcopy(module_outputs.get('stage3', {}) or {})
         junction_out = deepcopy(module_outputs.get('junction_lr', {}) or {})
         straight_out = deepcopy(module_outputs.get('straight_keep', {}) or {})
+        # 可选：approach_trigger 输入（旧 yaml 无此字段时为空 dict）
+        trigger_out = deepcopy(module_outputs.get('approach_trigger', {}) or {})
 
         stage_pred = self._parse_stage_pred(stage_out)
         junction_pred = self._parse_junction_pred(junction_out)
         omega_raw = self._safe_float(straight_out.get('omega_cmd_raw', 0.0), 0.0)
+
+        # approach_trigger 解析（兼容无 trigger 场景）
+        _trigger_available = bool(trigger_out and trigger_out.get('pred_label'))
+        _trigger_pred_label = str(trigger_out.get('pred_label', '')) if _trigger_available else ''
+        _trigger_confidence = self._safe_float(
+            trigger_out.get('confidence', 0.0), 0.0
+        ) if _trigger_available else 0.0
 
         # ===== 2) 更新时间步与历史窗口 =====
         self.global_step += 1
@@ -573,39 +584,83 @@ class HierarchicalNavigatorStateMachine:
             self.provisional_turn_dir = None
             self._recover_support_count = 0
             self._recover_recenter_hold_count = 0
-            # STRAIGHTKEEP -> APPROACH：事件触发门控（非单纯 Approach 票数）
-            _jhint_ok = (
-                (not self.approach_arm_use_junction_hint)
-                or (straight_junction_hint_consistent_dir in ('Left', 'Right'))
-            )
-            _approach_event_gate = (
-                self.state_step >= self.straightkeep_min_steps_before_approach
-                and approach_votes >= majority_thr
-                and turn_votes >= self.approach_arm_turn_votes
-                and _jhint_ok
-            )
-            if _approach_event_gate:
-                self._approach_arm_count += 1
-            else:
-                self._approach_arm_count = 0
 
-            if self._approach_arm_count >= self.approach_arm_consecutive_steps:
-                _jh = (
-                    straight_junction_hint_consistent_dir
-                    if straight_junction_hint_consistent_dir in ('Left', 'Right')
-                    else 'None'
+            # ===== 优先路径：approach_trigger 驱动 =====
+            # 仅在 trigger 可用时启用；否则完全使用旧逻辑
+            _trigger_transition_done = False
+            if _trigger_available:
+                # 更新 trigger 连续 NearTurnEvent 计数
+                if _trigger_pred_label == 'NearTurnEvent':
+                    self._trigger_arm_count += 1
+                else:
+                    self._trigger_arm_count = 0
+
+                # 触发条件：
+                #   1) NearTurnEvent 连续 >= 2 步
+                #   2) stage3 turn_votes >= 2 或 junction hint 连续一致
+                _trigger_consecutive_ok = (self._trigger_arm_count >= 2)
+                _trigger_stage3_support = (turn_votes >= 2)
+                _trigger_junction_support = (
+                    straight_junction_hint_consistent_dir in ('Left', 'Right')
                 )
-                transition_info = self._transition(
-                    NavState.APPROACH,
-                    f'approach_event_triggered('
-                    f'approach={approach_votes}, '
-                    f'turn={turn_votes}, '
-                    f'arm_count={self._approach_arm_count}, '
-                    f'junction_hint={_jh})'
+                _trigger_evidence_ok = (
+                    _trigger_stage3_support or _trigger_junction_support
                 )
-                # 新一次接近路口，重新累计 junction 投票
-                self._junction_hist.clear()
-                self._approach_arm_count = 0
+
+                if _trigger_consecutive_ok and _trigger_evidence_ok:
+                    _jh = (
+                        straight_junction_hint_consistent_dir
+                        if straight_junction_hint_consistent_dir in ('Left', 'Right')
+                        else 'None'
+                    )
+                    transition_info = self._transition(
+                        NavState.APPROACH,
+                        f'approach_trigger_fired('
+                        f'trigger_arm={self._trigger_arm_count}, '
+                        f'turn_votes={turn_votes}, '
+                        f'junction_hint={_jh}, '
+                        f'trigger_conf={_trigger_confidence:.3f})'
+                    )
+                    self._junction_hist.clear()
+                    self._approach_arm_count = 0
+                    self._trigger_arm_count = 0
+                    _trigger_transition_done = True
+
+            # ===== 旧路径：事件触发门控（trigger 不可用或未触发时） =====
+            if not _trigger_transition_done:
+                # STRAIGHTKEEP -> APPROACH：事件触发门控（非单纯 Approach 票数）
+                _jhint_ok = (
+                    (not self.approach_arm_use_junction_hint)
+                    or (straight_junction_hint_consistent_dir in ('Left', 'Right'))
+                )
+                _approach_event_gate = (
+                    self.state_step >= self.straightkeep_min_steps_before_approach
+                    and approach_votes >= majority_thr
+                    and turn_votes >= self.approach_arm_turn_votes
+                    and _jhint_ok
+                )
+                if _approach_event_gate:
+                    self._approach_arm_count += 1
+                else:
+                    self._approach_arm_count = 0
+
+                if self._approach_arm_count >= self.approach_arm_consecutive_steps:
+                    _jh = (
+                        straight_junction_hint_consistent_dir
+                        if straight_junction_hint_consistent_dir in ('Left', 'Right')
+                        else 'None'
+                    )
+                    transition_info = self._transition(
+                        NavState.APPROACH,
+                        f'approach_event_triggered('
+                        f'approach={approach_votes}, '
+                        f'turn={turn_votes}, '
+                        f'arm_count={self._approach_arm_count}, '
+                        f'junction_hint={_jh})'
+                    )
+                    # 新一次接近路口，重新累计 junction 投票
+                    self._junction_hist.clear()
+                    self._approach_arm_count = 0
 
         elif self.state == NavState.APPROACH:
             self._approach_arm_count = 0
@@ -1165,6 +1220,10 @@ class HierarchicalNavigatorStateMachine:
             'straight_junction_hint_hist': list(self._straight_junction_hint_hist),
             'straight_recover_hold_count': int(self._straight_recover_hold_count),
             'recover_recenter_hold_count': int(self._recover_recenter_hold_count),
+            # approach_trigger 诊断字段
+            'trigger_pred': str(_trigger_pred_label),
+            'trigger_confidence': float(_trigger_confidence),
+            'trigger_arm_count': int(self._trigger_arm_count),
             'junction_lock_allowed': bool(junction_lock_allowed),
             'junction_lock_block_reason': str(junction_lock_block_reason),
             'junction_hist_update_allowed': bool(junction_hist_update_allowed),
