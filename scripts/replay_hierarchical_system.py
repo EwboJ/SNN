@@ -4,7 +4,7 @@
 
 功能：
 1. 读取层级导航配置（configs/hierarchical_nav.yaml）
-2. 逐帧调用三模块推理（stage3 / junction_lr / straight_keep）
+2. 按调度策略调用四模块推理（stage3 / junction_lr / straight_keep / approach_trigger）
 3. 调用层级状态机 update() 得到系统级控制输出
 4. 输出回放轨迹、汇总统计和时间轴图
 
@@ -469,6 +469,156 @@ def _get_turn_exit_reason_primary(trace_rows: List[Dict[str, Any]]) -> str:
     return 'none'
 
 
+def _parse_bool_arg(val: Any) -> bool:
+    """解析布尔命令行参数，支持 true/false/1/0/yes/no。"""
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ('1', 'true', 't', 'yes', 'y', 'on'):
+        return True
+    if s in ('0', 'false', 'f', 'no', 'n', 'off'):
+        return False
+    raise argparse.ArgumentTypeError(f'无法解析布尔值: {val}')
+
+
+def _safe_stride(v: Any, default: int = 1) -> int:
+    try:
+        vv = int(v)
+    except Exception:
+        vv = int(default)
+    return max(1, vv)
+
+
+def _should_run_by_stride(step_idx: int, stride: int) -> bool:
+    s = max(1, int(stride))
+    return (int(step_idx) % s) == 0
+
+
+def _default_module_outputs() -> Dict[str, Dict[str, Any]]:
+    """四个子模块的安全默认输出。"""
+    return {
+        'stage3': {
+            'pred_stage': '',
+            'pred_id': -1,
+            'probs': {},
+            'confidence': 0.0,
+        },
+        'junction_lr': {
+            'pred_label': '',
+            'pred_id': -1,
+            'probs': {},
+            'confidence': 0.0,
+        },
+        'straight_keep': {
+            'omega_cmd_raw': 0.0,
+            'omega_abs': 0.0,
+        },
+        'approach_trigger': {
+            'pred_label': '',
+            'pred_id': -1,
+            'probs': {},
+            'confidence': 0.0,
+        },
+    }
+
+
+def _resolve_module_output_from_cache(
+    module_name: str,
+    module_cache: Dict[str, Dict[str, Any]],
+    module_defaults: Dict[str, Dict[str, Any]],
+    reuse_last_outputs: bool,
+) -> Dict[str, Any]:
+    """
+    当某模块本步未运行时：
+    - reuse_last_outputs=True 且缓存存在：返回 last_output
+    - 否则：返回安全默认输出
+    """
+    cache = module_cache.get(module_name, {}) or {}
+    last_output = cache.get('last_output', None)
+    if reuse_last_outputs and isinstance(last_output, dict):
+        return deepcopy(last_output)
+    return deepcopy(module_defaults[module_name])
+
+
+def _build_module_run_plan(
+    scheduler_policy: str,
+    state_name: str,
+    step_idx: int,
+    locked_turn_dir: Optional[str],
+    stage3_probe_stride: int,
+    junction_probe_stride: int,
+    straight_keep_stride: int,
+    trigger_stride: int,
+    has_trigger_model: bool,
+) -> Dict[str, bool]:
+    """
+    生成本步模块调度计划（True=运行模型，False=复用缓存/默认值）。
+
+    policy:
+      - all_models: 与历史逻辑一致，按步全量运行（trigger 仅在模型存在时运行）
+      - state_conditioned_v2: 按状态多速率调度
+    """
+    policy = str(scheduler_policy or 'all_models').strip().lower()
+    state = str(state_name or '').strip().upper()
+    has_lock = bool(str(locked_turn_dir or '').strip())
+
+    if policy == 'all_models':
+        return {
+            'stage3': True,
+            'junction_lr': True,
+            'straight_keep': True,
+            'approach_trigger': bool(has_trigger_model),
+        }
+
+    # state_conditioned_v2
+    plan = {
+        'stage3': False,
+        'junction_lr': False,
+        'straight_keep': False,
+        'approach_trigger': False,
+    }
+
+    if state in ('BOOT', 'STRAIGHTKEEP'):
+        plan['straight_keep'] = _should_run_by_stride(step_idx, straight_keep_stride)
+        plan['approach_trigger'] = bool(has_trigger_model) and _should_run_by_stride(step_idx, trigger_stride)
+        plan['stage3'] = _should_run_by_stride(step_idx, stage3_probe_stride)
+        plan['junction_lr'] = False
+    elif state == 'APPROACH':
+        plan['stage3'] = True
+        plan['junction_lr'] = _should_run_by_stride(step_idx, junction_probe_stride)
+        plan['straight_keep'] = _should_run_by_stride(step_idx, straight_keep_stride)
+        plan['approach_trigger'] = False
+    elif state == 'PROVISIONAL_TURN':
+        plan['stage3'] = True
+        plan['junction_lr'] = _should_run_by_stride(step_idx, junction_probe_stride)
+        plan['straight_keep'] = False
+        plan['approach_trigger'] = False
+    elif state == 'TURN':
+        plan['stage3'] = _should_run_by_stride(step_idx, 2)
+        # TURN 内在方向已锁存后停止 junction 推理
+        plan['junction_lr'] = (not has_lock) and _should_run_by_stride(step_idx, junction_probe_stride)
+        plan['straight_keep'] = False
+        plan['approach_trigger'] = False
+    elif state == 'RECOVER':
+        plan['stage3'] = _should_run_by_stride(step_idx, 2)
+        plan['junction_lr'] = False
+        plan['straight_keep'] = _should_run_by_stride(step_idx, straight_keep_stride)
+        plan['approach_trigger'] = False
+    else:
+        # 未知状态退化到保守探测策略
+        plan['stage3'] = _should_run_by_stride(step_idx, stage3_probe_stride)
+        plan['junction_lr'] = False
+        plan['straight_keep'] = _should_run_by_stride(step_idx, straight_keep_stride)
+        plan['approach_trigger'] = bool(has_trigger_model) and _should_run_by_stride(step_idx, trigger_stride)
+    return plan
+
+
+def _effective_hz(call_count: int, elapsed_sec: float) -> float:
+    if elapsed_sec <= 1e-12:
+        return 0.0
+    return float(call_count) / float(elapsed_sec)
+
+
 def _build_state_machine(cfg: Dict[str, Any]) -> HierarchicalNavigatorStateMachine:
     """根据 yaml 参数构建状态机（与配置字段完整对齐）。"""
     sm_cfg = deepcopy(cfg.get('state_machine', {}) or {})
@@ -709,6 +859,17 @@ def run_replay(args: argparse.Namespace) -> None:
     benchmark_warmup = max(0, int(getattr(args, 'benchmark_warmup', 50)))
     benchmark_steps = max(1, int(getattr(args, 'benchmark_steps', 500)))
     no_save_outputs = bool(getattr(args, 'no_save_outputs', False))
+    scheduler_policy = str(getattr(args, 'scheduler_policy', 'all_models') or 'all_models').strip()
+    if scheduler_policy not in ('all_models', 'state_conditioned_v2'):
+        raise ValueError(
+            f'不支持的 --scheduler_policy={scheduler_policy}，'
+            '可选: all_models / state_conditioned_v2'
+        )
+    stage3_probe_stride = _safe_stride(getattr(args, 'stage3_probe_stride', 3), default=3)
+    junction_probe_stride = _safe_stride(getattr(args, 'junction_probe_stride', 1), default=1)
+    straight_keep_stride = _safe_stride(getattr(args, 'straight_keep_stride', 1), default=1)
+    trigger_stride = _safe_stride(getattr(args, 'trigger_stride', 1), default=1)
+    reuse_last_outputs = bool(getattr(args, 'reuse_last_outputs', True))
 
     # logging 配置（真正生效）
     log_cfg = deepcopy(cfg.get('logging', {}) or {})
@@ -765,6 +926,13 @@ def run_replay(args: argparse.Namespace) -> None:
     vprint(f'  frame_stride: {frame_stride}  (sampling_mode={sampling_mode})')
     vprint(f'  实际回放帧数: {len(frames)}')
     vprint(f'  valid_only: {valid_only}')
+    vprint(f'  scheduler_policy: {scheduler_policy}')
+    vprint(
+        f'  scheduler_stride: stage3_probe={stage3_probe_stride}, '
+        f'junction_probe={junction_probe_stride}, '
+        f'straight_keep={straight_keep_stride}, trigger={trigger_stride}'
+    )
+    vprint(f'  reuse_last_outputs: {reuse_last_outputs}')
     vprint(f'  输出目录:   {out_dir}')
     vprint(f'  no_save_outputs: {no_save_outputs}')
     if benchmark_only:
@@ -773,7 +941,7 @@ def run_replay(args: argparse.Namespace) -> None:
            f'save_csv={save_csv}, verbose={verbose}')
     vprint('=' * 72)
 
-    # 1) 三模块推理封装
+    # 1) 子模块推理封装（stage3 / junction_lr / straight_keep / approach_trigger）
     model_cfg = cfg.get('models', {}) or {}
     stage3_ckpt = _resolve_path(str(model_cfg.get('stage3_ckpt', '')), base_dir=cfg_dir)
     junction_ckpt = _resolve_path(str(model_cfg.get('junction_lr_ckpt', '')), base_dir=cfg_dir)
@@ -800,6 +968,18 @@ def run_replay(args: argparse.Namespace) -> None:
             vprint(f'  approach_trigger: checkpoint 不存在，跳过 ({_trigger_ckpt})')
     else:
         vprint('  approach_trigger: 未配置，使用旧逻辑')
+
+    module_names = ('stage3', 'junction_lr', 'straight_keep', 'approach_trigger')
+    module_defaults = _default_module_outputs()
+    # 四模块缓存：last_output + last_step
+    module_cache: Dict[str, Dict[str, Any]] = {
+        name: {
+            'last_output': None,
+            'last_step': None,
+        }
+        for name in module_names
+    }
+    module_call_count: Dict[str, int] = {name: 0 for name in module_names}
 
     # 3) 逐帧回放
     trace_rows: List[Dict[str, Any]] = []
@@ -835,8 +1015,10 @@ def run_replay(args: argparse.Namespace) -> None:
     benchmark_stage3_ms: List[float] = []
     benchmark_junction_ms: List[float] = []
     benchmark_straight_ms: List[float] = []
+    benchmark_trigger_ms: List[float] = []
     benchmark_state_machine_ms: List[float] = []
     benchmark_total_step_ms: List[float] = []
+    benchmark_call_count: Dict[str, int] = {name: 0 for name in module_names}
 
     # 仅非 benchmark 模式启用 tqdm，避免进度条额外开销影响纯性能测量
     use_tqdm = (tqdm is not None) and (not benchmark_only)
@@ -871,40 +1053,95 @@ def run_replay(args: argparse.Namespace) -> None:
         gt_label_name = str(label_row.get('label_name', '')).strip() if has_label_name else ''
         valid_flag = str(label_row.get('valid', '')).strip() if has_valid_field else ''
 
-        # 分模块计时：读图+预处理、三模型推理、状态机更新
+        # 分模块计时：读图+预处理、按策略调度模型推理、状态机更新
         io_t0 = time.perf_counter()
         with Image.open(image_path) as img:
             img_rgb = img.convert('RGB')
         preprocess_ms = (time.perf_counter() - io_t0) * 1000.0
 
-        stage3_t0 = time.perf_counter()
-        stage_out = stage3_infer.predict(img_rgb)
-        stage3_ms = (time.perf_counter() - stage3_t0) * 1000.0
+        _state_obj = getattr(sm, 'state', '')
+        state_before = str(getattr(_state_obj, 'name', _state_obj) or '')
+        locked_turn_before = getattr(sm, 'locked_turn_dir', None)
+        run_plan = _build_module_run_plan(
+            scheduler_policy=scheduler_policy,
+            state_name=state_before,
+            step_idx=idx,
+            locked_turn_dir=locked_turn_before,
+            stage3_probe_stride=stage3_probe_stride,
+            junction_probe_stride=junction_probe_stride,
+            straight_keep_stride=straight_keep_stride,
+            trigger_stride=trigger_stride,
+            has_trigger_model=(approach_trigger_infer is not None),
+        )
+        ran_stage3 = bool(run_plan['stage3'])
+        ran_junction = bool(run_plan['junction_lr'])
+        ran_straight_keep = bool(run_plan['straight_keep'])
+        ran_trigger = bool(run_plan['approach_trigger'])
 
-        junction_t0 = time.perf_counter()
-        junction_out = junction_infer.predict(img_rgb)
-        junction_ms = (time.perf_counter() - junction_t0) * 1000.0
-
-        straight_t0 = time.perf_counter()
-        straight_out = straight_infer.predict(img_rgb)
-        straight_ms = (time.perf_counter() - straight_t0) * 1000.0
-
-        # 可选：approach_trigger 推理
-        trigger_out = None
+        stage_out: Dict[str, Any]
+        junction_out: Dict[str, Any]
+        straight_out: Dict[str, Any]
+        trigger_out: Dict[str, Any]
+        stage3_ms = 0.0
+        junction_ms = 0.0
+        straight_ms = 0.0
         trigger_ms = 0.0
-        if approach_trigger_infer is not None:
-            trigger_t0 = time.perf_counter()
-            trigger_out = approach_trigger_infer.predict(img_rgb)
-            trigger_ms = (time.perf_counter() - trigger_t0) * 1000.0
 
-        # 组装状态机输入
+        if ran_stage3:
+            t0 = time.perf_counter()
+            stage_out = stage3_infer.predict(img_rgb)
+            stage3_ms = (time.perf_counter() - t0) * 1000.0
+            module_cache['stage3']['last_output'] = deepcopy(stage_out)
+            module_cache['stage3']['last_step'] = idx
+            module_call_count['stage3'] += 1
+        else:
+            stage_out = _resolve_module_output_from_cache(
+                'stage3', module_cache, module_defaults, reuse_last_outputs
+            )
+
+        if ran_junction:
+            t0 = time.perf_counter()
+            junction_out = junction_infer.predict(img_rgb)
+            junction_ms = (time.perf_counter() - t0) * 1000.0
+            module_cache['junction_lr']['last_output'] = deepcopy(junction_out)
+            module_cache['junction_lr']['last_step'] = idx
+            module_call_count['junction_lr'] += 1
+        else:
+            junction_out = _resolve_module_output_from_cache(
+                'junction_lr', module_cache, module_defaults, reuse_last_outputs
+            )
+
+        if ran_straight_keep:
+            t0 = time.perf_counter()
+            straight_out = straight_infer.predict(img_rgb)
+            straight_ms = (time.perf_counter() - t0) * 1000.0
+            module_cache['straight_keep']['last_output'] = deepcopy(straight_out)
+            module_cache['straight_keep']['last_step'] = idx
+            module_call_count['straight_keep'] += 1
+        else:
+            straight_out = _resolve_module_output_from_cache(
+                'straight_keep', module_cache, module_defaults, reuse_last_outputs
+            )
+
+        if ran_trigger and approach_trigger_infer is not None:
+            t0 = time.perf_counter()
+            trigger_out = approach_trigger_infer.predict(img_rgb)
+            trigger_ms = (time.perf_counter() - t0) * 1000.0
+            module_cache['approach_trigger']['last_output'] = deepcopy(trigger_out)
+            module_cache['approach_trigger']['last_step'] = idx
+            module_call_count['approach_trigger'] += 1
+        else:
+            trigger_out = _resolve_module_output_from_cache(
+                'approach_trigger', module_cache, module_defaults, reuse_last_outputs
+            )
+
+        # 组装状态机输入（未运行模块使用缓存或安全默认值）
         sm_input: Dict[str, Any] = {
             'stage3': stage_out,
             'junction_lr': junction_out,
             'straight_keep': straight_out,
+            'approach_trigger': trigger_out,
         }
-        if trigger_out is not None:
-            sm_input['approach_trigger'] = trigger_out
 
         sm_t0 = time.perf_counter()
         sm_out = sm.update(sm_input)
@@ -915,9 +1152,18 @@ def run_replay(args: argparse.Namespace) -> None:
             # warmup 帧不计入 benchmark 统计
             if idx >= benchmark_warmup:
                 benchmark_preprocess_ms.append(preprocess_ms)
-                benchmark_stage3_ms.append(stage3_ms)
-                benchmark_junction_ms.append(junction_ms)
-                benchmark_straight_ms.append(straight_ms)
+                if ran_stage3:
+                    benchmark_stage3_ms.append(stage3_ms)
+                    benchmark_call_count['stage3'] += 1
+                if ran_junction:
+                    benchmark_junction_ms.append(junction_ms)
+                    benchmark_call_count['junction_lr'] += 1
+                if ran_straight_keep:
+                    benchmark_straight_ms.append(straight_ms)
+                    benchmark_call_count['straight_keep'] += 1
+                if ran_trigger:
+                    benchmark_trigger_ms.append(trigger_ms)
+                    benchmark_call_count['approach_trigger'] += 1
                 benchmark_state_machine_ms.append(state_machine_ms)
                 benchmark_total_step_ms.append(step_ms)
             continue
@@ -981,6 +1227,8 @@ def run_replay(args: argparse.Namespace) -> None:
             if in_approach_flow and junction_lock_allowed:
                 first_junction_lock_allowed_step = idx
 
+        trigger_pred_label = str(trigger_out.get('pred_label', '')).strip() if isinstance(trigger_out, dict) else ''
+        trigger_visible = bool(trigger_pred_label)
         row = {
             'step_idx': idx,
             'image_name': image_name,
@@ -990,6 +1238,10 @@ def run_replay(args: argparse.Namespace) -> None:
             'gt_turn_dir': gt_turn_dir,
             'locked_turn_dir': locked_dir_str,
             'state': state_now,
+            'ran_stage3': ran_stage3,
+            'ran_junction': ran_junction,
+            'ran_straight_keep': ran_straight_keep,
+            'ran_trigger': ran_trigger,
             'transition_from': transition_from,
             'transition_to': transition_to,
             'transition_reason': transition_reason,
@@ -1028,11 +1280,11 @@ def run_replay(args: argparse.Namespace) -> None:
             'run_name': run_name,
             # approach_trigger 可选列
             'trigger_pred': (
-                str(trigger_out.get('pred_label', '')) if trigger_out else ''
+                trigger_pred_label if trigger_visible else ''
             ),
             'trigger_confidence': (
                 _safe_float(trigger_out.get('confidence', 0.0), 0.0)
-                if trigger_out else ''
+                if trigger_visible else ''
             ),
         }
         trace_rows.append(row)
@@ -1066,8 +1318,26 @@ def run_replay(args: argparse.Namespace) -> None:
         # 保留完整状态机 debug 字段，便于核查新逻辑是否实际生效
         debug_row.update(deepcopy(debug))
         # 新增：approach_trigger 信息保留到 debug_json
-        if trigger_out is not None:
+        if trigger_visible:
             debug_row['approach_trigger'] = deepcopy(trigger_out)
+        debug_row['scheduler'] = {
+            'policy': scheduler_policy,
+            'state_before': state_before,
+            'locked_turn_dir_before': locked_turn_before,
+            'run_plan': {
+                'stage3': ran_stage3,
+                'junction_lr': ran_junction,
+                'straight_keep': ran_straight_keep,
+                'approach_trigger': ran_trigger,
+            },
+            'reuse_last_outputs': reuse_last_outputs,
+            'cache_step': {
+                'stage3': module_cache['stage3']['last_step'],
+                'junction_lr': module_cache['junction_lr']['last_step'],
+                'straight_keep': module_cache['straight_keep']['last_step'],
+                'approach_trigger': module_cache['approach_trigger']['last_step'],
+            },
+        }
         debug_rows.append(debug_row)
 
         step_dt = max(1e-12, step_ms / 1000.0)
@@ -1091,12 +1361,12 @@ def run_replay(args: argparse.Namespace) -> None:
                 refresh=False,
             )
 
+    replay_elapsed_sec = time.perf_counter() - replay_start_time
     if use_tqdm:
         progress.close()
-        total_elapsed = time.perf_counter() - replay_start_time
-        avg_fps = (float(total_frames) / total_elapsed) if total_elapsed > 0 else 0.0
+        avg_fps = (float(total_frames) / replay_elapsed_sec) if replay_elapsed_sec > 0 else 0.0
         vprint(
-            f'[Replay] 回放循环耗时: {total_elapsed:.2f}s, '
+            f'[Replay] 回放循环耗时: {replay_elapsed_sec:.2f}s, '
             f'平均速度: {avg_fps:.2f} frame/s'
         )
 
@@ -1108,11 +1378,15 @@ def run_replay(args: argparse.Namespace) -> None:
         stage3_stats = _summarize_timing_ms(benchmark_stage3_ms)
         junction_stats = _summarize_timing_ms(benchmark_junction_ms)
         straight_stats = _summarize_timing_ms(benchmark_straight_ms)
+        trigger_stats = _summarize_timing_ms(benchmark_trigger_ms)
         sm_stats = _summarize_timing_ms(benchmark_state_machine_ms)
         io_stats = _summarize_timing_ms(benchmark_preprocess_ms)
         achieved_hz = (1000.0 / total_stats['avg']) if total_stats['avg'] > 0 else 0.0
+        measured_elapsed_sec = max(1e-12, sum(benchmark_total_step_ms) / 1000.0)
 
         print('\n[Benchmark] 纯性能基准测试')
+        print(f'  scheduler_policy: {scheduler_policy}')
+        print(f'  reuse_last_outputs: {reuse_last_outputs}')
         print(f'  total frames used: {total_frames}')
         print(f'  warmup frames: {warmup_used}')
         print(f'  measured frames: {measured_frames}')
@@ -1129,6 +1403,29 @@ def run_replay(args: argparse.Namespace) -> None:
         print(f'    max_step_ms: {total_stats["max"]:.4f}')
         print(f'    achieved_hz: {achieved_hz:.2f}')
 
+        print('  module_call_count (all / measured):')
+        print(f'    stage3:         {module_call_count["stage3"]} / {benchmark_call_count["stage3"]}')
+        print(f'    junction_lr:    {module_call_count["junction_lr"]} / {benchmark_call_count["junction_lr"]}')
+        print(f'    straight_keep:  {module_call_count["straight_keep"]} / {benchmark_call_count["straight_keep"]}')
+        print(
+            f'    approach_trigger: '
+            f'{module_call_count["approach_trigger"]} / {benchmark_call_count["approach_trigger"]}'
+        )
+        print('  module_effective_hz (measured window):')
+        print(f'    stage3_hz:         {_effective_hz(benchmark_call_count["stage3"], measured_elapsed_sec):.2f}')
+        print(
+            f'    junction_hz:       '
+            f'{_effective_hz(benchmark_call_count["junction_lr"], measured_elapsed_sec):.2f}'
+        )
+        print(
+            f'    straight_keep_hz:  '
+            f'{_effective_hz(benchmark_call_count["straight_keep"], measured_elapsed_sec):.2f}'
+        )
+        print(
+            f'    trigger_hz:        '
+            f'{_effective_hz(benchmark_call_count["approach_trigger"], measured_elapsed_sec):.2f}'
+        )
+
         print('  breakdown by module:')
         print(f'    stage3_ms:        avg={stage3_stats["avg"]:.4f}, p50={stage3_stats["p50"]:.4f}, '
               f'p90={stage3_stats["p90"]:.4f}, p95={stage3_stats["p95"]:.4f}, max={stage3_stats["max"]:.4f}')
@@ -1136,6 +1433,8 @@ def run_replay(args: argparse.Namespace) -> None:
               f'p90={junction_stats["p90"]:.4f}, p95={junction_stats["p95"]:.4f}, max={junction_stats["max"]:.4f}')
         print(f'    straight_keep_ms: avg={straight_stats["avg"]:.4f}, p50={straight_stats["p50"]:.4f}, '
               f'p90={straight_stats["p90"]:.4f}, p95={straight_stats["p95"]:.4f}, max={straight_stats["max"]:.4f}')
+        print(f'    trigger_ms:       avg={trigger_stats["avg"]:.4f}, p50={trigger_stats["p50"]:.4f}, '
+              f'p90={trigger_stats["p90"]:.4f}, p95={trigger_stats["p95"]:.4f}, max={trigger_stats["max"]:.4f}')
         print(f'    state_machine_ms: avg={sm_stats["avg"]:.4f}, p50={sm_stats["p50"]:.4f}, '
               f'p90={sm_stats["p90"]:.4f}, p95={sm_stats["p95"]:.4f}, max={sm_stats["max"]:.4f}')
         print(f'    preprocess_ms:    avg={io_stats["avg"]:.4f}, p50={io_stats["p50"]:.4f}, '
@@ -1153,6 +1452,10 @@ def run_replay(args: argparse.Namespace) -> None:
         'gt_turn_dir',
         'locked_turn_dir',
         'state',
+        'ran_stage3',
+        'ran_junction',
+        'ran_straight_keep',
+        'ran_trigger',
         'transition_from',
         'transition_to',
         'transition_reason',
@@ -1280,6 +1583,14 @@ def run_replay(args: argparse.Namespace) -> None:
         and (int(num_recover_entries) >= 1)
         and bool(returned_to_straightkeep)
     )
+    stage3_call_count = int(module_call_count['stage3'])
+    junction_call_count = int(module_call_count['junction_lr'])
+    straight_keep_call_count = int(module_call_count['straight_keep'])
+    trigger_call_count = int(module_call_count['approach_trigger'])
+    stage3_effective_hz = _effective_hz(stage3_call_count, replay_elapsed_sec)
+    junction_effective_hz = _effective_hz(junction_call_count, replay_elapsed_sec)
+    straight_keep_effective_hz = _effective_hz(straight_keep_call_count, replay_elapsed_sec)
+    trigger_effective_hz = _effective_hz(trigger_call_count, replay_elapsed_sec)
 
     summary = {
         'total_steps': len(trace_rows),
@@ -1308,6 +1619,16 @@ def run_replay(args: argparse.Namespace) -> None:
         'unique_state_sequence': unique_state_sequence,
         'returned_to_straightkeep': bool(returned_to_straightkeep),
         'task_success': bool(task_success),
+        'scheduler_policy': scheduler_policy,
+        'reuse_last_outputs': bool(reuse_last_outputs),
+        'stage3_call_count': stage3_call_count,
+        'junction_call_count': junction_call_count,
+        'straight_keep_call_count': straight_keep_call_count,
+        'trigger_call_count': trigger_call_count,
+        'stage3_effective_hz': stage3_effective_hz,
+        'junction_effective_hz': junction_effective_hz,
+        'straight_keep_effective_hz': straight_keep_effective_hz,
+        'trigger_effective_hz': trigger_effective_hz,
         # ===== 新增：valid 过滤相关统计 =====
         'used_total_steps': len(trace_rows),
         'original_total_steps': original_total,
@@ -1383,6 +1704,14 @@ def run_replay(args: argparse.Namespace) -> None:
         print(f'  - fallback 发生步: {fallback_step_list}')
     if junction_lock_first_step is not None:
         print(f'  - junction 首次锁定步: {junction_lock_first_step}')
+    print(f'  - scheduler: {scheduler_policy} (reuse_last_outputs={reuse_last_outputs})')
+    print(
+        '  - call_count: '
+        f'stage3={module_call_count["stage3"]}, '
+        f'junction={module_call_count["junction_lr"]}, '
+        f'straight_keep={module_call_count["straight_keep"]}, '
+        f'trigger={module_call_count["approach_trigger"]}'
+    )
     print(f'  - Turn 票数峰值: {turn_signal_peak_votes}')
 
 
@@ -1405,6 +1734,20 @@ def main() -> None:
                         help='步长采样：每隔 N 帧保留 1 帧（默认 1 表示不采样）')
     parser.add_argument('--sample_dt_ms', type=float, default=0.0,
                         help='时间采样间隔(ms)，>0 且存在 timestamp_ns 时优先启用')
+    parser.add_argument('--scheduler_policy', type=str,
+                        default='all_models',
+                        choices=['all_models', 'state_conditioned_v2'],
+                        help='模型调度策略：all_models(全量逐步) / state_conditioned_v2(状态依赖多速率)')
+    parser.add_argument('--stage3_probe_stride', type=int, default=3,
+                        help='state_conditioned_v2 下 stage3 探测步长（STRAIGHTKEEP 使用）')
+    parser.add_argument('--junction_probe_stride', type=int, default=1,
+                        help='state_conditioned_v2 下 junction 探测步长（APPROACH/PROVISIONAL/TURN-未锁存）')
+    parser.add_argument('--straight_keep_stride', type=int, default=1,
+                        help='state_conditioned_v2 下 straight_keep 步长')
+    parser.add_argument('--trigger_stride', type=int, default=1,
+                        help='state_conditioned_v2 下 approach_trigger 步长（STRAIGHTKEEP 使用）')
+    parser.add_argument('--reuse_last_outputs', type=_parse_bool_arg, nargs='?', const=True, default=True,
+                        help='模块本步未运行时是否复用最近一次输出（true/false）')
     # 新增：valid 过滤开关
     parser.add_argument('--valid_only', action='store_true', default=False,
                         help='仅回放 labels.csv 中 valid=1/true 的帧（默认回放全部）')
@@ -1423,6 +1766,14 @@ def main() -> None:
         args.frame_stride = 1
     if args.sample_dt_ms <= 0:
         args.sample_dt_ms = 0.0
+    if args.stage3_probe_stride <= 0:
+        args.stage3_probe_stride = 1
+    if args.junction_probe_stride <= 0:
+        args.junction_probe_stride = 1
+    if args.straight_keep_stride <= 0:
+        args.straight_keep_stride = 1
+    if args.trigger_stride <= 0:
+        args.trigger_stride = 1
     if args.benchmark_warmup < 0:
         args.benchmark_warmup = 0
     if args.benchmark_steps <= 0:
