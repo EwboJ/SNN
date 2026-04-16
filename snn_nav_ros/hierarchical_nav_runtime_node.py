@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import rclpy
@@ -52,11 +53,14 @@ class HierarchicalNavRuntimeNode(Node):
         super().__init__("hierarchical_nav_runtime")
 
         # ===== 1) 读取配置路径参数并加载 YAML =====
+        self.repo_root: Optional[str] = self._detect_repo_root(config_path=None)
+        self.config_dir: Optional[str] = None
         self.declare_parameter("config_path", "configs/hierarchical_nav_robot_v1.yaml")
         cfg_path_raw = (
             self.get_parameter("config_path").get_parameter_value().string_value.strip()
         )
         self.config_path = self._resolve_config_path(cfg_path_raw)
+        self.config_dir = str(Path(self.config_path).resolve().parent)
         self.config = self._load_config(self.config_path)
 
         self.system_cfg = self._cfg_dict("system")
@@ -203,27 +207,96 @@ class HierarchicalNavRuntimeNode(Node):
         value = self.config.get(key, {})
         return value if isinstance(value, dict) else {}
 
+    @staticmethod
+    def _dedupe_paths(paths: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for p in paths:
+            key = os.path.normcase(os.path.normpath(p))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+        return out
+
+    @staticmethod
+    def _format_missing_path_message(raw_path: str, tried_candidates: List[str]) -> str:
+        lines = [
+            f"raw_path={raw_path}",
+            "tried_candidates:",
+        ]
+        if tried_candidates:
+            lines.extend(f"  - {p}" for p in tried_candidates)
+        else:
+            lines.append("  - <none>")
+        return "\n".join(lines)
+
+    def _detect_repo_root(self, config_path: Optional[str]) -> Optional[str]:
+        candidates: List[Path] = []
+
+        env_repo_root = os.path.expandvars(os.path.expanduser(os.environ.get("SNN_ROOT", "")))
+        if env_repo_root:
+            candidates.append(Path(env_repo_root))
+
+        if config_path:
+            cfg = Path(config_path).resolve()
+            if cfg.parent.name == "configs":
+                candidates.append(cfg.parent.parent)
+            candidates.append(cfg.parent)
+
+        this_file = Path(__file__).resolve()
+        candidates.extend(list(this_file.parents))
+
+        cwd = Path.cwd().resolve()
+        candidates.append(cwd)
+        candidates.extend(list(cwd.parents))
+
+        seen = set()
+        for p in candidates:
+            p_resolved = p.resolve()
+            key = str(p_resolved).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if self._looks_like_repo_root(p_resolved):
+                return str(p_resolved)
+        return None
+
+    def _resolve_path_with_candidates(
+        self, path_raw: str, base_dir: Optional[str] = None
+    ) -> Tuple[str, List[str]]:
+        raw = str(path_raw or "").strip()
+        if not raw:
+            return "", []
+
+        expanded = os.path.expandvars(os.path.expanduser(raw))
+        if os.path.isabs(expanded):
+            candidates = [os.path.abspath(expanded)]
+        else:
+            candidates = []
+            if self.repo_root:
+                candidates.append(os.path.abspath(os.path.join(self.repo_root, expanded)))
+            if base_dir:
+                candidates.append(os.path.abspath(os.path.join(base_dir, expanded)))
+            candidates.append(os.path.abspath(os.path.join(os.getcwd(), expanded)))
+            candidates = self._dedupe_paths(candidates)
+
+        for c in candidates:
+            if os.path.exists(c):
+                return c, candidates
+        return candidates[0], candidates
+
     def _resolve_config_path(self, cfg_path_raw: str) -> str:
         if not cfg_path_raw:
             cfg_path_raw = "configs/hierarchical_nav_robot_v1.yaml"
 
-        raw = Path(cfg_path_raw)
-        candidates = []
-        if raw.is_absolute():
-            candidates.append(raw)
-        else:
-            candidates.append(Path.cwd() / raw)
-            this_file = Path(__file__).resolve()
-            for p in this_file.parents:
-                candidates.append(p / raw)
-
-        for c in candidates:
-            if c.is_file():
-                return str(c.resolve())
+        resolved, candidates = self._resolve_path_with_candidates(cfg_path_raw)
+        if os.path.isfile(resolved):
+            return str(Path(resolved).resolve())
 
         raise FileNotFoundError(
-            "无法找到 config_path: %s (已尝试 %d 个候选路径)"
-            % (cfg_path_raw, len(candidates))
+            "config_path not found.\n"
+            + self._format_missing_path_message(cfg_path_raw, candidates)
         )
 
     def _load_config(self, path: str) -> Dict[str, Any]:
@@ -242,34 +315,17 @@ class HierarchicalNavRuntimeNode(Node):
 
     def _prepare_repo_import_path(self, config_path: str) -> None:
         """
-        尝试将仓库根目录加入 sys.path。
-        兼容：
-        1) 源码直接运行；
-        2) ROS 安装运行时，通过 config_path 反推仓库根目录。
+        尝试将仓库根目录加入 sys.path，同时刷新路径解析时使用的 repo_root。
         """
-        cfg = Path(config_path).resolve()
-        candidates = []
-        # 配置通常在 <repo>/configs/*.yaml
-        if cfg.parent.name == "configs":
-            candidates.append(cfg.parent.parent)
-        candidates.append(cfg.parent)
+        detected = self._detect_repo_root(config_path=config_path)
+        if detected:
+            self.repo_root = detected
+            if detected not in sys.path:
+                sys.path.insert(0, detected)
+            self.get_logger().info("Repository root resolved for imports: %s" % detected)
+            return
 
-        this_file = Path(__file__).resolve()
-        candidates.extend(list(this_file.parents))
-        candidates.append(Path.cwd())
-        candidates.extend(list(Path.cwd().parents))
-
-        for c in candidates:
-            if self._looks_like_repo_root(c):
-                c_str = str(c.resolve())
-                if c_str not in sys.path:
-                    sys.path.insert(0, c_str)
-                self.get_logger().info("Repository root resolved for imports: %s" % c_str)
-                return
-
-        self.get_logger().warn(
-            "未自动定位到仓库根目录，后续将尝试直接导入 inference/controllers。"
-        )
+        self.get_logger().warn("未自动定位到仓库根目录，后续将尝试直接导入 inference/controllers。")
 
     def _import_infer_classes(self):
         try:
@@ -334,11 +390,24 @@ class HierarchicalNavRuntimeNode(Node):
             "approach_trigger": ("approach_trigger_ckpt", self.ApproachTriggerInfer),
         }
         for name, (ckpt_key, cls_obj) in model_specs.items():
-            ckpt_path = str(self.models_cfg.get(ckpt_key, "")).strip()
-            if not ckpt_path:
+            ckpt_raw = str(self.models_cfg.get(ckpt_key, "")).strip()
+            if not ckpt_raw:
                 self.models[name] = None
                 self.get_logger().error("模型配置缺失: models.%s" % ckpt_key)
                 continue
+
+            ckpt_path, tried_candidates = self._resolve_path_with_candidates(
+                ckpt_raw,
+                base_dir=self.config_dir,
+            )
+            if not os.path.isfile(ckpt_path):
+                self.models[name] = None
+                self.get_logger().error(
+                    "模型 checkpoint 不存在: models.%s\n%s"
+                    % (ckpt_key, self._format_missing_path_message(ckpt_raw, tried_candidates))
+                )
+                continue
+
             try:
                 self.models[name] = cls_obj(ckpt_path=ckpt_path, device=None)
                 # 在线串流推理前，显式重置一次内部状态

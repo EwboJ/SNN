@@ -143,25 +143,66 @@ def _truncate_tail(text: Any, max_len: int = 28) -> str:
     return '...' + s[-(max_len - 3):]
 
 
-def _resolve_path(path_str: str, base_dir: Optional[str] = None) -> str:
-    """
-    解析路径：
-    - 绝对路径直接返回；
-    - 相对路径优先相对 base_dir，再相对仓库根目录。
-    """
-    if os.path.isabs(path_str):
-        return path_str
+def _dedupe_paths(paths: List[str]) -> List[str]:
+    """Preserve order while removing duplicate absolute paths."""
+    out: List[str] = []
+    seen = set()
+    for p in paths:
+        key = os.path.normcase(os.path.normpath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
 
-    candidates: List[str] = []
-    if base_dir:
-        candidates.append(os.path.abspath(os.path.join(base_dir, path_str)))
-    candidates.append(os.path.abspath(os.path.join(_REPO_ROOT, path_str)))
-    candidates.append(os.path.abspath(path_str))
+
+def _resolve_path_with_candidates(
+    path_str: str,
+    base_dir: Optional[str] = None,
+) -> Tuple[str, List[str]]:
+    """
+    Unified path resolution:
+    1) absolute path (after expanding ~ and env vars)
+    2) relative path resolved in order: repo_root -> base_dir -> cwd
+    Returns:
+        (best_effort_resolved_path, tried_absolute_candidates)
+    """
+    raw = str(path_str or '').strip()
+    if not raw:
+        return '', []
+
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+
+    if os.path.isabs(expanded):
+        candidates = [os.path.abspath(expanded)]
+    else:
+        candidates = [os.path.abspath(os.path.join(_REPO_ROOT, expanded))]
+        if base_dir:
+            candidates.append(os.path.abspath(os.path.join(base_dir, expanded)))
+        candidates.append(os.path.abspath(os.path.join(os.getcwd(), expanded)))
+        candidates = _dedupe_paths(candidates)
 
     for p in candidates:
         if os.path.exists(p):
-            return p
-    return candidates[0]
+            return p, candidates
+    return candidates[0], candidates
+
+
+def _resolve_path(path_str: str, base_dir: Optional[str] = None) -> str:
+    resolved, _ = _resolve_path_with_candidates(path_str, base_dir=base_dir)
+    return resolved
+
+
+def _format_missing_path_message(raw_path: str, tried_candidates: List[str]) -> str:
+    lines = [
+        f'raw_path={raw_path}',
+        'tried_candidates:',
+    ]
+    if tried_candidates:
+        lines.extend(f'  - {p}' for p in tried_candidates)
+    else:
+        lines.append('  - <none>')
+    return '\n'.join(lines)
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -943,9 +984,23 @@ def run_replay(args: argparse.Namespace) -> None:
 
     # 1) 子模块推理封装（stage3 / junction_lr / straight_keep / approach_trigger）
     model_cfg = cfg.get('models', {}) or {}
-    stage3_ckpt = _resolve_path(str(model_cfg.get('stage3_ckpt', '')), base_dir=cfg_dir)
-    junction_ckpt = _resolve_path(str(model_cfg.get('junction_lr_ckpt', '')), base_dir=cfg_dir)
-    straight_ckpt = _resolve_path(str(model_cfg.get('straight_keep_ckpt', '')), base_dir=cfg_dir)
+    def _require_ckpt_path(ckpt_key: str) -> str:
+        raw_ckpt = str(model_cfg.get(ckpt_key, '') or '').strip()
+        if not raw_ckpt:
+            raise ValueError(f'models.{ckpt_key} is empty.')
+        resolved_ckpt, tried_candidates = _resolve_path_with_candidates(
+            raw_ckpt, base_dir=cfg_dir
+        )
+        if not os.path.isfile(resolved_ckpt):
+            raise FileNotFoundError(
+                f'models.{ckpt_key} checkpoint not found.\n'
+                + _format_missing_path_message(raw_ckpt, tried_candidates)
+            )
+        return resolved_ckpt
+
+    stage3_ckpt = _require_ckpt_path('stage3_ckpt')
+    junction_ckpt = _require_ckpt_path('junction_lr_ckpt')
+    straight_ckpt = _require_ckpt_path('straight_keep_ckpt')
 
     stage3_infer = Stage3Infer(stage3_ckpt, device=args.device)
     junction_infer = JunctionLRInfer(junction_ckpt, device=args.device)
@@ -958,14 +1013,19 @@ def run_replay(args: argparse.Namespace) -> None:
 
     # 2b) 可选：加载 approach_trigger 轻量触发模型
     approach_trigger_infer = None
-    _trigger_ckpt_raw = str(model_cfg.get('approach_trigger_ckpt', '') or '')
+    _trigger_ckpt_raw = str(model_cfg.get('approach_trigger_ckpt', '') or '').strip()
     if _trigger_ckpt_raw:
-        _trigger_ckpt = _resolve_path(_trigger_ckpt_raw, base_dir=cfg_dir)
+        _trigger_ckpt, _trigger_candidates = _resolve_path_with_candidates(
+            _trigger_ckpt_raw, base_dir=cfg_dir
+        )
         if os.path.isfile(_trigger_ckpt):
             approach_trigger_infer = ApproachTriggerInfer(_trigger_ckpt, device=args.device)
             vprint(f'  approach_trigger: 已加载 ({_trigger_ckpt})')
         else:
-            vprint(f'  approach_trigger: checkpoint 不存在，跳过 ({_trigger_ckpt})')
+            vprint(
+                '  approach_trigger: checkpoint not found, skip.\n'
+                + _format_missing_path_message(_trigger_ckpt_raw, _trigger_candidates)
+            )
     else:
         vprint('  approach_trigger: 未配置，使用旧逻辑')
 

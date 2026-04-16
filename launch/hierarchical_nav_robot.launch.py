@@ -14,7 +14,7 @@ def generate_launch_description() -> LaunchDescription:
     # 可从命令行覆盖的参数
     config_path_arg = DeclareLaunchArgument(
         "config_path",
-        default_value="/home/fsr/Files/SNN/configs/hierarchical_nav_robot_v1.yaml",
+        default_value="configs/hierarchical_nav_robot_v1.yaml",
         description="Path to hierarchical navigation runtime config yaml.",
     )
     image_topic_arg = DeclareLaunchArgument(
