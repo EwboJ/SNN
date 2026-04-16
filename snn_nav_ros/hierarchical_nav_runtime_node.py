@@ -63,6 +63,12 @@ class HierarchicalNavRuntimeNode(Node):
         self.config_dir = str(Path(self.config_path).resolve().parent)
         self.config = self._load_config(self.config_path)
 
+        # 支持 launch 覆盖 topic：非空字符串生效，空字符串回退到 yaml/default
+        self.declare_parameter("image_topic", "")
+        self.declare_parameter("cmd_vel_topic", "")
+        self.declare_parameter("state_topic", "")
+        self.declare_parameter("debug_topic", "")
+
         self.system_cfg = self._cfg_dict("system")
         self.models_cfg = self._cfg_dict("models")
         self.state_machine_cfg = self._cfg_dict("state_machine")
@@ -74,10 +80,28 @@ class HierarchicalNavRuntimeNode(Node):
         self.topics_cfg = self._cfg_dict("topics")
 
         # ===== 2) 按配置准备运行参数 =====
-        self.image_topic = str(self.topics_cfg.get("image_topic", "/camera/image_raw"))
-        self.cmd_vel_topic = str(self.topics_cfg.get("cmd_vel_topic", "/cmd_vel"))
-        self.state_topic = str(self.topics_cfg.get("state_topic", "/nav/state"))
-        self.debug_topic = str(self.topics_cfg.get("debug_topic", "/nav/debug"))
+        ros_image_topic = (
+            self.get_parameter("image_topic").get_parameter_value().string_value.strip()
+        )
+        ros_cmd_vel_topic = (
+            self.get_parameter("cmd_vel_topic").get_parameter_value().string_value.strip()
+        )
+        ros_state_topic = (
+            self.get_parameter("state_topic").get_parameter_value().string_value.strip()
+        )
+        ros_debug_topic = (
+            self.get_parameter("debug_topic").get_parameter_value().string_value.strip()
+        )
+
+        yaml_image_topic = str(self.topics_cfg.get("image_topic", "")).strip()
+        yaml_cmd_vel_topic = str(self.topics_cfg.get("cmd_vel_topic", "")).strip()
+        yaml_state_topic = str(self.topics_cfg.get("state_topic", "")).strip()
+        yaml_debug_topic = str(self.topics_cfg.get("debug_topic", "")).strip()
+
+        self.image_topic = ros_image_topic or yaml_image_topic or "/camera/image_raw"
+        self.cmd_vel_topic = ros_cmd_vel_topic or yaml_cmd_vel_topic or "/cmd_vel"
+        self.state_topic = ros_state_topic or yaml_state_topic or "/nav/state"
+        self.debug_topic = ros_debug_topic or yaml_debug_topic or "/nav/debug"
 
         self.cmd_publish_hz = max(
             1.0, float(self.robot_control_cfg.get("cmd_publish_hz", 10.0))
@@ -196,8 +220,16 @@ class HierarchicalNavRuntimeNode(Node):
             )
 
         self.get_logger().info(
-            "HierarchicalNavRuntimeNode started. config=%s, image=%s, cmd_vel=%s, hz=%.2f"
-            % (self.config_path, self.image_topic, self.cmd_vel_topic, self.cmd_publish_hz)
+            "HierarchicalNavRuntimeNode started. config=%s, image_topic=%s, cmd_vel_topic=%s, "
+            "state_topic=%s, debug_topic=%s, hz=%.2f"
+            % (
+                self.config_path,
+                self.image_topic,
+                self.cmd_vel_topic,
+                self.state_topic,
+                self.debug_topic,
+                self.cmd_publish_hz,
+            )
         )
 
     # ---------------------------
