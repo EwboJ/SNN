@@ -359,6 +359,15 @@ class HierarchicalNavRuntimeNode(Node):
 
         self.get_logger().warn("未自动定位到仓库根目录，后续将尝试直接导入 inference/controllers。")
 
+    def _log_import_failure(self, import_target: str, exc: Exception) -> None:
+        self.get_logger().error("Python executable: %s" % sys.executable)
+        self.get_logger().error("sys.path[0:5]: %s" % repr(sys.path[:5]))
+        self.get_logger().error("Import %s failed: %r" % (import_target, exc))
+        self.get_logger().error(
+            "Traceback for failed import %s:\\n%s"
+            % (import_target, traceback.format_exc())
+        )
+
     def _import_infer_classes(self):
         try:
             from inference.corridor_module_infer import (  # type: ignore
@@ -368,9 +377,8 @@ class HierarchicalNavRuntimeNode(Node):
                 StraightKeepInfer,
             )
         except Exception as exc:  # pragma: no cover
-            raise RuntimeError(
-                "导入推理模块失败，请确认 inference/corridor_module_infer.py 可访问。"
-            ) from exc
+            self._log_import_failure("inference.corridor_module_infer", exc)
+            raise
         return Stage3Infer, JunctionLRInfer, StraightKeepInfer, ApproachTriggerInfer
 
     def _import_state_machine_class(self):
@@ -379,9 +387,8 @@ class HierarchicalNavRuntimeNode(Node):
                 HierarchicalNavigatorStateMachine,
             )
         except Exception as exc:  # pragma: no cover
-            raise RuntimeError(
-                "导入状态机失败，请确认 controllers/hierarchical_state_machine.py 可访问。"
-            ) from exc
+            self._log_import_failure("controllers.hierarchical_state_machine", exc)
+            raise
         return HierarchicalNavigatorStateMachine
 
     def _build_state_machine(self):
