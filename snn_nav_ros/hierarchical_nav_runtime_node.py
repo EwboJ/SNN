@@ -26,7 +26,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
@@ -98,10 +98,32 @@ class HierarchicalNavRuntimeNode(Node):
         yaml_state_topic = str(self.topics_cfg.get("state_topic", "")).strip()
         yaml_debug_topic = str(self.topics_cfg.get("debug_topic", "")).strip()
 
-        self.image_topic = ros_image_topic or yaml_image_topic or "/camera/image_raw"
-        self.cmd_vel_topic = ros_cmd_vel_topic or yaml_cmd_vel_topic or "/cmd_vel"
-        self.state_topic = ros_state_topic or yaml_state_topic or "/nav/state"
-        self.debug_topic = ros_debug_topic or yaml_debug_topic or "/nav/debug"
+        self.image_topic, image_topic_src = self._resolve_topic_value(
+            launch_value=ros_image_topic,
+            yaml_value=yaml_image_topic,
+            default_value="/camera/image_raw",
+        )
+        self.cmd_vel_topic, cmd_vel_topic_src = self._resolve_topic_value(
+            launch_value=ros_cmd_vel_topic,
+            yaml_value=yaml_cmd_vel_topic,
+            default_value="/cmd_vel",
+        )
+        self.state_topic, state_topic_src = self._resolve_topic_value(
+            launch_value=ros_state_topic,
+            yaml_value=yaml_state_topic,
+            default_value="/nav/state",
+        )
+        self.debug_topic, debug_topic_src = self._resolve_topic_value(
+            launch_value=ros_debug_topic,
+            yaml_value=yaml_debug_topic,
+            default_value="/nav/debug",
+        )
+        self._topic_source: Dict[str, str] = {
+            "image_topic": image_topic_src,
+            "cmd_vel_topic": cmd_vel_topic_src,
+            "state_topic": state_topic_src,
+            "debug_topic": debug_topic_src,
+        }
 
         self.cmd_publish_hz = max(
             1.0, float(self.robot_control_cfg.get("cmd_publish_hz", 10.0))
@@ -175,6 +197,10 @@ class HierarchicalNavRuntimeNode(Node):
         self._latest_image: Optional[np.ndarray] = None
         self._latest_image_time: Optional[Time] = None
         self._latest_image_header_time: Optional[Time] = None
+        self._latest_image_receive_time: Optional[Time] = None
+        self._latest_image_stamp: Optional[Time] = None
+        self._last_missing_image_log_time: Optional[Time] = None
+        self._missing_image_log_interval_sec = max(1.0, float(self.image_timeout_sec))
         self._bridge = CvBridge() if CvBridge is not None else None
         self._bridge_warned = False
 
@@ -192,9 +218,10 @@ class HierarchicalNavRuntimeNode(Node):
 
         # ===== 7) ROS2 通信对象 =====
         image_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,  # latest-only 关键设置
-            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=qos_profile_sensor_data.history,
+            depth=1,  # latest-only: 只缓存最新一帧
+            reliability=qos_profile_sensor_data.reliability,
+            durability=qos_profile_sensor_data.durability,
         )
         self.image_sub = self.create_subscription(
             Image,
@@ -231,6 +258,20 @@ class HierarchicalNavRuntimeNode(Node):
                 self.cmd_publish_hz,
             )
         )
+        self.get_logger().info(
+            "Resolved topics => image_topic=%s (%s), cmd_vel_topic=%s (%s), state_topic=%s (%s), "
+            "debug_topic=%s (%s)"
+            % (
+                self.image_topic,
+                self._topic_source["image_topic"],
+                self.cmd_vel_topic,
+                self._topic_source["cmd_vel_topic"],
+                self.state_topic,
+                self._topic_source["state_topic"],
+                self.debug_topic,
+                self._topic_source["debug_topic"],
+            )
+        )
 
     # ---------------------------
     # 配置与导入
@@ -238,6 +279,20 @@ class HierarchicalNavRuntimeNode(Node):
     def _cfg_dict(self, key: str) -> Dict[str, Any]:
         value = self.config.get(key, {})
         return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _resolve_topic_value(
+        *, launch_value: str, yaml_value: str, default_value: str
+    ) -> Tuple[str, str]:
+        launch_v = str(launch_value or "").strip()
+        if launch_v:
+            return launch_v, "launch"
+
+        yaml_v = str(yaml_value or "").strip()
+        if yaml_v:
+            return yaml_v, "yaml"
+
+        return default_value, "default"
 
     @staticmethod
     def _dedupe_paths(paths: List[str]) -> List[str]:
@@ -479,6 +534,8 @@ class HierarchicalNavRuntimeNode(Node):
                 self._latest_image = image_rgb
                 self._latest_image_time = recv_time
                 self._latest_image_header_time = header_time
+                self._latest_image_receive_time = recv_time
+                self._latest_image_stamp = header_time
         except Exception as exc:
             self.get_logger().error("图像转换失败: %s" % str(exc))
 
@@ -567,6 +624,7 @@ class HierarchicalNavRuntimeNode(Node):
             image_ok, image_age_ms = self._get_latest_image_status(now)
             if not image_ok:
                 reason = "missing_image_or_timeout"
+                self._maybe_log_missing_image(now=now, image_age_ms=image_age_ms)
                 self.publish_zero_twist(reason)
                 self._publish_state(state_now)
                 self._publish_debug(
@@ -579,6 +637,7 @@ class HierarchicalNavRuntimeNode(Node):
                     run_flags=run_flags,
                     reason=reason,
                     image_age_ms=image_age_ms,
+                    image_received_ok=False,
                 )
                 return
 
@@ -597,6 +656,7 @@ class HierarchicalNavRuntimeNode(Node):
                     run_flags=run_flags,
                     reason=reason,
                     image_age_ms=image_age_ms,
+                    image_received_ok=False,
                 )
                 return
 
@@ -634,6 +694,7 @@ class HierarchicalNavRuntimeNode(Node):
                     run_flags=run_flags,
                     reason=reason,
                     image_age_ms=image_age_ms,
+                    image_received_ok=True,
                 )
                 return
 
@@ -658,6 +719,7 @@ class HierarchicalNavRuntimeNode(Node):
                     run_flags=run_flags,
                     reason=reason,
                     image_age_ms=image_age_ms,
+                    image_received_ok=True,
                 )
                 return
 
@@ -699,6 +761,7 @@ class HierarchicalNavRuntimeNode(Node):
                 run_flags=run_flags,
                 reason="ok",
                 image_age_ms=image_age_ms,
+                image_received_ok=True,
                 sm_out=sm_out,
             )
         except Exception as exc:
@@ -717,7 +780,10 @@ class HierarchicalNavRuntimeNode(Node):
                 outputs=outputs,
                 run_flags=run_flags,
                 reason="exception",
-                image_age_ms=self._age_ms(self._latest_image_time, now),
+                image_age_ms=self._age_ms(
+                    self._latest_image_receive_time or self._latest_image_time, now
+                ),
+                image_received_ok=None,
                 extra={"exception": str(exc)},
             )
 
@@ -935,9 +1001,21 @@ class HierarchicalNavRuntimeNode(Node):
         run_flags: Dict[str, bool],
         reason: str,
         image_age_ms: int,
+        image_received_ok: Optional[bool] = None,
         sm_out: Optional[Dict[str, Any]] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
+        with self._img_lock:
+            latest_image_receive_time = self._latest_image_receive_time
+            latest_image_stamp = self._latest_image_stamp
+
+        if image_received_ok is None:
+            image_received_ok = (
+                latest_image_receive_time is not None
+                and int(image_age_ms) >= 0
+                and (float(image_age_ms) / 1000.0) <= float(self.image_timeout_sec)
+            )
+
         debug_payload: Dict[str, Any] = {
             "state": state,
             "locked_turn_dir": locked_turn_dir if locked_turn_dir is not None else "",
@@ -950,7 +1028,11 @@ class HierarchicalNavRuntimeNode(Node):
             "ran_junction": bool(run_flags.get("junction_lr", False)),
             "ran_straight_keep": bool(run_flags.get("straight_keep", False)),
             "ran_trigger": bool(run_flags.get("approach_trigger", False)),
+            "subscribed_image_topic": self.image_topic,
+            "image_received_ok": bool(image_received_ok),
             "image_age_ms": int(image_age_ms),
+            "image_header_stamp": self._format_time_stamp(latest_image_stamp),
+            "latest_image_receive_time": self._format_time_stamp(latest_image_receive_time),
             "stage3_age_ms": self._age_ms(self.module_cache["stage3"].last_update_time, now),
             "junction_age_ms": self._age_ms(
                 self.module_cache["junction_lr"].last_update_time, now
@@ -998,13 +1080,46 @@ class HierarchicalNavRuntimeNode(Node):
             return self._latest_image.copy()
 
     def _get_latest_image_status(self, now: Time) -> Tuple[bool, int]:
-        age_ms = self._age_ms(self._latest_image_time, now)
-        if self._latest_image_time is None:
+        with self._img_lock:
+            last_receive_time = self._latest_image_receive_time or self._latest_image_time
+        age_ms = self._age_ms(last_receive_time, now)
+        if last_receive_time is None:
             return False, -1
         age_sec = age_ms / 1000.0
         if age_sec > self.image_timeout_sec:
             return False, age_ms
         return True, age_ms
+
+    def _maybe_log_missing_image(self, now: Time, image_age_ms: int) -> None:
+        if self._last_missing_image_log_time is not None:
+            elapsed = self._age_sec(self._last_missing_image_log_time, now)
+            if elapsed is not None and elapsed < self._missing_image_log_interval_sec:
+                return
+
+        with self._img_lock:
+            last_receive_time = self._latest_image_receive_time or self._latest_image_time
+            last_header_stamp = self._latest_image_stamp or self._latest_image_header_time
+
+        self.get_logger().warn(
+            "Image missing/timeout. topic=%s, image_age_ms=%d, last_receive_time=%s, "
+            "last_header_stamp=%s"
+            % (
+                self.image_topic,
+                int(image_age_ms),
+                self._format_time_stamp(last_receive_time),
+                self._format_time_stamp(last_header_stamp),
+            )
+        )
+        self._last_missing_image_log_time = now
+
+    @staticmethod
+    def _format_time_stamp(time_obj: Optional[Time]) -> str:
+        if time_obj is None:
+            return ""
+        ns = int(time_obj.nanoseconds)
+        sec = ns // 1_000_000_000
+        nsec = ns % 1_000_000_000
+        return "%d.%09d" % (sec, nsec)
 
     @staticmethod
     def _safe_float(v: Any, default: float = 0.0) -> float:
