@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -25,6 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Twist
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
@@ -40,10 +43,13 @@ except Exception:  # pragma: no cover - 运行环境无 cv_bridge 时走 fallbac
 
 @dataclass
 class ModuleCache:
-    """保存模型缓存输出与更新时间。"""
+    """保存模块缓存、异步任务状态与最近调度信息。"""
 
     last_output: Dict[str, Any]
     last_update_time: Optional[Time] = None
+    busy: bool = False
+    future: Optional[Future] = None
+    last_run_step: int = 0
 
 
 class HierarchicalNavRuntimeNode(Node):
@@ -203,6 +209,20 @@ class HierarchicalNavRuntimeNode(Node):
         self._missing_image_log_interval_sec = max(1.0, float(self.image_timeout_sec))
         self._bridge = CvBridge() if CvBridge is not None else None
         self._bridge_warned = False
+        self._module_names: Tuple[str, ...] = (
+            "stage3",
+            "junction_lr",
+            "straight_keep",
+            "approach_trigger",
+        )
+        self._module_lock = Lock()
+        self._infer_executor = ThreadPoolExecutor(
+            max_workers=len(self._module_names),
+            thread_name_prefix="hier_nav_infer",
+        )
+        self._image_cb_group = ReentrantCallbackGroup()
+        self._control_cb_group = ReentrantCallbackGroup()
+        self._executor_shutdown = False
 
         # ===== 6) 各模型缓存输出 =====
         self.module_cache: Dict[str, ModuleCache] = {
@@ -228,6 +248,7 @@ class HierarchicalNavRuntimeNode(Node):
             self.image_topic,
             self._image_callback,
             image_qos,
+            callback_group=self._image_cb_group,
         )
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.state_pub = self.create_publisher(String, self.state_topic, 10)
@@ -237,7 +258,9 @@ class HierarchicalNavRuntimeNode(Node):
         self._consecutive_errors = 0
         self._last_cmd = Twist()
         self.control_timer = self.create_timer(
-            1.0 / self.cmd_publish_hz, self._control_tick
+            1.0 / self.cmd_publish_hz,
+            self._control_tick,
+            callback_group=self._control_cb_group,
         )
 
         if self.scheduler_policy != "state_conditioned_v2":
@@ -599,7 +622,6 @@ class HierarchicalNavRuntimeNode(Node):
     def _control_tick(self) -> None:
         self._tick_count += 1
         now = self.get_clock().now()
-        tick_had_exception = False
 
         # 当前状态（调度用）
         state_now = self._get_state_name()
@@ -612,14 +634,17 @@ class HierarchicalNavRuntimeNode(Node):
             "straight_keep": False,
             "approach_trigger": False,
         }
-        outputs = {
-            "stage3": self.module_cache["stage3"].last_output,
-            "junction_lr": self.module_cache["junction_lr"].last_output,
-            "straight_keep": self.module_cache["straight_keep"].last_output,
-            "approach_trigger": self.module_cache["approach_trigger"].last_output,
-        }
+        outputs = self._get_cached_outputs()
 
         try:
+            # 0) 先收割已完成的异步推理结果（非阻塞）
+            tick_had_exception = self._collect_finished_inference_results(now=now)
+            outputs = self._get_cached_outputs()
+            if tick_had_exception:
+                self._consecutive_errors += 1
+            else:
+                self._consecutive_errors = 0
+
             # 1) 图像超时检查
             image_ok, image_age_ms = self._get_latest_image_status(now)
             if not image_ok:
@@ -660,22 +685,15 @@ class HierarchicalNavRuntimeNode(Node):
                 )
                 return
 
-            # 2) 按当前状态决定本轮模型调度
-            run_flags = self._decide_schedule(state_now, locked_now)
-
-            # 3) 运行或复用缓存
-            outputs, tick_had_exception = self._update_model_outputs(
+            # 2) 按当前状态决定本轮模型调度，提交后台推理（不等待）
+            schedule_flags = self._decide_schedule(state_now, locked_now)
+            run_flags = self._submit_inference_jobs(
                 image_np=image_np,
-                run_flags=run_flags,
-                now=now,
+                schedule_flags=schedule_flags,
             )
+            outputs = self._get_cached_outputs()
 
-            # 4) 连续异常安全机制
-            if tick_had_exception:
-                self._consecutive_errors += 1
-            else:
-                self._consecutive_errors = 0
-
+            # 3) 连续异常安全机制
             if self._consecutive_errors >= self.max_consecutive_errors:
                 reason = "too_many_consecutive_errors"
                 self.get_logger().error(
@@ -698,7 +716,7 @@ class HierarchicalNavRuntimeNode(Node):
                 )
                 return
 
-            # 5) 模型输出超时检查（按当前状态依赖）
+            # 4) 模型输出超时检查（按当前状态依赖）
             timeout_modules = self._check_model_timeout_modules(
                 state=state_now,
                 locked_turn_dir=locked_now,
@@ -723,7 +741,7 @@ class HierarchicalNavRuntimeNode(Node):
                 )
                 return
 
-            # 6) 状态机更新
+            # 5) 状态机更新
             sm_out = self.state_machine.update(
                 {
                     "stage3": outputs["stage3"],
@@ -736,14 +754,14 @@ class HierarchicalNavRuntimeNode(Node):
             locked_new = sm_out.get("locked_turn_dir", locked_now)
             omega_sm = self._safe_float(sm_out.get("omega_cmd_final", 0.0), 0.0)
 
-            # 7) 速度映射 + 角速度规则
+            # 6) 速度映射 + 角速度规则
             linear_x, angular_z = self._compose_control_cmd(
                 state=state_new,
                 locked_turn_dir=locked_new,
                 omega_cmd_final=omega_sm,
             )
 
-            # 8) 发布 cmd/state/debug
+            # 7) 发布 cmd/state/debug
             cmd = Twist()
             cmd.linear.x = float(linear_x)
             cmd.angular.z = float(angular_z)
@@ -841,36 +859,109 @@ class HierarchicalNavRuntimeNode(Node):
 
         return run
 
-    def _update_model_outputs(
-        self, image_np: np.ndarray, run_flags: Dict[str, bool], now: Time
-    ) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+    def _collect_finished_inference_results(self, now: Time) -> bool:
+        """
+        仅收集已经完成的 future，不阻塞控制线程。
+        """
+        completed_jobs: List[Tuple[str, Future]] = []
+        with self._module_lock:
+            for module_name in self._module_names:
+                cache = self.module_cache[module_name]
+                if cache.busy and cache.future is not None and cache.future.done():
+                    completed_jobs.append((module_name, cache.future))
+
+        had_exception = False
+        for module_name, future in completed_jobs:
+            try:
+                out = future.result()
+                if not isinstance(out, dict):
+                    raise TypeError("%s 输出不是 dict" % module_name)
+                with self._module_lock:
+                    cache = self.module_cache[module_name]
+                    cache.last_output = out
+                    cache.last_update_time = now
+                    cache.busy = False
+                    cache.future = None
+            except Exception as exc:
+                had_exception = True
+                with self._module_lock:
+                    cache = self.module_cache[module_name]
+                    cache.busy = False
+                    cache.future = None
+                self.get_logger().error(
+                    "异步模型运行异常[%s]: %s\n%s"
+                    % (module_name, str(exc), traceback.format_exc())
+                )
+
+        return had_exception
+
+    def _submit_inference_jobs(
+        self, image_np: np.ndarray, schedule_flags: Dict[str, bool]
+    ) -> Dict[str, bool]:
+        """
+        按调度策略提交后台推理任务：
+        - busy 的模块不重复提交
+        - 仅提交，不等待完成
+        """
+        ran_flags: Dict[str, bool] = {
+            "stage3": False,
+            "junction_lr": False,
+            "straight_keep": False,
+            "approach_trigger": False,
+        }
+
+        for module_name in self._module_names:
+            if not schedule_flags.get(module_name, False):
+                continue
+            model = self.models.get(module_name)
+            if model is None:
+                continue
+
+            should_submit = False
+            with self._module_lock:
+                cache = self.module_cache[module_name]
+                if not cache.busy:
+                    cache.busy = True
+                    cache.last_run_step = self._tick_count
+                    should_submit = True
+
+            if not should_submit:
+                continue
+
+            # 线程池任务使用同一时刻快照，避免读取正在变化的 latest image。
+            image_snapshot = np.ascontiguousarray(image_np.copy())
+            try:
+                future = self._infer_executor.submit(
+                    self._run_model,
+                    module_name,
+                    image_snapshot,
+                )
+            except Exception as exc:
+                with self._module_lock:
+                    cache = self.module_cache[module_name]
+                    cache.busy = False
+                    cache.future = None
+                self.get_logger().error(
+                    "提交异步推理失败[%s]: %s" % (module_name, str(exc))
+                )
+                continue
+
+            with self._module_lock:
+                cache = self.module_cache[module_name]
+                cache.future = future
+            ran_flags[module_name] = True
+
+        return ran_flags
+
+    def _get_cached_outputs(self) -> Dict[str, Dict[str, Any]]:
         outputs: Dict[str, Dict[str, Any]] = {}
-        tick_had_exception = False
-
-        for module_name in ("stage3", "junction_lr", "straight_keep", "approach_trigger"):
-            if run_flags.get(module_name, False):
-                try:
-                    out = self._run_model(module_name, image_np)
-                    if not isinstance(out, dict):
-                        raise TypeError("%s 输出不是 dict" % module_name)
-                    self.module_cache[module_name].last_output = out
-                    self.module_cache[module_name].last_update_time = now
-                    outputs[module_name] = out
-                except Exception as exc:
-                    tick_had_exception = True
-                    self.get_logger().error(
-                        "模型运行异常[%s]: %s" % (module_name, str(exc))
-                    )
-                    outputs[module_name] = self.module_cache[module_name].last_output
-            else:
-                # 本轮不跑，复用 last_output
-                outputs[module_name] = self.module_cache[module_name].last_output
-
-            # 双保险：如果缓存仍为空，给安全默认值
-            if outputs[module_name] is None:
-                outputs[module_name] = self._default_output(module_name)
-
-        return outputs, tick_had_exception
+        with self._module_lock:
+            for module_name in self._module_names:
+                out = self.module_cache[module_name].last_output
+                if not isinstance(out, dict):
+                    out = self._default_output(module_name)
+                outputs[module_name] = out
+        return outputs
 
     def _run_model(self, module_name: str, image_np: np.ndarray) -> Dict[str, Any]:
         model = self.models.get(module_name)
@@ -915,8 +1006,12 @@ class HierarchicalNavRuntimeNode(Node):
     ) -> list[str]:
         required = self._required_modules_for_state(state, locked_turn_dir)
         timed_out = []
+        with self._module_lock:
+            last_update_map = {
+                m: self.module_cache[m].last_update_time for m in self._module_names
+            }
         for m in required:
-            last_t = self.module_cache[m].last_update_time
+            last_t = last_update_map.get(m)
             age_sec = self._age_sec(last_t, now)
             if age_sec is None or age_sec > self.model_output_timeout_sec:
                 timed_out.append(m)
@@ -1008,6 +1103,15 @@ class HierarchicalNavRuntimeNode(Node):
         with self._img_lock:
             latest_image_receive_time = self._latest_image_receive_time
             latest_image_stamp = self._latest_image_stamp
+        with self._module_lock:
+            stage3_update = self.module_cache["stage3"].last_update_time
+            junction_update = self.module_cache["junction_lr"].last_update_time
+            straight_keep_update = self.module_cache["straight_keep"].last_update_time
+            trigger_update = self.module_cache["approach_trigger"].last_update_time
+            stage3_busy = bool(self.module_cache["stage3"].busy)
+            junction_busy = bool(self.module_cache["junction_lr"].busy)
+            straight_keep_busy = bool(self.module_cache["straight_keep"].busy)
+            trigger_busy = bool(self.module_cache["approach_trigger"].busy)
 
         if image_received_ok is None:
             image_received_ok = (
@@ -1028,21 +1132,19 @@ class HierarchicalNavRuntimeNode(Node):
             "ran_junction": bool(run_flags.get("junction_lr", False)),
             "ran_straight_keep": bool(run_flags.get("straight_keep", False)),
             "ran_trigger": bool(run_flags.get("approach_trigger", False)),
+            "stage3_busy": stage3_busy,
+            "junction_busy": junction_busy,
+            "straight_keep_busy": straight_keep_busy,
+            "trigger_busy": trigger_busy,
             "subscribed_image_topic": self.image_topic,
             "image_received_ok": bool(image_received_ok),
             "image_age_ms": int(image_age_ms),
             "image_header_stamp": self._format_time_stamp(latest_image_stamp),
             "latest_image_receive_time": self._format_time_stamp(latest_image_receive_time),
-            "stage3_age_ms": self._age_ms(self.module_cache["stage3"].last_update_time, now),
-            "junction_age_ms": self._age_ms(
-                self.module_cache["junction_lr"].last_update_time, now
-            ),
-            "straight_keep_age_ms": self._age_ms(
-                self.module_cache["straight_keep"].last_update_time, now
-            ),
-            "trigger_age_ms": self._age_ms(
-                self.module_cache["approach_trigger"].last_update_time, now
-            ),
+            "stage3_age_ms": self._age_ms(stage3_update, now),
+            "junction_age_ms": self._age_ms(junction_update, now),
+            "straight_keep_age_ms": self._age_ms(straight_keep_update, now),
+            "trigger_age_ms": self._age_ms(trigger_update, now),
             "reason": reason,
             "consecutive_errors": int(self._consecutive_errors),
         }
@@ -1183,21 +1285,43 @@ class HierarchicalNavRuntimeNode(Node):
         except Exception:
             return ""
 
+    def _shutdown_inference_executor(self) -> None:
+        if self._executor_shutdown:
+            return
+
+        with self._module_lock:
+            for module_name in self._module_names:
+                cache = self.module_cache[module_name]
+                if cache.future is not None and not cache.future.done():
+                    cache.future.cancel()
+                cache.future = None
+                cache.busy = False
+
+        self._infer_executor.shutdown(wait=False, cancel_futures=True)
+        self._executor_shutdown = True
+
     def destroy_node(self) -> bool:
         # 节点退出时必须发布一次零速
         try:
             self.publish_zero_twist("node_destroy")
         except Exception:
             pass
+        try:
+            self._shutdown_inference_executor()
+        except Exception as exc:
+            self.get_logger().warn("关闭推理线程池失败: %s" % str(exc))
         return super().destroy_node()
 
 
 def main(args: Optional[list[str]] = None) -> None:
     rclpy.init(args=args)
     node: Optional[HierarchicalNavRuntimeNode] = None
+    executor: Optional[MultiThreadedExecutor] = None
     try:
         node = HierarchicalNavRuntimeNode()
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor(num_threads=4)
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     except Exception as exc:
@@ -1206,6 +1330,11 @@ def main(args: Optional[list[str]] = None) -> None:
         else:
             print("HierarchicalNavRuntimeNode failed before init: %s" % str(exc))
     finally:
+        if executor is not None:
+            try:
+                executor.shutdown()
+            except Exception:
+                pass
         if node is not None:
             try:
                 node.publish_zero_twist("node_shutdown")
