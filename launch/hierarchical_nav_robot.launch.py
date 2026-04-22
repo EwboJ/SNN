@@ -19,7 +19,7 @@ def generate_launch_description() -> LaunchDescription:
     )
     image_topic_arg = DeclareLaunchArgument(
         "image_topic",
-        default_value="/camera/image_raw",
+        default_value="/camera/color/image_raw",
         description="Input camera image topic.",
     )
     cmd_vel_topic_arg = DeclareLaunchArgument(
