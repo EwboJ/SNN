@@ -188,6 +188,7 @@ class HierarchicalNavRuntimeNode(Node):
         self.max_consecutive_errors = max(
             1, int(self.safety_cfg.get("max_consecutive_errors", 5))
         )
+        self.debug_compact = bool(self.safety_cfg.get("debug_compact", True))
 
         # ===== 3) 动态导入仓库内模块（兼容源码运行与安装运行） =====
         self._prepare_repo_import_path(self.config_path)
@@ -208,6 +209,7 @@ class HierarchicalNavRuntimeNode(Node):
         self._latest_image_header_time: Optional[Time] = None
         self._latest_image_receive_time: Optional[Time] = None
         self._latest_image_stamp: Optional[Time] = None
+        self._image_rx_count = 0
         self._last_missing_image_log_time: Optional[Time] = None
         self._missing_image_log_interval_sec = max(1.0, float(self.image_timeout_sec))
         self._bridge = CvBridge() if CvBridge is not None else None
@@ -563,6 +565,7 @@ class HierarchicalNavRuntimeNode(Node):
                 self._latest_image_header_time = header_time
                 self._latest_image_receive_time = recv_time
                 self._latest_image_stamp = header_time
+                self._image_rx_count += 1
         except Exception as exc:
             self.get_logger().error("图像转换失败: %s" % str(exc))
 
@@ -1148,6 +1151,7 @@ class HierarchicalNavRuntimeNode(Node):
         with self._img_lock:
             latest_image_receive_time = self._latest_image_receive_time
             latest_image_stamp = self._latest_image_stamp
+            image_rx_count = int(self._image_rx_count)
         with self._module_lock:
             stage3_update = self.module_cache["stage3"].last_update_time
             junction_update = self.module_cache["junction_lr"].last_update_time
@@ -1173,42 +1177,87 @@ class HierarchicalNavRuntimeNode(Node):
                 and (float(image_age_ms) / 1000.0) <= float(self.image_timeout_sec)
             )
 
-        debug_payload: Dict[str, Any] = {
-            "state": state,
-            "locked_turn_dir": locked_turn_dir if locked_turn_dir is not None else "",
-            "linear_x": float(linear_x),
-            "angular_z": float(angular_z),
-            "trigger_pred": self._parse_trigger_pred(outputs.get("approach_trigger", {})),
-            "stage3_pred": self._parse_stage3_pred(outputs.get("stage3", {})),
-            "junction_pred": self._parse_junction_pred(outputs.get("junction_lr", {})),
-            "ran_stage3": bool(run_flags.get("stage3", False)),
-            "ran_junction": bool(run_flags.get("junction_lr", False)),
-            "ran_straight_keep": bool(run_flags.get("straight_keep", False)),
-            "ran_trigger": bool(run_flags.get("approach_trigger", False)),
-            "stage3_busy": stage3_busy,
-            "junction_busy": junction_busy,
-            "straight_keep_busy": straight_keep_busy,
-            "trigger_busy": trigger_busy,
-            "subscribed_image_topic": self.image_topic,
-            "image_received_ok": bool(image_received_ok),
-            "image_age_ms": int(image_age_ms),
-            "image_header_stamp": self._format_time_stamp(latest_image_stamp),
-            "latest_image_receive_time": self._format_time_stamp(latest_image_receive_time),
-            "stage3_age_ms": self._age_ms(stage3_update, now),
-            "junction_age_ms": self._age_ms(junction_update, now),
-            "straight_keep_age_ms": self._age_ms(straight_keep_update, now),
-            "trigger_age_ms": self._age_ms(trigger_update, now),
-            "stage3_last_run_step": stage3_last_run_step,
-            "junction_last_run_step": junction_last_run_step,
-            "straight_keep_last_run_step": straight_keep_last_run_step,
-            "trigger_last_run_step": trigger_last_run_step,
-            "reason": reason,
-            "consecutive_errors": int(self._consecutive_errors),
-        }
-        if sm_out is not None:
-            debug_payload["state_machine_debug"] = sm_out.get("debug", {})
-        if extra:
-            debug_payload.update(extra)
+        locked_turn_dir_out = locked_turn_dir if locked_turn_dir is not None else ""
+        trigger_pred = self._parse_trigger_pred(outputs.get("approach_trigger", {}))
+        stage3_pred = self._parse_stage3_pred(outputs.get("stage3", {}))
+        junction_pred = self._parse_junction_pred(outputs.get("junction_lr", {}))
+        latest_image_receive_time_str = self._format_time_stamp(latest_image_receive_time)
+        image_header_stamp_str = self._format_time_stamp(latest_image_stamp)
+        stage3_age_ms = self._age_ms(stage3_update, now)
+        junction_age_ms = self._age_ms(junction_update, now)
+        straight_keep_age_ms = self._age_ms(straight_keep_update, now)
+        trigger_age_ms = self._age_ms(trigger_update, now)
+        tick_count = int(self._tick_count)
+
+        if self.debug_compact:
+            # 轻量模式：仅发布核心诊断字段，降低 JSON 序列化与发布开销。
+            debug_payload: Dict[str, Any] = {
+                "state": state,
+                "locked_turn_dir": locked_turn_dir_out,
+                "linear_x": float(linear_x),
+                "angular_z": float(angular_z),
+                "trigger_pred": trigger_pred,
+                "stage3_pred": stage3_pred,
+                "junction_pred": junction_pred,
+                "image_received_ok": bool(image_received_ok),
+                "image_age_ms": int(image_age_ms),
+                "latest_image_receive_time": latest_image_receive_time_str,
+                "stage3_age_ms": stage3_age_ms,
+                "junction_age_ms": junction_age_ms,
+                "straight_keep_age_ms": straight_keep_age_ms,
+                "trigger_age_ms": trigger_age_ms,
+                "stage3_busy": stage3_busy,
+                "junction_busy": junction_busy,
+                "straight_keep_busy": straight_keep_busy,
+                "trigger_busy": trigger_busy,
+                "tick_count": tick_count,
+                "image_rx_count": image_rx_count,
+                "stage3_last_run_step": stage3_last_run_step,
+                "junction_last_run_step": junction_last_run_step,
+                "straight_keep_last_run_step": straight_keep_last_run_step,
+                "trigger_last_run_step": trigger_last_run_step,
+                "reason": reason,
+                "consecutive_errors": int(self._consecutive_errors),
+            }
+        else:
+            debug_payload = {
+                "state": state,
+                "locked_turn_dir": locked_turn_dir_out,
+                "linear_x": float(linear_x),
+                "angular_z": float(angular_z),
+                "trigger_pred": trigger_pred,
+                "stage3_pred": stage3_pred,
+                "junction_pred": junction_pred,
+                "ran_stage3": bool(run_flags.get("stage3", False)),
+                "ran_junction": bool(run_flags.get("junction_lr", False)),
+                "ran_straight_keep": bool(run_flags.get("straight_keep", False)),
+                "ran_trigger": bool(run_flags.get("approach_trigger", False)),
+                "stage3_busy": stage3_busy,
+                "junction_busy": junction_busy,
+                "straight_keep_busy": straight_keep_busy,
+                "trigger_busy": trigger_busy,
+                "subscribed_image_topic": self.image_topic,
+                "image_received_ok": bool(image_received_ok),
+                "image_age_ms": int(image_age_ms),
+                "image_header_stamp": image_header_stamp_str,
+                "latest_image_receive_time": latest_image_receive_time_str,
+                "stage3_age_ms": stage3_age_ms,
+                "junction_age_ms": junction_age_ms,
+                "straight_keep_age_ms": straight_keep_age_ms,
+                "trigger_age_ms": trigger_age_ms,
+                "tick_count": tick_count,
+                "image_rx_count": image_rx_count,
+                "stage3_last_run_step": stage3_last_run_step,
+                "junction_last_run_step": junction_last_run_step,
+                "straight_keep_last_run_step": straight_keep_last_run_step,
+                "trigger_last_run_step": trigger_last_run_step,
+                "reason": reason,
+                "consecutive_errors": int(self._consecutive_errors),
+            }
+            if sm_out is not None:
+                debug_payload["state_machine_debug"] = sm_out.get("debug", {})
+            if extra:
+                debug_payload.update(extra)
 
         msg = String()
         msg.data = json.dumps(debug_payload, ensure_ascii=False)
