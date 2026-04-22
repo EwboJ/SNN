@@ -176,6 +176,9 @@ class HierarchicalNavRuntimeNode(Node):
         self.model_output_timeout_sec = max(
             0.01, float(self.safety_cfg.get("model_output_timeout_sec", 1.0))
         )
+        self.startup_warmup_sec = max(
+            0.0, float(self.safety_cfg.get("startup_warmup_sec", 2.5))
+        )
         self.publish_zero_on_timeout = bool(
             self.safety_cfg.get("publish_zero_on_timeout", True)
         )
@@ -254,6 +257,7 @@ class HierarchicalNavRuntimeNode(Node):
         self.state_pub = self.create_publisher(String, self.state_topic, 10)
         self.debug_pub = self.create_publisher(String, self.debug_topic, 10)
 
+        self._node_start_time = self.get_clock().now()
         self._tick_count = 0
         self._consecutive_errors = 0
         self._last_cmd = Twist()
@@ -717,11 +721,22 @@ class HierarchicalNavRuntimeNode(Node):
                 return
 
             # 4) 模型输出超时检查（按当前状态依赖）
-            timeout_modules = self._check_model_timeout_modules(
-                state=state_now,
-                locked_turn_dir=locked_now,
-                now=now,
+            debug_reason = "ok"
+            startup_elapsed_sec = self._age_sec(self._node_start_time, now)
+            in_startup_warmup = (
+                startup_elapsed_sec is not None
+                and startup_elapsed_sec <= self.startup_warmup_sec
             )
+            if in_startup_warmup:
+                debug_reason = "startup_warmup"
+
+            timeout_modules = []
+            if not in_startup_warmup:
+                timeout_modules = self._check_model_timeout_modules(
+                    state=state_now,
+                    locked_turn_dir=locked_now,
+                    now=now,
+                )
             if timeout_modules:
                 reason = "model_output_timeout:%s" % ",".join(timeout_modules)
                 self.get_logger().error("模型输出超时: %s" % ",".join(timeout_modules))
@@ -777,7 +792,7 @@ class HierarchicalNavRuntimeNode(Node):
                 angular_z=angular_z,
                 outputs=outputs,
                 run_flags=run_flags,
-                reason="ok",
+                reason=debug_reason,
                 image_age_ms=image_age_ms,
                 image_received_ok=True,
                 sm_out=sm_out,
@@ -1006,14 +1021,44 @@ class HierarchicalNavRuntimeNode(Node):
     ) -> list[str]:
         required = self._required_modules_for_state(state, locked_turn_dir)
         timed_out = []
+        inflight_window_steps = max(
+            1, int(self.model_output_timeout_sec * self.cmd_publish_hz)
+        )
         with self._module_lock:
-            last_update_map = {
-                m: self.module_cache[m].last_update_time for m in self._module_names
-            }
+            module_status = {}
+            for m in self._module_names:
+                cache = self.module_cache[m]
+                module_status[m] = {
+                    "last_update_time": cache.last_update_time,
+                    "busy": bool(cache.busy),
+                    "future": cache.future,
+                    "last_run_step": int(cache.last_run_step),
+                }
         for m in required:
-            last_t = last_update_map.get(m)
+            status = module_status.get(m, {})
+            last_t = status.get("last_update_time")
+            busy = bool(status.get("busy", False))
+            future = status.get("future")
+            last_run_step = int(status.get("last_run_step", 0))
             age_sec = self._age_sec(last_t, now)
-            if age_sec is None or age_sec > self.model_output_timeout_sec:
+            step_delta = max(0, int(self._tick_count - last_run_step))
+            future_running = bool(future is not None and not future.done())
+
+            # in-flight 宽限：busy 期间允许异步任务跨若干个控制 tick 返回。
+            if busy:
+                # future 仍在运行中时，窗口内暂不判 timeout。
+                if future_running and step_delta <= inflight_window_steps:
+                    continue
+                # future 已完成但结果尚未在本 tick 被回收时，窗口内同样不判 timeout。
+                if (not future_running) and step_delta <= inflight_window_steps:
+                    continue
+                timed_out.append(m)
+                continue
+
+            if last_t is None:
+                timed_out.append(m)
+                continue
+            if age_sec is not None and age_sec > self.model_output_timeout_sec:
                 timed_out.append(m)
         return timed_out
 
@@ -1108,6 +1153,14 @@ class HierarchicalNavRuntimeNode(Node):
             junction_update = self.module_cache["junction_lr"].last_update_time
             straight_keep_update = self.module_cache["straight_keep"].last_update_time
             trigger_update = self.module_cache["approach_trigger"].last_update_time
+            stage3_last_run_step = int(self.module_cache["stage3"].last_run_step)
+            junction_last_run_step = int(self.module_cache["junction_lr"].last_run_step)
+            straight_keep_last_run_step = int(
+                self.module_cache["straight_keep"].last_run_step
+            )
+            trigger_last_run_step = int(
+                self.module_cache["approach_trigger"].last_run_step
+            )
             stage3_busy = bool(self.module_cache["stage3"].busy)
             junction_busy = bool(self.module_cache["junction_lr"].busy)
             straight_keep_busy = bool(self.module_cache["straight_keep"].busy)
@@ -1145,6 +1198,10 @@ class HierarchicalNavRuntimeNode(Node):
             "junction_age_ms": self._age_ms(junction_update, now),
             "straight_keep_age_ms": self._age_ms(straight_keep_update, now),
             "trigger_age_ms": self._age_ms(trigger_update, now),
+            "stage3_last_run_step": stage3_last_run_step,
+            "junction_last_run_step": junction_last_run_step,
+            "straight_keep_last_run_step": straight_keep_last_run_step,
+            "trigger_last_run_step": trigger_last_run_step,
             "reason": reason,
             "consecutive_errors": int(self._consecutive_errors),
         }

@@ -1,0 +1,123 @@
+# =============================================================================
+# robot_v1锛氫笌鐪熷疄褰曞埗琛屼负涓€鑷寸殑瀹炴満閮ㄧ讲閰嶇疆
+# =============================================================================
+# 璇存槑锛?
+# - 杩欐槸涓庣湡瀹炲綍鍒惰涓轰竴鑷寸殑 robot_v1 瀹炴満閮ㄧ讲閰嶇疆
+# - 閲嶇偣鏄厛瀹炵幇鍙繍琛岀殑浣庨€熼棴鐜師鍨?
+# - 涓嶆槸杩芥眰鏈€浼橈紝鑰屾槸鍏堣创杩戠湡瀹炶溅閫熷拰瑙掗€熷害
+#
+# 鐢ㄩ€?
+# - replay 绂荤嚎澶嶇幇
+# - ROS2 鍦ㄧ嚎鑺傜偣
+
+system:
+  image_h: 48              # 杈撳叆鍥惧儚楂樺害, 涓庤缁?img_h 瀵归綈
+  image_w: 64              # 杈撳叆鍥惧儚瀹藉害, 涓庤缁?img_w 瀵归綈
+  control_rate_hz: 5      # 鎺у埗鍛戒护鍙?0Hz鍙戝竷, 鎺ㄧ悊涓庣姸鎬佹洿鏂板彲浣庨缂撳瓨
+
+models:
+  junction_lr_ckpt: "checkpoint/corridor_task/raw_data/corridor_task_junction_lr_APLIF_ADD_T4/best_model.ckpt"      # 宸﹀彸鍒ゅ畾妯″瀷
+  stage3_ckpt: "checkpoint/corridor_task/corridor_task_stage3a_APLIF_ADD_T4/best_model.ckpt"                # 涓夐樁娈垫ā鍨?
+  straight_keep_ckpt: "checkpoint/corridor/corridor_regression_dim1_rate_APLIF_ADD_T4_seq4/best_model.ckpt"            # 鐩磋绾犲亸鍥炲綊妯″瀷
+  approach_trigger_ckpt: "checkpoint/corridor_task/approach_trigger_sameenv_shortwin/best_model.ckpt"       # APPROACH 瑙﹀彂浜屽垎绫绘ā鍨?
+
+state_machine:
+  boot_steps: 6                       # 鍚姩棰勭儹姝ユ暟, 鎶戝埗棣栧抚鎶栧姩
+  stage_window_size: 7                # stage3 澶氬抚鎶曠エ绐楀彛澶у皬
+  stage_enter_turn_votes: 5           # 杩涘叆 Turn 鎵€闇€鏈€灏戠エ鏁?
+  stage_exit_turn_votes: 5            # 閫€鍑?Turn 鎵€闇€鏈€灏戠エ鏁?
+  junction_window_size: 5             # junction 宸﹀彸鎶曠エ绐楀彛澶у皬
+  junction_lock_votes: 4              # 閿佸畾 Left/Right 鎵€闇€鏈€灏戠エ鏁?
+  recover_min_steps: 4                # Recover 鏈€灏戜繚鎸佹鏁?鎸?Hz鑺傚涓嬭皟)
+  recover_blend_steps: 12             # Recover 鍒扮洿琛岄樁娈电殑铻嶅悎姝ユ暟
+  straightkeep_suppress_in_turn: true # Turn 鏈熼棿鎶戝埗 straight_keep 杈撳嚭
+
+  # ----- TURN 閫€鍑哄寮猴紙5Hz鑺傚锛?----
+  min_turn_steps: 5                   # TURN 鏈€灏忔寔缁鏁?
+  soft_exit_min_turn_steps: 6         # 杞€€鍑烘渶灏忔鏁?
+  max_turn_steps: 10                  # TURN 鍦ㄧ姸鎬佹満涓殑鏈€澶ф寔缁鏁?
+  recover_support_steps_needed: 2     # Recover 淇″彿绱纭鎵€闇€鏈夋晥鏀寔姝ユ暟(娓愬噺妯″紡)
+  turn_exit_vote_threshold: 3         # turn_votes 浣庝簬姝ゅ€兼椂, 閰嶅悎浣?omega 鍙€€鍑?TURN
+  straight_recover_omega_thresh: 0.12 # TURN 閫€鍑烘潯浠? |omega_raw| 浣庝簬姝ゅ€艰涓哄彲瀹夊叏鍒囧洖鐩磋
+  straight_recover_hold_steps: 3      # 浣?turn + 浣?omega 闇€鎸佺画鐨勬鏁版墠鍙€€鍑?TURN
+  recover_recenter_omega_thresh: 0.15 # RECOVER 鍥炲埌 STRAIGHTKEEP 鍓嶇殑鍥炴闃堝€?
+  recover_recenter_hold_steps: 2      # RECOVER 鍥炴闃堝€奸渶鎸佺画婊¤冻姝ユ暟
+
+  # ----- STRAIGHTKEEP -> APPROACH 浜嬩欢瑙﹀彂闂ㄦ帶 -----
+  straightkeep_min_steps_before_approach: 8       # STRAIGHTKEEP 淇濇寔鏈€灏忔鏁板悗鎵嶅厑璁歌Е鍙?APPROACH
+  approach_arm_turn_votes: 3                      # arm 鏉′欢瑕佹眰鐨勬渶灏?turn 绁ㄦ暟
+  approach_arm_consecutive_steps: 2               # arm 鏉′欢闇€杩炵画婊¤冻姝ユ暟
+  approach_arm_use_junction_hint: true            # 鏄惁瑕佹眰 junction hint 涓€鑷存€?
+  approach_arm_junction_consistency_steps: 2      # junction hint 杩炵画涓€鑷存鏁?
+
+  # ----- Junction 閿佸瓨寤惰繜 -----
+  min_approach_steps_before_junction_lock: 4      # APPROACH 涓?junction 鏈€鏃╅攣瀛樻鏁伴棬妲?
+  min_turn_votes_before_junction_lock: 3          # junction 閿佸瓨闇€瑕佺殑鏈€浣?turn 绁ㄦ暟
+  start_junction_hist_on_turn_signal: true        # 鍑虹幇 turn 淇″彿鍚庢墠绱 junction 鍘嗗彶
+  min_turn_votes_to_start_junction_hist: 3        # 鍚姩 junction 鍘嗗彶绱鎵€闇€鏈€灏?turn 绁ㄦ暟
+  reset_junction_hist_when_no_turn_signal: true   # APPROACH 涓旈暱鏈熸棤 turn 淇″彿鏃堕噸缃?junction 鍘嗗彶
+  allow_turn_relock_once: false                   # TURN 鏈熼棿绂佺敤涓€斿弽鍚戦噸閿?
+
+  # ----- PROVISIONAL_TURN 鎻愪氦纭 -----
+  provisional_turn_window_steps: 6                # PROVISIONAL_TURN 鏈€闀胯瀵熺獥鍙ｆ鏁?
+  provisional_turn_commit_votes: 4                # 鍏煎鏃ц鍒? 绐楀彛鍐呰揪鍒拌绁ㄦ暟鍙綔涓哄€欓€夊熀纭€
+  provisional_turn_mix_ratio: 0.35                # PROVISIONAL_TURN 鎺у埗娣峰悎姣斾緥
+  provisional_turn_min_observe_steps: 3           # 鏈€灏忚瀵熸鏁? 鏈揪鍒板墠绂佹鎻愪氦
+  provisional_turn_recent_consistency_steps: 3    # 鏈€杩戣繛缁竴鑷存鏁伴槇鍊?
+  provisional_turn_margin_votes: 2                # 涓绘柟鍚戠浉瀵规鏂瑰悜鐨勬渶灏忛鍏堢エ鏁?
+  provisional_turn_use_omega_gate: true           # 鏄惁鍚敤 omega 鏂瑰悜涓€鑷存€ч棬鎺?
+  provisional_turn_omega_sign_thresh: 0.12        # omega 绗﹀彿鍒ゅ畾闃堝€?
+  provisional_turn_require_omega_agreement: false # 鎻愪氦鏂瑰悜涓嶅己鍒惰姹備笌 omega 鏂瑰悜涓€鑷?
+
+turn_control:
+  left_omega: 0.5             # 鍥哄畾宸﹁浆瑙掗€熷害(rad/s)
+  right_omega: -0.5           # 鍥哄畾鍙宠浆瑙掗€熷害(rad/s)
+  use_fixed_turn_rate: true   # Turn 闃舵浣跨敤鍥哄畾瑙掗€熷害
+  max_turn_steps: 10          # Turn 鏈€闀挎寔缁鏁? 瀵归綈1~2绉掔湡瀹炶浆寮?
+
+straight_keep:
+  omega_clip: 0.25            # 绾犲亸瑙掗€熷害瑁佸壀闃堝€?
+  use_clip: true              # 鏄惁鍚敤瑁佸壀
+
+scheduler:
+  policy: state_conditioned_v2
+  reuse_last_outputs: true
+  stage3_probe_stride: 2
+  junction_probe_stride: 1
+  straight_keep_stride: 1
+  trigger_stride: 1
+  disable_junction_after_lock: true
+  turn_stage3_stride: 1
+  recover_stage3_stride: 1
+
+robot_control:
+  cmd_publish_hz: 5
+  use_state_based_linear_speed: true
+  linear_speed_boot: 0.0
+  linear_speed_straightkeep: 0.22
+  linear_speed_approach: 0.18
+  linear_speed_provisional_turn: 0.15
+  linear_speed_turn: 0.12
+  linear_speed_recover: 0.16
+  angular_clip: 0.20
+  publish_last_cmd_when_no_new_inference: true
+
+safety:
+  image_timeout_sec: 1.5
+  model_output_timeout_sec: 3.0
+  startup_warmup_sec: 2.5
+  publish_zero_on_timeout: true
+  publish_zero_on_missing_image: true
+  max_consecutive_errors: 8
+  stop_on_exception: true
+
+topics:
+  image_topic: /camera/color/image_raw
+  cmd_vel_topic: /cmd_vel
+  debug_topic: /nav/debug
+  state_topic: /nav/state
+
+logging:
+  save_debug_json: false      # 瀹炴満鍘熷瀷闃舵鍏抽棴纾佺洏璋冭瘯钀界洏
+  save_csv: false             # 瀹炴満鍘熷瀷闃舵鍏抽棴CSV钀界洏
+  verbose: true               # 鎺у埗鍙版墦鍗拌缁嗘棩蹇?

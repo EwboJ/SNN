@@ -111,7 +111,7 @@ safety:
   stop_on_exception: true
 
 topics:
-  image_topic: /camera/image_raw
+  image_topic: /camera/color/image_raw
   cmd_vel_topic: /cmd_vel
   debug_topic: /nav/debug
   state_topic: /nav/state
