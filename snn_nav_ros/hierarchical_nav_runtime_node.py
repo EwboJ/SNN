@@ -176,9 +176,7 @@ class HierarchicalNavRuntimeNode(Node):
         self.model_output_timeout_sec = max(
             0.01, float(self.safety_cfg.get("model_output_timeout_sec", 1.0))
         )
-        self.startup_warmup_sec = max(
-            0.0, float(self.safety_cfg.get("startup_warmup_sec", 2.5))
-        )
+        self.startup_warmup_sec = float(self.safety_cfg.get("startup_warmup_sec", 2.5))
         self.publish_zero_on_timeout = bool(
             self.safety_cfg.get("publish_zero_on_timeout", True)
         )
@@ -210,6 +208,8 @@ class HierarchicalNavRuntimeNode(Node):
         self._latest_image_receive_time: Optional[Time] = None
         self._latest_image_stamp: Optional[Time] = None
         self._image_rx_count = 0
+        self._has_received_first_image = False
+        self._first_image_logged = False
         self._last_missing_image_log_time: Optional[Time] = None
         self._missing_image_log_interval_sec = max(1.0, float(self.image_timeout_sec))
         self._bridge = CvBridge() if CvBridge is not None else None
@@ -559,6 +559,7 @@ class HierarchicalNavRuntimeNode(Node):
             header_time = Time.from_msg(msg.header.stamp)
             if header_time.nanoseconds <= 0:
                 header_time = recv_time
+            should_log_first_image = False
             with self._img_lock:
                 self._latest_image = image_rgb
                 self._latest_image_time = recv_time
@@ -566,6 +567,19 @@ class HierarchicalNavRuntimeNode(Node):
                 self._latest_image_receive_time = recv_time
                 self._latest_image_stamp = header_time
                 self._image_rx_count += 1
+                self._has_received_first_image = True
+                if not self._first_image_logged:
+                    self._first_image_logged = True
+                    should_log_first_image = True
+            if should_log_first_image:
+                self.get_logger().info(
+                    "First image received. topic=%s, header_stamp=%s, receive_time=%s"
+                    % (
+                        self.image_topic,
+                        self._format_time_stamp(header_time),
+                        self._format_time_stamp(recv_time),
+                    )
+                )
         except Exception as exc:
             self.get_logger().error("图像转换失败: %s" % str(exc))
 
@@ -642,6 +656,11 @@ class HierarchicalNavRuntimeNode(Node):
             "approach_trigger": False,
         }
         outputs = self._get_cached_outputs()
+        startup_elapsed_sec = self._age_sec(self._node_start_time, now)
+        startup_warmup_active = (
+            startup_elapsed_sec is not None
+            and startup_elapsed_sec <= self.startup_warmup_sec
+        )
 
         try:
             # 0) 先收割已完成的异步推理结果（非阻塞）
@@ -652,11 +671,55 @@ class HierarchicalNavRuntimeNode(Node):
             else:
                 self._consecutive_errors = 0
 
-            # 1) 图像超时检查
+            # 1) 启动 warmup 窗口：首帧未到时不触发 image timeout 停车
+            if startup_warmup_active:
+                with self._img_lock:
+                    has_received_first_image = bool(self._has_received_first_image)
+                if not has_received_first_image:
+                    reason = "startup_warmup_waiting_first_image"
+                    self.publish_zero_twist(reason)
+                    self._publish_state(state_now)
+                    self._publish_debug(
+                        now=now,
+                        state=state_now,
+                        locked_turn_dir=locked_now,
+                        linear_x=0.0,
+                        angular_z=0.0,
+                        outputs=outputs,
+                        run_flags=run_flags,
+                        reason=reason,
+                        image_age_ms=-1,
+                        image_received_ok=False,
+                    )
+                    return
+
+            # 2) 图像超时检查
             image_ok, image_age_ms = self._get_latest_image_status(now)
             if not image_ok:
+                with self._img_lock:
+                    has_received_first_image = bool(self._has_received_first_image)
+
+                if not has_received_first_image:
+                    reason = "waiting_first_image"
+                    self.publish_zero_twist(reason)
+                    self._publish_state(state_now)
+                    self._publish_debug(
+                        now=now,
+                        state=state_now,
+                        locked_turn_dir=locked_now,
+                        linear_x=0.0,
+                        angular_z=0.0,
+                        outputs=outputs,
+                        run_flags=run_flags,
+                        reason=reason,
+                        image_age_ms=image_age_ms,
+                        image_received_ok=False,
+                    )
+                    return
+
                 reason = "missing_image_or_timeout"
-                self._maybe_log_missing_image(now=now, image_age_ms=image_age_ms)
+                if not startup_warmup_active:
+                    self._maybe_log_missing_image(now=now, image_age_ms=image_age_ms)
                 self.publish_zero_twist(reason)
                 self._publish_state(state_now)
                 self._publish_debug(
@@ -724,17 +787,10 @@ class HierarchicalNavRuntimeNode(Node):
                 return
 
             # 4) 模型输出超时检查（按当前状态依赖）
-            debug_reason = "ok"
-            startup_elapsed_sec = self._age_sec(self._node_start_time, now)
-            in_startup_warmup = (
-                startup_elapsed_sec is not None
-                and startup_elapsed_sec <= self.startup_warmup_sec
-            )
-            if in_startup_warmup:
-                debug_reason = "startup_warmup"
+            debug_reason = "startup_warmup" if startup_warmup_active else "ok"
 
             timeout_modules = []
-            if not in_startup_warmup:
+            if not startup_warmup_active:
                 timeout_modules = self._check_model_timeout_modules(
                     state=state_now,
                     locked_turn_dir=locked_now,
@@ -1152,6 +1208,7 @@ class HierarchicalNavRuntimeNode(Node):
             latest_image_receive_time = self._latest_image_receive_time
             latest_image_stamp = self._latest_image_stamp
             image_rx_count = int(self._image_rx_count)
+            has_received_first_image = bool(self._has_received_first_image)
         with self._module_lock:
             stage3_update = self.module_cache["stage3"].last_update_time
             junction_update = self.module_cache["junction_lr"].last_update_time
@@ -1188,6 +1245,11 @@ class HierarchicalNavRuntimeNode(Node):
         straight_keep_age_ms = self._age_ms(straight_keep_update, now)
         trigger_age_ms = self._age_ms(trigger_update, now)
         tick_count = int(self._tick_count)
+        startup_elapsed_sec = self._age_sec(self._node_start_time, now)
+        startup_warmup_active = (
+            startup_elapsed_sec is not None
+            and startup_elapsed_sec <= self.startup_warmup_sec
+        )
 
         if self.debug_compact:
             # 轻量模式：仅发布核心诊断字段，降低 JSON 序列化与发布开销。
@@ -1212,6 +1274,9 @@ class HierarchicalNavRuntimeNode(Node):
                 "trigger_busy": trigger_busy,
                 "tick_count": tick_count,
                 "image_rx_count": image_rx_count,
+                "has_received_first_image": has_received_first_image,
+                "startup_warmup_active": bool(startup_warmup_active),
+                "startup_warmup_sec": float(self.startup_warmup_sec),
                 "stage3_last_run_step": stage3_last_run_step,
                 "junction_last_run_step": junction_last_run_step,
                 "straight_keep_last_run_step": straight_keep_last_run_step,
@@ -1247,6 +1312,9 @@ class HierarchicalNavRuntimeNode(Node):
                 "trigger_age_ms": trigger_age_ms,
                 "tick_count": tick_count,
                 "image_rx_count": image_rx_count,
+                "has_received_first_image": has_received_first_image,
+                "startup_warmup_active": bool(startup_warmup_active),
+                "startup_warmup_sec": float(self.startup_warmup_sec),
                 "stage3_last_run_step": stage3_last_run_step,
                 "junction_last_run_step": junction_last_run_step,
                 "straight_keep_last_run_step": straight_keep_last_run_step,
