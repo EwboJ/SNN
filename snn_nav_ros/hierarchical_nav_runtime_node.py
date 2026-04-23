@@ -137,6 +137,15 @@ class HierarchicalNavRuntimeNode(Node):
         self.angular_clip = max(
             0.0, float(self.robot_control_cfg.get("angular_clip", 0.25))
         )
+        self.straight_keep_bias = float(
+            self.robot_control_cfg.get("straight_keep_bias", 0.0)
+        )
+        self.straight_keep_scale = max(
+            0.0, float(self.robot_control_cfg.get("straight_keep_scale", 1.0))
+        )
+        self.straight_keep_deadband = max(
+            0.0, float(self.robot_control_cfg.get("straight_keep_deadband", 0.0))
+        )
 
         self.linear_speed_map: Dict[str, float] = {
             "BOOT": float(self.robot_control_cfg.get("linear_speed_boot", 0.0)),
@@ -672,35 +681,14 @@ class HierarchicalNavRuntimeNode(Node):
                 self._consecutive_errors = 0
 
             # 1) 启动 warmup 窗口：首帧未到时不触发 image timeout 停车
-            if startup_warmup_active:
-                with self._img_lock:
-                    has_received_first_image = bool(self._has_received_first_image)
-                if not has_received_first_image:
-                    reason = "startup_warmup_waiting_first_image"
-                    self.publish_zero_twist(reason)
-                    self._publish_state(state_now)
-                    self._publish_debug(
-                        now=now,
-                        state=state_now,
-                        locked_turn_dir=locked_now,
-                        linear_x=0.0,
-                        angular_z=0.0,
-                        outputs=outputs,
-                        run_flags=run_flags,
-                        reason=reason,
-                        image_age_ms=-1,
-                        image_received_ok=False,
-                    )
-                    return
-
             # 2) 图像超时检查
             image_ok, image_age_ms = self._get_latest_image_status(now)
             if not image_ok:
                 with self._img_lock:
                     has_received_first_image = bool(self._has_received_first_image)
 
-                if not has_received_first_image:
-                    reason = "waiting_first_image"
+                if startup_warmup_active and (not has_received_first_image):
+                    reason = "startup_warmup_waiting_first_image"
                     self.publish_zero_twist(reason)
                     self._publish_state(state_now)
                     self._publish_debug(
@@ -718,8 +706,7 @@ class HierarchicalNavRuntimeNode(Node):
                     return
 
                 reason = "missing_image_or_timeout"
-                if not startup_warmup_active:
-                    self._maybe_log_missing_image(now=now, image_age_ms=image_age_ms)
+                self._maybe_log_missing_image(now=now, image_age_ms=image_age_ms)
                 self.publish_zero_twist(reason)
                 self._publish_state(state_now)
                 self._publish_debug(
@@ -1151,7 +1138,15 @@ class HierarchicalNavRuntimeNode(Node):
     ) -> Tuple[float, float]:
         linear_x = float(self.linear_speed_map.get(state, 0.0))
 
-        if state in ("STRAIGHTKEEP", "APPROACH", "RECOVER"):
+        if state == "STRAIGHTKEEP":
+            # STRAIGHTKEEP：按 bias->scale->clip->deadband 顺序处理，抑制直段稳定偏置
+            raw_omega = float(omega_cmd_final)
+            bias_corrected_omega = raw_omega - self.straight_keep_bias
+            scaled_omega = self.straight_keep_scale * bias_corrected_omega
+            angular_z = self._clip(scaled_omega, -self.angular_clip, self.angular_clip)
+            if abs(angular_z) < self.straight_keep_deadband:
+                angular_z = 0.0
+        elif state in ("APPROACH", "RECOVER"):
             angular_z = self._clip(omega_cmd_final, -self.angular_clip, self.angular_clip)
         elif state == "TURN":
             if locked_turn_dir == "Left":
@@ -1277,6 +1272,9 @@ class HierarchicalNavRuntimeNode(Node):
                 "has_received_first_image": has_received_first_image,
                 "startup_warmup_active": bool(startup_warmup_active),
                 "startup_warmup_sec": float(self.startup_warmup_sec),
+                "straight_keep_bias": float(self.straight_keep_bias),
+                "straight_keep_scale": float(self.straight_keep_scale),
+                "straight_keep_deadband": float(self.straight_keep_deadband),
                 "stage3_last_run_step": stage3_last_run_step,
                 "junction_last_run_step": junction_last_run_step,
                 "straight_keep_last_run_step": straight_keep_last_run_step,
@@ -1315,6 +1313,9 @@ class HierarchicalNavRuntimeNode(Node):
                 "has_received_first_image": has_received_first_image,
                 "startup_warmup_active": bool(startup_warmup_active),
                 "startup_warmup_sec": float(self.startup_warmup_sec),
+                "straight_keep_bias": float(self.straight_keep_bias),
+                "straight_keep_scale": float(self.straight_keep_scale),
+                "straight_keep_deadband": float(self.straight_keep_deadband),
                 "stage3_last_run_step": stage3_last_run_step,
                 "junction_last_run_step": junction_last_run_step,
                 "straight_keep_last_run_step": straight_keep_last_run_step,
