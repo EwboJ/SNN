@@ -80,15 +80,16 @@ straight_keep:
   use_clip: true              # 鏄惁鍚敤瑁佸壀
 
 scheduler:
+  # STRAIGHTKEEP 悬空中心调度降载实验：目标是将 stale_ratio 从 84% 降到 40% 以下。
   policy: state_conditioned_v2
   reuse_last_outputs: true
-  stage3_probe_stride: 2
-  junction_probe_stride: 1
   straight_keep_stride: 1
-  trigger_stride: 1
-  disable_junction_after_lock: true
+  trigger_stride: 4
+  stage3_probe_stride: 10
+  junction_probe_stride: 1
   turn_stage3_stride: 1
-  recover_stage3_stride: 1
+  recover_stage3_stride: 2
+  disable_junction_after_lock: true
 
 robot_control:
   cmd_publish_hz: 5
@@ -99,10 +100,14 @@ robot_control:
   linear_speed_provisional_turn: 0.15
   linear_speed_turn: 0.12
   linear_speed_recover: 0.08
-  angular_clip: 0.10
-  straight_keep_bias: -0.12
+  angular_clip: 0.08
+  straight_keep_bias: -0.15
   straight_keep_scale: 0.6
-  straight_keep_deadband: 0.03
+  straight_keep_deadband: 0.035
+  max_omega_hold_sec: 0.4
+  omega_stale_decay: 0.5
+  zero_omega_on_stale_inference: true
+  omega_rate_limit_per_step: 0.06
   publish_last_cmd_when_no_new_inference: true
 
 safety:
