@@ -89,7 +89,7 @@ scheduler:
   junction_probe_stride: 1
   turn_stage3_stride: 1
   recover_stage3_stride: 2
-  # infer_max_workers=1 用于验证多模型 GPU 并发是否导致 straight_keep 输出 age 增大。
+  # infer_max_workers=2 用于验证多模型 GPU 并发是否导致 straight_keep 输出 age 增大。
   infer_max_workers: 2
   disable_junction_after_lock: true
 
@@ -110,6 +110,14 @@ robot_control:
   omega_stale_decay: 0.5
   zero_omega_on_stale_inference: true
   omega_rate_limit_per_step: 0.06
+  # 本配置用于验证 slow-SNN 模型条件下的安全线速度保持策略。
+  # 角速度过期时仍清零，线速度仅在 STRAIGHTKEEP 且图像和 trigger 安全时低速保持。
+  allow_linear_hold_on_stale_straight: true
+  linear_hold_speed_on_stale: 0.04
+  max_linear_hold_sec: 1.2
+  linear_hold_require_trigger_straight: true
+  linear_hold_block_stage3_turn: true
+  linear_hold_max_image_age_sec: 0.5
   publish_last_cmd_when_no_new_inference: true
 
 safety:

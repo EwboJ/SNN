@@ -165,6 +165,25 @@ class HierarchicalNavRuntimeNode(Node):
         self.omega_rate_limit_per_step = max(
             0.0, float(self.robot_control_cfg.get("omega_rate_limit_per_step", 0.06))
         )
+        self.allow_linear_hold_on_stale_straight = bool(
+            self.robot_control_cfg.get("allow_linear_hold_on_stale_straight", True)
+        )
+        self.linear_hold_speed_on_stale = max(
+            0.0, float(self.robot_control_cfg.get("linear_hold_speed_on_stale", 0.04))
+        )
+        self.max_linear_hold_sec = max(
+            0.0, float(self.robot_control_cfg.get("max_linear_hold_sec", 1.2))
+        )
+        self.linear_hold_require_trigger_straight = bool(
+            self.robot_control_cfg.get("linear_hold_require_trigger_straight", True)
+        )
+        self.linear_hold_block_stage3_turn = bool(
+            self.robot_control_cfg.get("linear_hold_block_stage3_turn", True)
+        )
+        self.linear_hold_max_image_age_sec = max(
+            0.0,
+            float(self.robot_control_cfg.get("linear_hold_max_image_age_sec", 0.5)),
+        )
 
         self.linear_speed_map: Dict[str, float] = {
             "BOOT": float(self.robot_control_cfg.get("linear_speed_boot", 0.0)),
@@ -427,6 +446,12 @@ class HierarchicalNavRuntimeNode(Node):
             "stale_omega_after": None,
             "max_omega_hold_sec": float(self.max_omega_hold_sec),
             "omega_stale_decay": float(self.omega_stale_decay),
+            "stale_linear_hold_active": False,
+            "stale_linear_hold_allowed": False,
+            "stale_linear_hold_reason": "",
+            "linear_hold_speed_on_stale": float(self.linear_hold_speed_on_stale),
+            "max_linear_hold_sec": float(self.max_linear_hold_sec),
+            "linear_hold_max_image_age_sec": float(self.linear_hold_max_image_age_sec),
         }
 
     def _apply_stale_omega_policy(
@@ -436,6 +461,10 @@ class HierarchicalNavRuntimeNode(Node):
         state: str,
         linear_x: float,
         angular_z: float,
+        reason: str,
+        image_age_ms: int,
+        trigger_pred: str,
+        stage3_pred: str,
         completed_modules: Optional[List[str]],
     ) -> Tuple[float, float, Optional[str], Dict[str, Any], bool, bool]:
         cmd_new, cmd_cached = self._compute_cmd_origin_flags(
@@ -470,8 +499,62 @@ class HierarchicalNavRuntimeNode(Node):
         adjusted_linear_x = float(linear_x)
 
         if hold_exceeded:
-            adjusted_linear_x = 0.0
-            if self.zero_omega_on_stale_inference:
+            hold_allowed = False
+            hold_reason = "not_straightkeep"
+            straight_keep_age_sec = (
+                float(latest_inference_age_ms) / 1000.0
+                if int(latest_inference_age_ms) >= 0
+                else None
+            )
+            image_age_sec = (
+                float(image_age_ms) / 1000.0 if int(image_age_ms) >= 0 else None
+            )
+
+            if not self.allow_linear_hold_on_stale_straight:
+                hold_reason = "disabled"
+            elif state != "STRAIGHTKEEP":
+                hold_reason = "state_not_straightkeep"
+            elif str(reason or "") != "ok":
+                hold_reason = "reason_not_ok"
+            elif image_age_sec is None:
+                hold_reason = "image_age_unknown"
+            elif image_age_sec > float(self.linear_hold_max_image_age_sec):
+                hold_reason = "image_too_old"
+            elif straight_keep_age_sec is None:
+                hold_reason = "straight_keep_age_unknown"
+            elif straight_keep_age_sec > float(self.max_linear_hold_sec):
+                hold_reason = "straight_keep_too_old"
+            elif (
+                self.linear_hold_require_trigger_straight
+                and str(trigger_pred or "") != "Straight"
+            ):
+                hold_reason = "trigger_not_straight"
+            elif self.linear_hold_block_stage3_turn and str(stage3_pred or "") == "Turn":
+                hold_reason = "stage3_turn"
+            else:
+                hold_allowed = True
+                hold_reason = "ok"
+
+            stale_diag["stale_linear_hold_allowed"] = bool(hold_allowed)
+            stale_diag["stale_linear_hold_reason"] = str(hold_reason)
+
+            if state == "STRAIGHTKEEP":
+                adjusted_omega = 0.0
+                if hold_allowed:
+                    adjusted_linear_x = min(
+                        float(linear_x), float(self.linear_hold_speed_on_stale)
+                    )
+                    source_override = "stale_straight_keep_linear_hold"
+                    stale_diag["stale_linear_hold_active"] = True
+                else:
+                    adjusted_linear_x = 0.0
+                    source_override = (
+                        "stale_cache_zero"
+                        if cmd_cached and int(latest_inference_age_ms) >= 0
+                        else "stale_straight_keep_zero"
+                    )
+            elif self.zero_omega_on_stale_inference:
+                adjusted_linear_x = 0.0
                 adjusted_omega = 0.0
                 source_override = (
                     "stale_cache_zero"
@@ -479,6 +562,7 @@ class HierarchicalNavRuntimeNode(Node):
                     else "stale_omega_zero"
                 )
             else:
+                adjusted_linear_x = 0.0
                 target_omega = last_angular_z * float(self.omega_stale_decay)
                 clipped_omega = self._clip(
                     target_omega, -self.angular_clip, self.angular_clip
@@ -745,6 +829,12 @@ class HierarchicalNavRuntimeNode(Node):
             "stale_omega_after": None,
             "max_omega_hold_sec": float(self.max_omega_hold_sec),
             "omega_stale_decay": float(self.omega_stale_decay),
+            "stale_linear_hold_active": False,
+            "stale_linear_hold_allowed": False,
+            "stale_linear_hold_reason": "",
+            "linear_hold_speed_on_stale": float(self.linear_hold_speed_on_stale),
+            "max_linear_hold_sec": float(self.max_linear_hold_sec),
+            "linear_hold_max_image_age_sec": float(self.linear_hold_max_image_age_sec),
         }
         if isinstance(straight_keep_trace, dict):
             diag.update(straight_keep_trace)
@@ -1388,6 +1478,10 @@ class HierarchicalNavRuntimeNode(Node):
                 omega_cmd_final=omega_sm,
                 straight_keep_raw_omega=straight_keep_raw_omega,
             )
+            trigger_pred_for_hold = self._parse_trigger_pred(
+                outputs.get("approach_trigger", {})
+            )
+            stage3_pred_for_hold = self._parse_stage3_pred(outputs.get("stage3", {}))
             (
                 linear_x,
                 angular_z,
@@ -1400,6 +1494,10 @@ class HierarchicalNavRuntimeNode(Node):
                 state=state_new,
                 linear_x=linear_x,
                 angular_z=angular_z,
+                reason=debug_reason,
+                image_age_ms=image_age_ms,
+                trigger_pred=trigger_pred_for_hold,
+                stage3_pred=stage3_pred_for_hold,
                 completed_modules=completed_modules,
             )
             cmd_diag = self._build_cmd_diag(
@@ -1989,6 +2087,13 @@ class HierarchicalNavRuntimeNode(Node):
         stale_omega_suppressed = bool(cmd_diag.get("stale_omega_suppressed", False))
         stale_omega_before = cmd_diag.get("stale_omega_before", None)
         stale_omega_after = cmd_diag.get("stale_omega_after", None)
+        stale_linear_hold_active = bool(
+            cmd_diag.get("stale_linear_hold_active", False)
+        )
+        stale_linear_hold_allowed = bool(
+            cmd_diag.get("stale_linear_hold_allowed", False)
+        )
+        stale_linear_hold_reason = str(cmd_diag.get("stale_linear_hold_reason", ""))
         max_omega_hold_sec = self._safe_float(
             cmd_diag.get("max_omega_hold_sec", self.max_omega_hold_sec),
             self.max_omega_hold_sec,
@@ -1996,6 +2101,22 @@ class HierarchicalNavRuntimeNode(Node):
         omega_stale_decay = self._safe_float(
             cmd_diag.get("omega_stale_decay", self.omega_stale_decay),
             self.omega_stale_decay,
+        )
+        linear_hold_speed_on_stale = self._safe_float(
+            cmd_diag.get(
+                "linear_hold_speed_on_stale", self.linear_hold_speed_on_stale
+            ),
+            self.linear_hold_speed_on_stale,
+        )
+        max_linear_hold_sec = self._safe_float(
+            cmd_diag.get("max_linear_hold_sec", self.max_linear_hold_sec),
+            self.max_linear_hold_sec,
+        )
+        linear_hold_max_image_age_sec = self._safe_float(
+            cmd_diag.get(
+                "linear_hold_max_image_age_sec", self.linear_hold_max_image_age_sec
+            ),
+            self.linear_hold_max_image_age_sec,
         )
 
         debug_payload: Dict[str, Any] = {
@@ -2071,8 +2192,14 @@ class HierarchicalNavRuntimeNode(Node):
             "stale_omega_suppressed": bool(stale_omega_suppressed),
             "stale_omega_before": stale_omega_before,
             "stale_omega_after": stale_omega_after,
+            "stale_linear_hold_active": bool(stale_linear_hold_active),
+            "stale_linear_hold_allowed": bool(stale_linear_hold_allowed),
+            "stale_linear_hold_reason": stale_linear_hold_reason,
             "max_omega_hold_sec": float(max_omega_hold_sec),
             "omega_stale_decay": float(omega_stale_decay),
+            "linear_hold_speed_on_stale": float(linear_hold_speed_on_stale),
+            "max_linear_hold_sec": float(max_linear_hold_sec),
+            "linear_hold_max_image_age_sec": float(linear_hold_max_image_age_sec),
             "stage3_last_run_step": stage3_last_run_step,
             "junction_last_run_step": junction_last_run_step,
             "straight_keep_last_run_step": straight_keep_last_run_step,
