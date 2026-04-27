@@ -89,6 +89,8 @@ scheduler:
   junction_probe_stride: 1
   turn_stage3_stride: 1
   recover_stage3_stride: 2
+  # infer_max_workers=1 用于验证多模型 GPU 并发是否导致 straight_keep 输出 age 增大。
+  infer_max_workers: 1
   disable_junction_after_lock: true
 
 robot_control:

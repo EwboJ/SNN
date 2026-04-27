@@ -201,6 +201,10 @@ class HierarchicalNavRuntimeNode(Node):
         self.recover_stage3_stride = max(
             1, int(self.scheduler_cfg.get("recover_stage3_stride", 2))
         )
+        infer_max_workers_raw = self.scheduler_cfg.get("infer_max_workers", None)
+        if infer_max_workers_raw is None:
+            infer_max_workers_raw = self.system_cfg.get("infer_max_workers", 1)
+        self.infer_max_workers = max(1, int(infer_max_workers_raw))
 
         self.image_timeout_sec = max(
             0.01, float(self.safety_cfg.get("image_timeout_sec", 1.0))
@@ -254,7 +258,7 @@ class HierarchicalNavRuntimeNode(Node):
         )
         self._module_lock = Lock()
         self._infer_executor = ThreadPoolExecutor(
-            max_workers=len(self._module_names),
+            max_workers=self.infer_max_workers,
             thread_name_prefix="hier_nav_infer",
         )
         self._image_cb_group = ReentrantCallbackGroup()
@@ -318,7 +322,7 @@ class HierarchicalNavRuntimeNode(Node):
         self.get_logger().info(
             "HierarchicalNavRuntimeNode started. runtime_build_tag=%s, runtime_file=%s, "
             "config_path=%s, image_topic=%s, cmd_vel_topic=%s, state_topic=%s, "
-            "debug_topic=%s, hz=%.2f"
+            "debug_topic=%s, hz=%.2f, infer_max_workers=%d"
             % (
                 self.runtime_build_tag,
                 self.runtime_file,
@@ -328,6 +332,7 @@ class HierarchicalNavRuntimeNode(Node):
                 self.state_topic,
                 self.debug_topic,
                 self.cmd_publish_hz,
+                self.infer_max_workers,
             )
         )
         self.get_logger().info(
@@ -1968,6 +1973,7 @@ class HierarchicalNavRuntimeNode(Node):
             "config_path": str(self.config_path),
             "cmd_vel_topic": str(self.cmd_vel_topic),
             "debug_schema_version": 2,
+            "infer_max_workers": int(self.infer_max_workers),
             "state": state,
             "nav_state": nav_state,
             "prev_nav_state": prev_nav_state,
