@@ -57,6 +57,8 @@ class HierarchicalNavRuntimeNode(Node):
 
     def __init__(self) -> None:
         super().__init__("hierarchical_nav_runtime")
+        self.runtime_build_tag = "v1h_recenter_debug_2026_04"
+        self.runtime_file = os.path.abspath(__file__)
 
         # ===== 1) 读取配置路径参数并加载 YAML =====
         self.repo_root: Optional[str] = self._detect_repo_root(config_path=None)
@@ -305,9 +307,12 @@ class HierarchicalNavRuntimeNode(Node):
             )
 
         self.get_logger().info(
-            "HierarchicalNavRuntimeNode started. config=%s, image_topic=%s, cmd_vel_topic=%s, "
-            "state_topic=%s, debug_topic=%s, hz=%.2f"
+            "HierarchicalNavRuntimeNode started. runtime_build_tag=%s, runtime_file=%s, "
+            "config_path=%s, image_topic=%s, cmd_vel_topic=%s, state_topic=%s, "
+            "debug_topic=%s, hz=%.2f"
             % (
+                self.runtime_build_tag,
+                self.runtime_file,
                 self.config_path,
                 self.image_topic,
                 self.cmd_vel_topic,
@@ -1949,6 +1954,11 @@ class HierarchicalNavRuntimeNode(Node):
         )
 
         debug_payload: Dict[str, Any] = {
+            "runtime_build_tag": str(self.runtime_build_tag),
+            "runtime_file": str(self.runtime_file),
+            "config_path": str(self.config_path),
+            "cmd_vel_topic": str(self.cmd_vel_topic),
+            "debug_schema_version": 2,
             "state": state,
             "nav_state": nav_state,
             "prev_nav_state": prev_nav_state,
