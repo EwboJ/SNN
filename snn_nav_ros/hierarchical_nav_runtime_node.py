@@ -140,11 +140,23 @@ class HierarchicalNavRuntimeNode(Node):
         self.straight_keep_bias = float(
             self.robot_control_cfg.get("straight_keep_bias", 0.0)
         )
-        self.straight_keep_scale = max(
-            0.0, float(self.robot_control_cfg.get("straight_keep_scale", 1.0))
+        self.straight_keep_scale = float(
+            self.robot_control_cfg.get("straight_keep_scale", 1.0)
         )
         self.straight_keep_deadband = max(
             0.0, float(self.robot_control_cfg.get("straight_keep_deadband", 0.0))
+        )
+        self.max_omega_hold_sec = max(
+            0.0, float(self.robot_control_cfg.get("max_omega_hold_sec", 0.4))
+        )
+        self.omega_stale_decay = self._clip(
+            float(self.robot_control_cfg.get("omega_stale_decay", 0.5)), 0.0, 1.0
+        )
+        self.zero_omega_on_stale_inference = bool(
+            self.robot_control_cfg.get("zero_omega_on_stale_inference", True)
+        )
+        self.omega_rate_limit_per_step = max(
+            0.0, float(self.robot_control_cfg.get("omega_rate_limit_per_step", 0.06))
         )
 
         self.linear_speed_map: Dict[str, float] = {
@@ -272,6 +284,14 @@ class HierarchicalNavRuntimeNode(Node):
         self._tick_count = 0
         self._consecutive_errors = 0
         self._last_cmd = Twist()
+        self._last_angular_z = 0.0
+        self._last_angular_cmd_valid = False
+        self._debug_last_nav_state: Optional[str] = None
+        self._debug_state_step_count = 0
+        self._debug_turn_step_count = 0
+        self._debug_recover_step_count = 0
+        self._debug_last_turn_dir: Optional[str] = None
+        self._debug_last_turn_sign: Optional[int] = None
         self.control_timer = self.create_timer(
             1.0 / self.cmd_publish_hz,
             self._control_tick,
@@ -310,6 +330,403 @@ class HierarchicalNavRuntimeNode(Node):
                 self._topic_source["debug_topic"],
             )
         )
+
+    @staticmethod
+    def _sign_of(v: float, eps: float = 1e-9) -> int:
+        if float(v) > float(eps):
+            return 1
+        if float(v) < -float(eps):
+            return -1
+        return 0
+
+    @staticmethod
+    def _turn_dir_to_sign(turn_dir: Optional[str]) -> Optional[int]:
+        if turn_dir == "Left":
+            return 1
+        if turn_dir == "Right":
+            return -1
+        return None
+
+    @staticmethod
+    def _sign_to_turn_dir(sign: Optional[int]) -> Optional[str]:
+        if sign is None:
+            return None
+        if int(sign) > 0:
+            return "Left"
+        if int(sign) < 0:
+            return "Right"
+        return None
+
+    @staticmethod
+    def _is_model_omega_state(state: str) -> bool:
+        return state in ("STRAIGHTKEEP", "APPROACH", "PROVISIONAL_TURN", "RECOVER")
+
+    def _stale_cache_age_threshold_ms(self) -> int:
+        if self.cmd_publish_hz <= 1e-6:
+            return 200
+        return max(200, int((2.0 / float(self.cmd_publish_hz)) * 1000.0))
+
+    def _get_latest_inference_age_ms(self, now: Time) -> int:
+        with self._module_lock:
+            update_times = [
+                self.module_cache[module_name].last_update_time
+                for module_name in self._module_names
+            ]
+        valid_times = [t for t in update_times if t is not None]
+        if not valid_times:
+            return -1
+        latest_time = max(valid_times, key=lambda t: int(t.nanoseconds))
+        return int(self._age_ms(latest_time, now))
+
+    def _get_cmd_inference_age_ms(self, state: str, now: Time) -> int:
+        if self._is_model_omega_state(state):
+            with self._module_lock:
+                last_update_time = self.module_cache["straight_keep"].last_update_time
+            return int(self._age_ms(last_update_time, now))
+        return self._get_latest_inference_age_ms(now)
+
+    def _rate_limit_omega(self, target: float, previous: float) -> float:
+        limit = float(self.omega_rate_limit_per_step)
+        if limit <= 0.0:
+            return float(target)
+        delta = float(target) - float(previous)
+        if delta > limit:
+            return float(previous) + limit
+        if delta < -limit:
+            return float(previous) - limit
+        return float(target)
+
+    def _empty_stale_omega_diag(self) -> Dict[str, Any]:
+        return {
+            "stale_omega_suppressed": False,
+            "stale_omega_before": None,
+            "stale_omega_after": None,
+            "max_omega_hold_sec": float(self.max_omega_hold_sec),
+            "omega_stale_decay": float(self.omega_stale_decay),
+        }
+
+    def _apply_stale_omega_policy(
+        self,
+        *,
+        now: Time,
+        state: str,
+        linear_x: float,
+        angular_z: float,
+        completed_modules: Optional[List[str]],
+    ) -> Tuple[float, float, Optional[str], Dict[str, Any], bool, bool]:
+        cmd_new, cmd_cached = self._compute_cmd_origin_flags(
+            state=state,
+            completed_modules=completed_modules,
+            cmd_from_new_inference=None,
+            cmd_from_cached_output=None,
+        )
+        stale_diag = self._empty_stale_omega_diag()
+        if (not self._is_model_omega_state(state)) or cmd_new:
+            return (
+                float(linear_x),
+                float(angular_z),
+                None,
+                stale_diag,
+                bool(cmd_new),
+                bool(cmd_cached),
+            )
+
+        latest_inference_age_ms = self._get_cmd_inference_age_ms(state, now)
+        stale_diag["stale_omega_suppressed"] = True
+        stale_diag["stale_omega_before"] = float(angular_z)
+
+        last_angular_z = (
+            float(self._last_angular_z) if self._last_angular_cmd_valid else 0.0
+        )
+        hold_exceeded = (
+            int(latest_inference_age_ms) < 0
+            or (float(latest_inference_age_ms) / 1000.0) > float(self.max_omega_hold_sec)
+        )
+        source_override: Optional[str] = None
+        adjusted_linear_x = float(linear_x)
+
+        if hold_exceeded:
+            adjusted_linear_x = 0.0
+            if self.zero_omega_on_stale_inference:
+                adjusted_omega = 0.0
+                source_override = (
+                    "stale_cache_zero"
+                    if cmd_cached and int(latest_inference_age_ms) >= 0
+                    else "stale_omega_zero"
+                )
+            else:
+                target_omega = last_angular_z * float(self.omega_stale_decay)
+                clipped_omega = self._clip(
+                    target_omega, -self.angular_clip, self.angular_clip
+                )
+                adjusted_omega = self._rate_limit_omega(clipped_omega, last_angular_z)
+                source_override = "stale_cache_decay" if cmd_cached else "stale_omega_decay"
+        else:
+            target_omega = last_angular_z * float(self.omega_stale_decay)
+            clipped_omega = self._clip(target_omega, -self.angular_clip, self.angular_clip)
+            adjusted_omega = self._rate_limit_omega(clipped_omega, last_angular_z)
+            source_override = "stale_cache_decay" if cmd_cached else "stale_omega_decay"
+
+        if abs(adjusted_omega) < 1e-9:
+            adjusted_omega = 0.0
+        stale_diag["stale_omega_after"] = float(adjusted_omega)
+        return (
+            float(adjusted_linear_x),
+            float(adjusted_omega),
+            source_override,
+            stale_diag,
+            bool(cmd_new),
+            bool(cmd_cached),
+        )
+
+    def _compute_cmd_origin_flags(
+        self,
+        *,
+        state: str,
+        completed_modules: Optional[List[str]],
+        cmd_from_new_inference: Optional[bool],
+        cmd_from_cached_output: Optional[bool],
+    ) -> Tuple[bool, bool]:
+        if cmd_from_new_inference is not None and cmd_from_cached_output is not None:
+            return bool(cmd_from_new_inference), bool(cmd_from_cached_output)
+
+        inferred_new = False
+        inferred_cached = False
+        if self._is_model_omega_state(state):
+            completed = set(completed_modules or [])
+            inferred_new = "straight_keep" in completed
+            inferred_cached = not inferred_new
+
+        if cmd_from_new_inference is not None:
+            inferred_new = bool(cmd_from_new_inference)
+        if cmd_from_cached_output is not None:
+            inferred_cached = bool(cmd_from_cached_output)
+        return inferred_new, inferred_cached
+
+    def _resolve_omega_source(
+        self,
+        *,
+        state: str,
+        reason: str,
+        image_age_ms: int,
+        latest_inference_age_ms: int,
+        cmd_from_cached_output: bool,
+        source_override: Optional[str] = None,
+    ) -> str:
+        if source_override:
+            return str(source_override)
+
+        reason_s = str(reason or "")
+        if reason_s.startswith("model_output_timeout"):
+            return "timeout_zero"
+        if reason_s in (
+            "missing_image",
+            "missing_image_or_timeout",
+            "startup_warmup_waiting_first_image",
+        ):
+            if int(image_age_ms) >= 0 and (
+                float(image_age_ms) / 1000.0
+            ) > float(self.image_timeout_sec):
+                return "timeout_zero"
+            return "missing_image_zero"
+        if reason_s in ("exception", "control_tick_exception", "too_many_consecutive_errors"):
+            return "exception_zero"
+
+        if state == "BOOT":
+            return "boot_zero"
+        if state == "TURN":
+            return "turn_fixed"
+        if state == "RECOVER":
+            base_source = "recover_blend"
+        elif state in ("STRAIGHTKEEP", "APPROACH", "PROVISIONAL_TURN"):
+            base_source = "straight_keep"
+        else:
+            base_source = "boot_zero"
+
+        if (
+            bool(cmd_from_cached_output)
+            and int(latest_inference_age_ms) >= 0
+            and int(latest_inference_age_ms) >= self._stale_cache_age_threshold_ms()
+        ):
+            return "stale_cache"
+        return base_source
+
+    def _empty_straight_keep_trace(self) -> Dict[str, Any]:
+        trace: Dict[str, Any] = {
+            "straight_keep_raw_omega": None,
+            "straight_keep_bias": float(self.straight_keep_bias),
+            "straight_keep_scale": float(self.straight_keep_scale),
+            "straight_keep_deadband": float(self.straight_keep_deadband),
+            "straight_keep_after_bias": None,
+            "straight_keep_after_scale": None,
+            "straight_keep_after_deadband": None,
+            "straight_keep_after_clip": None,
+            "straight_keep_final_omega": None,
+        }
+        return trace
+
+    def _calibrate_straight_keep_omega(
+        self, raw_omega: float
+    ) -> Tuple[float, Dict[str, Any]]:
+        trace = self._empty_straight_keep_trace()
+        raw_omega = float(raw_omega)
+        after_bias = raw_omega + float(self.straight_keep_bias)
+        after_scale = after_bias * float(self.straight_keep_scale)
+        after_deadband = (
+            0.0
+            if abs(after_scale) < float(self.straight_keep_deadband)
+            else float(after_scale)
+        )
+        after_clip = self._clip(
+            after_deadband, -float(self.angular_clip), float(self.angular_clip)
+        )
+        previous_omega = (
+            float(self._last_angular_z) if self._last_angular_cmd_valid else 0.0
+        )
+        final_omega = self._rate_limit_omega(after_clip, previous_omega)
+        trace.update(
+            {
+                "straight_keep_raw_omega": float(raw_omega),
+                "straight_keep_after_bias": float(after_bias),
+                "straight_keep_after_scale": float(after_scale),
+                "straight_keep_after_deadband": float(after_deadband),
+                "straight_keep_after_clip": float(after_clip),
+                "straight_keep_final_omega": float(final_omega),
+            }
+        )
+        return float(final_omega), trace
+
+    def _recover_same_direction_suppressed_omega(
+        self, *, omega: float, locked_turn_dir: Optional[str]
+    ) -> float:
+        omega_sign = self._sign_of(float(omega))
+        if omega_sign == 0:
+            return 0.0
+        turn_sign = self._turn_dir_to_sign(locked_turn_dir)
+        if turn_sign not in (-1, 1):
+            turn_sign = (
+                int(self._debug_last_turn_sign)
+                if self._debug_last_turn_sign in (-1, 1)
+                else None
+            )
+        if turn_sign in (-1, 1) and omega_sign == int(turn_sign):
+            return 0.0
+        return float(omega)
+
+    def _build_cmd_diag(
+        self,
+        *,
+        now: Time,
+        state: str,
+        locked_turn_dir: Optional[str],
+        linear_x: float,
+        angular_z: float,
+        reason: str,
+        image_age_ms: int,
+        omega_cmd_final: Optional[float] = None,
+        straight_keep_trace: Optional[Dict[str, Any]] = None,
+        completed_modules: Optional[List[str]] = None,
+        source_override: Optional[str] = None,
+        cmd_from_new_inference: Optional[bool] = None,
+        cmd_from_cached_output: Optional[bool] = None,
+        reused_last_cmd: bool = False,
+    ) -> Dict[str, Any]:
+        prev_nav_state = self._debug_last_nav_state
+        if prev_nav_state == state:
+            self._debug_state_step_count += 1
+        else:
+            self._debug_state_step_count = 1
+
+        if state == "TURN":
+            if prev_nav_state == "TURN":
+                self._debug_turn_step_count += 1
+            else:
+                self._debug_turn_step_count = 1
+        else:
+            self._debug_turn_step_count = 0
+
+        if state == "RECOVER":
+            if prev_nav_state == "RECOVER":
+                self._debug_recover_step_count += 1
+            else:
+                self._debug_recover_step_count = 1
+        else:
+            self._debug_recover_step_count = 0
+
+        state_step_count = int(self._debug_state_step_count)
+        turn_step_count = int(self._debug_turn_step_count) if state == "TURN" else -1
+        recover_step_count = int(self._debug_recover_step_count) if state == "RECOVER" else -1
+        state_step_sm = getattr(self.state_machine, "state_step", None)
+        if isinstance(state_step_sm, int) and state_step_sm >= 0:
+            state_step_count = int(state_step_sm)
+            if state == "TURN":
+                turn_step_count = int(state_step_sm)
+            if state == "RECOVER":
+                recover_step_count = int(state_step_sm)
+        self._debug_last_nav_state = state
+
+        last_turn_sign_before = self._debug_last_turn_sign
+        omega_sign = self._sign_of(float(angular_z))
+        omega_same_sign_as_last_turn: Optional[bool] = None
+        if last_turn_sign_before in (-1, 1) and omega_sign != 0:
+            omega_same_sign_as_last_turn = bool(omega_sign == int(last_turn_sign_before))
+
+        locked_sign = self._turn_dir_to_sign(locked_turn_dir)
+        if locked_sign in (-1, 1):
+            self._debug_last_turn_dir = str(locked_turn_dir)
+            self._debug_last_turn_sign = int(locked_sign)
+        elif state == "TURN" and omega_sign != 0:
+            self._debug_last_turn_sign = int(omega_sign)
+            self._debug_last_turn_dir = self._sign_to_turn_dir(omega_sign)
+
+        latest_inference_age_ms = self._get_cmd_inference_age_ms(state, now)
+        cmd_new, cmd_cached = self._compute_cmd_origin_flags(
+            state=state,
+            completed_modules=completed_modules,
+            cmd_from_new_inference=cmd_from_new_inference,
+            cmd_from_cached_output=cmd_from_cached_output,
+        )
+        omega_source = self._resolve_omega_source(
+            state=state,
+            reason=reason,
+            image_age_ms=image_age_ms,
+            latest_inference_age_ms=latest_inference_age_ms,
+            cmd_from_cached_output=cmd_cached,
+            source_override=source_override,
+        )
+
+        diag = {
+            "nav_state": str(state),
+            "prev_nav_state": prev_nav_state,
+            "state_step_count": int(state_step_count),
+            "turn_step_count": int(turn_step_count),
+            "recover_step_count": int(recover_step_count),
+            "locked_turn_dir": locked_turn_dir if locked_turn_dir in ("Left", "Right") else None,
+            "last_turn_dir": self._debug_last_turn_dir,
+            "last_turn_sign": self._debug_last_turn_sign
+            if self._debug_last_turn_sign in (-1, 1)
+            else None,
+            "cmd_linear_x": float(linear_x),
+            "cmd_angular_z": float(angular_z),
+            "omega_source": str(omega_source),
+            "cmd_from_new_inference": bool(cmd_new),
+            "cmd_from_cached_output": bool(cmd_cached),
+            "reused_last_cmd": bool(reused_last_cmd),
+            "omega_same_sign_as_last_turn": omega_same_sign_as_last_turn,
+            "latest_inference_age_ms": int(latest_inference_age_ms),
+            "model_output_timeout": float(self.model_output_timeout_sec),
+            "image_timeout": float(self.image_timeout_sec),
+            "stale_omega_suppressed": False,
+            "stale_omega_before": None,
+            "stale_omega_after": None,
+            "max_omega_hold_sec": float(self.max_omega_hold_sec),
+            "omega_stale_decay": float(self.omega_stale_decay),
+        }
+        if isinstance(straight_keep_trace, dict):
+            diag.update(straight_keep_trace)
+        else:
+            diag.update(self._empty_straight_keep_trace())
+        return diag
 
     # ---------------------------
     # 配置与导入
@@ -653,11 +1070,9 @@ class HierarchicalNavRuntimeNode(Node):
         self._tick_count += 1
         now = self.get_clock().now()
 
-        # 当前状态（调度用）
         state_now = self._get_state_name()
         locked_now = self._get_locked_turn_dir()
 
-        # 默认 debug 信息（即便 early-return 也可发布）
         run_flags = {
             "stage3": False,
             "junction_lr": False,
@@ -665,6 +1080,7 @@ class HierarchicalNavRuntimeNode(Node):
             "approach_trigger": False,
         }
         outputs = self._get_cached_outputs()
+        completed_modules: List[str] = []
         startup_elapsed_sec = self._age_sec(self._node_start_time, now)
         startup_warmup_active = (
             startup_elapsed_sec is not None
@@ -672,24 +1088,65 @@ class HierarchicalNavRuntimeNode(Node):
         )
 
         try:
-            # 0) 先收割已完成的异步推理结果（非阻塞）
-            tick_had_exception = self._collect_finished_inference_results(now=now)
+            tick_had_exception, completed_modules = self._collect_finished_inference_results(
+                now=now
+            )
             outputs = self._get_cached_outputs()
             if tick_had_exception:
                 self._consecutive_errors += 1
             else:
                 self._consecutive_errors = 0
 
-            # 1) 启动 warmup 窗口：首帧未到时不触发 image timeout 停车
-            # 2) 图像超时检查
             image_ok, image_age_ms = self._get_latest_image_status(now)
+            if tick_had_exception:
+                reason = "model_inference_exception"
+                cmd_diag = self._build_cmd_diag(
+                    now=now,
+                    state=state_now,
+                    locked_turn_dir=locked_now,
+                    linear_x=0.0,
+                    angular_z=0.0,
+                    reason=reason,
+                    image_age_ms=image_age_ms,
+                    source_override="exception_zero",
+                    cmd_from_new_inference=False,
+                    cmd_from_cached_output=False,
+                )
+                self._publish_state(state_now)
+                self._publish_debug(
+                    now=now,
+                    state=state_now,
+                    locked_turn_dir=locked_now,
+                    linear_x=0.0,
+                    angular_z=0.0,
+                    outputs=outputs,
+                    run_flags=run_flags,
+                    reason=reason,
+                    image_age_ms=image_age_ms,
+                    image_received_ok=image_ok,
+                    cmd_diag=cmd_diag,
+                )
+                self.publish_zero_twist(reason)
+                return
+
             if not image_ok:
                 with self._img_lock:
                     has_received_first_image = bool(self._has_received_first_image)
 
                 if startup_warmup_active and (not has_received_first_image):
                     reason = "startup_warmup_waiting_first_image"
-                    self.publish_zero_twist(reason)
+                    cmd_diag = self._build_cmd_diag(
+                        now=now,
+                        state=state_now,
+                        locked_turn_dir=locked_now,
+                        linear_x=0.0,
+                        angular_z=0.0,
+                        reason=reason,
+                        image_age_ms=image_age_ms,
+                        source_override="missing_image_zero",
+                        cmd_from_new_inference=False,
+                        cmd_from_cached_output=False,
+                    )
                     self._publish_state(state_now)
                     self._publish_debug(
                         now=now,
@@ -702,12 +1159,24 @@ class HierarchicalNavRuntimeNode(Node):
                         reason=reason,
                         image_age_ms=image_age_ms,
                         image_received_ok=False,
+                        cmd_diag=cmd_diag,
                     )
+                    self.publish_zero_twist(reason)
                     return
 
                 reason = "missing_image_or_timeout"
                 self._maybe_log_missing_image(now=now, image_age_ms=image_age_ms)
-                self.publish_zero_twist(reason)
+                cmd_diag = self._build_cmd_diag(
+                    now=now,
+                    state=state_now,
+                    locked_turn_dir=locked_now,
+                    linear_x=0.0,
+                    angular_z=0.0,
+                    reason=reason,
+                    image_age_ms=image_age_ms,
+                    cmd_from_new_inference=False,
+                    cmd_from_cached_output=False,
+                )
                 self._publish_state(state_now)
                 self._publish_debug(
                     now=now,
@@ -720,13 +1189,26 @@ class HierarchicalNavRuntimeNode(Node):
                     reason=reason,
                     image_age_ms=image_age_ms,
                     image_received_ok=False,
+                    cmd_diag=cmd_diag,
                 )
+                self.publish_zero_twist(reason)
                 return
 
             image_np = self._get_latest_image_copy()
             if image_np is None:
                 reason = "missing_image"
-                self.publish_zero_twist(reason)
+                cmd_diag = self._build_cmd_diag(
+                    now=now,
+                    state=state_now,
+                    locked_turn_dir=locked_now,
+                    linear_x=0.0,
+                    angular_z=0.0,
+                    reason=reason,
+                    image_age_ms=image_age_ms,
+                    source_override="missing_image_zero",
+                    cmd_from_new_inference=False,
+                    cmd_from_cached_output=False,
+                )
                 self._publish_state(state_now)
                 self._publish_debug(
                     now=now,
@@ -739,25 +1221,32 @@ class HierarchicalNavRuntimeNode(Node):
                     reason=reason,
                     image_age_ms=image_age_ms,
                     image_received_ok=False,
+                    cmd_diag=cmd_diag,
                 )
+                self.publish_zero_twist(reason)
                 return
 
-            # 2) 按当前状态决定本轮模型调度，提交后台推理（不等待）
             schedule_flags = self._decide_schedule(state_now, locked_now)
-            run_flags = self._submit_inference_jobs(
+            run_flags, submit_had_exception = self._submit_inference_jobs(
                 image_np=image_np,
                 schedule_flags=schedule_flags,
             )
             outputs = self._get_cached_outputs()
-
-            # 3) 连续异常安全机制
-            if self._consecutive_errors >= self.max_consecutive_errors:
-                reason = "too_many_consecutive_errors"
-                self.get_logger().error(
-                    "连续异常达到阈值: %d >= %d，执行安全停车。"
-                    % (self._consecutive_errors, self.max_consecutive_errors)
+            if submit_had_exception:
+                self._consecutive_errors += 1
+                reason = "model_submit_exception"
+                cmd_diag = self._build_cmd_diag(
+                    now=now,
+                    state=state_now,
+                    locked_turn_dir=locked_now,
+                    linear_x=0.0,
+                    angular_z=0.0,
+                    reason=reason,
+                    image_age_ms=image_age_ms,
+                    source_override="exception_zero",
+                    cmd_from_new_inference=False,
+                    cmd_from_cached_output=False,
                 )
-                self.publish_zero_twist(reason)
                 self._publish_state(state_now)
                 self._publish_debug(
                     now=now,
@@ -770,10 +1259,46 @@ class HierarchicalNavRuntimeNode(Node):
                     reason=reason,
                     image_age_ms=image_age_ms,
                     image_received_ok=True,
+                    cmd_diag=cmd_diag,
                 )
+                self.publish_zero_twist(reason)
                 return
 
-            # 4) 模型输出超时检查（按当前状态依赖）
+            if self._consecutive_errors >= self.max_consecutive_errors:
+                reason = "too_many_consecutive_errors"
+                self.get_logger().error(
+                    "Too many consecutive errors: %d >= %d, publishing zero command."
+                    % (self._consecutive_errors, self.max_consecutive_errors)
+                )
+                cmd_diag = self._build_cmd_diag(
+                    now=now,
+                    state=state_now,
+                    locked_turn_dir=locked_now,
+                    linear_x=0.0,
+                    angular_z=0.0,
+                    reason=reason,
+                    image_age_ms=image_age_ms,
+                    source_override="exception_zero",
+                    cmd_from_new_inference=False,
+                    cmd_from_cached_output=False,
+                )
+                self._publish_state(state_now)
+                self._publish_debug(
+                    now=now,
+                    state=state_now,
+                    locked_turn_dir=locked_now,
+                    linear_x=0.0,
+                    angular_z=0.0,
+                    outputs=outputs,
+                    run_flags=run_flags,
+                    reason=reason,
+                    image_age_ms=image_age_ms,
+                    image_received_ok=True,
+                    cmd_diag=cmd_diag,
+                )
+                self.publish_zero_twist(reason)
+                return
+
             debug_reason = "startup_warmup" if startup_warmup_active else "ok"
 
             timeout_modules = []
@@ -785,8 +1310,21 @@ class HierarchicalNavRuntimeNode(Node):
                 )
             if timeout_modules:
                 reason = "model_output_timeout:%s" % ",".join(timeout_modules)
-                self.get_logger().error("模型输出超时: %s" % ",".join(timeout_modules))
-                self.publish_zero_twist(reason)
+                self.get_logger().error(
+                    "Model output timeout: %s" % ",".join(timeout_modules)
+                )
+                cmd_diag = self._build_cmd_diag(
+                    now=now,
+                    state=state_now,
+                    locked_turn_dir=locked_now,
+                    linear_x=0.0,
+                    angular_z=0.0,
+                    reason=reason,
+                    image_age_ms=image_age_ms,
+                    source_override="timeout_zero",
+                    cmd_from_new_inference=False,
+                    cmd_from_cached_output=False,
+                )
                 self._publish_state(state_now)
                 self._publish_debug(
                     now=now,
@@ -799,10 +1337,11 @@ class HierarchicalNavRuntimeNode(Node):
                     reason=reason,
                     image_age_ms=image_age_ms,
                     image_received_ok=True,
+                    cmd_diag=cmd_diag,
                 )
+                self.publish_zero_twist(reason)
                 return
 
-            # 5) 状态机更新
             sm_out = self.state_machine.update(
                 {
                     "stage3": outputs["stage3"],
@@ -814,20 +1353,52 @@ class HierarchicalNavRuntimeNode(Node):
             state_new = str(sm_out.get("state", state_now))
             locked_new = sm_out.get("locked_turn_dir", locked_now)
             omega_sm = self._safe_float(sm_out.get("omega_cmd_final", 0.0), 0.0)
+            straight_keep_raw_omega = self._safe_float(
+                outputs.get("straight_keep", {}).get("omega_cmd_raw", omega_sm),
+                omega_sm,
+            )
 
-            # 6) 速度映射 + 角速度规则
-            linear_x, angular_z = self._compose_control_cmd(
+            linear_x, angular_z, straight_keep_trace = self._compose_control_cmd(
                 state=state_new,
                 locked_turn_dir=locked_new,
                 omega_cmd_final=omega_sm,
+                straight_keep_raw_omega=straight_keep_raw_omega,
             )
+            (
+                linear_x,
+                angular_z,
+                source_override,
+                stale_omega_diag,
+                cmd_from_new,
+                cmd_from_cached,
+            ) = self._apply_stale_omega_policy(
+                now=now,
+                state=state_new,
+                linear_x=linear_x,
+                angular_z=angular_z,
+                completed_modules=completed_modules,
+            )
+            cmd_diag = self._build_cmd_diag(
+                now=now,
+                state=state_new,
+                locked_turn_dir=locked_new,
+                linear_x=linear_x,
+                angular_z=angular_z,
+                reason=debug_reason,
+                image_age_ms=image_age_ms,
+                omega_cmd_final=omega_sm,
+                straight_keep_trace=straight_keep_trace,
+                completed_modules=completed_modules,
+                source_override=source_override,
+                cmd_from_new_inference=cmd_from_new,
+                cmd_from_cached_output=cmd_from_cached,
+                reused_last_cmd=False,
+            )
+            cmd_diag.update(stale_omega_diag)
 
-            # 7) 发布 cmd/state/debug
             cmd = Twist()
             cmd.linear.x = float(linear_x)
             cmd.angular.z = float(angular_z)
-            self.cmd_pub.publish(cmd)
-            self._last_cmd = cmd
 
             self._publish_state(state_new)
             self._publish_debug(
@@ -842,13 +1413,30 @@ class HierarchicalNavRuntimeNode(Node):
                 image_age_ms=image_age_ms,
                 image_received_ok=True,
                 sm_out=sm_out,
+                cmd_diag=cmd_diag,
             )
+            self.cmd_pub.publish(cmd)
+            self._record_published_cmd(cmd)
         except Exception as exc:
             self._consecutive_errors += 1
             self.get_logger().error(
-                "control_tick 异常: %s\n%s" % (str(exc), traceback.format_exc())
+                "control_tick ??: %s\n%s" % (str(exc), traceback.format_exc())
             )
-            self.publish_zero_twist("control_tick_exception")
+            exc_image_age_ms = self._age_ms(
+                self._latest_image_receive_time or self._latest_image_time, now
+            )
+            cmd_diag = self._build_cmd_diag(
+                now=now,
+                state=state_now,
+                locked_turn_dir=locked_now,
+                linear_x=0.0,
+                angular_z=0.0,
+                reason="exception",
+                image_age_ms=exc_image_age_ms,
+                source_override="exception_zero",
+                cmd_from_new_inference=False,
+                cmd_from_cached_output=False,
+            )
             self._publish_state(state_now)
             self._publish_debug(
                 now=now,
@@ -859,16 +1447,13 @@ class HierarchicalNavRuntimeNode(Node):
                 outputs=outputs,
                 run_flags=run_flags,
                 reason="exception",
-                image_age_ms=self._age_ms(
-                    self._latest_image_receive_time or self._latest_image_time, now
-                ),
+                image_age_ms=exc_image_age_ms,
                 image_received_ok=None,
                 extra={"exception": str(exc)},
+                cmd_diag=cmd_diag,
             )
+            self.publish_zero_twist("control_tick_exception")
 
-    # ---------------------------
-    # 调度 / 模型缓存
-    # ---------------------------
     def _is_stride_tick(self, stride: int) -> bool:
         s = max(1, int(stride))
         # 第一个 tick 即命中（tick=1 -> 0 % s == 0）
@@ -920,7 +1505,7 @@ class HierarchicalNavRuntimeNode(Node):
 
         return run
 
-    def _collect_finished_inference_results(self, now: Time) -> bool:
+    def _collect_finished_inference_results(self, now: Time) -> Tuple[bool, List[str]]:
         """
         仅收集已经完成的 future，不阻塞控制线程。
         """
@@ -932,6 +1517,7 @@ class HierarchicalNavRuntimeNode(Node):
                     completed_jobs.append((module_name, cache.future))
 
         had_exception = False
+        completed_modules: List[str] = []
         for module_name, future in completed_jobs:
             try:
                 out = future.result()
@@ -943,6 +1529,7 @@ class HierarchicalNavRuntimeNode(Node):
                     cache.last_update_time = now
                     cache.busy = False
                     cache.future = None
+                completed_modules.append(module_name)
             except Exception as exc:
                 had_exception = True
                 with self._module_lock:
@@ -954,11 +1541,11 @@ class HierarchicalNavRuntimeNode(Node):
                     % (module_name, str(exc), traceback.format_exc())
                 )
 
-        return had_exception
+        return had_exception, completed_modules
 
     def _submit_inference_jobs(
         self, image_np: np.ndarray, schedule_flags: Dict[str, bool]
-    ) -> Dict[str, bool]:
+    ) -> Tuple[Dict[str, bool], bool]:
         """
         按调度策略提交后台推理任务：
         - busy 的模块不重复提交
@@ -970,6 +1557,7 @@ class HierarchicalNavRuntimeNode(Node):
             "straight_keep": False,
             "approach_trigger": False,
         }
+        had_exception = False
 
         for module_name in self._module_names:
             if not schedule_flags.get(module_name, False):
@@ -998,6 +1586,7 @@ class HierarchicalNavRuntimeNode(Node):
                     image_snapshot,
                 )
             except Exception as exc:
+                had_exception = True
                 with self._module_lock:
                     cache = self.module_cache[module_name]
                     cache.busy = False
@@ -1012,7 +1601,7 @@ class HierarchicalNavRuntimeNode(Node):
                 cache.future = future
             ran_flags[module_name] = True
 
-        return ran_flags
+        return ran_flags, had_exception
 
     def _get_cached_outputs(self) -> Dict[str, Dict[str, Any]]:
         outputs: Dict[str, Dict[str, Any]] = {}
@@ -1135,19 +1724,26 @@ class HierarchicalNavRuntimeNode(Node):
         state: str,
         locked_turn_dir: Optional[str],
         omega_cmd_final: float,
-    ) -> Tuple[float, float]:
+        straight_keep_raw_omega: Optional[float] = None,
+    ) -> Tuple[float, float, Dict[str, Any]]:
         linear_x = float(self.linear_speed_map.get(state, 0.0))
+        straight_keep_trace = self._empty_straight_keep_trace()
 
-        if state == "STRAIGHTKEEP":
-            # STRAIGHTKEEP：按 bias->scale->clip->deadband 顺序处理，抑制直段稳定偏置
-            raw_omega = float(omega_cmd_final)
-            bias_corrected_omega = raw_omega - self.straight_keep_bias
-            scaled_omega = self.straight_keep_scale * bias_corrected_omega
-            angular_z = self._clip(scaled_omega, -self.angular_clip, self.angular_clip)
-            if abs(angular_z) < self.straight_keep_deadband:
-                angular_z = 0.0
-        elif state in ("APPROACH", "RECOVER"):
-            angular_z = self._clip(omega_cmd_final, -self.angular_clip, self.angular_clip)
+        if state in ("STRAIGHTKEEP", "APPROACH", "RECOVER"):
+            raw_omega = (
+                float(straight_keep_raw_omega)
+                if straight_keep_raw_omega is not None
+                else float(omega_cmd_final)
+            )
+            angular_z, straight_keep_trace = self._calibrate_straight_keep_omega(
+                raw_omega
+            )
+            if state == "RECOVER":
+                angular_z = self._recover_same_direction_suppressed_omega(
+                    omega=angular_z,
+                    locked_turn_dir=locked_turn_dir,
+                )
+                straight_keep_trace["straight_keep_final_omega"] = float(angular_z)
         elif state == "TURN":
             if locked_turn_dir == "Left":
                 angular_z = self.turn_left_omega
@@ -1161,18 +1757,32 @@ class HierarchicalNavRuntimeNode(Node):
             linear_x = float(self.linear_speed_map.get("BOOT", 0.0))
             angular_z = 0.0
 
-        return float(linear_x), float(angular_z)
+        return float(linear_x), float(angular_z), straight_keep_trace
 
     @staticmethod
     def _clip(v: float, low: float, high: float) -> float:
         return max(low, min(high, float(v)))
+
+    def _record_published_cmd(self, cmd: Twist) -> None:
+        self._last_cmd = cmd
+        self._last_angular_z = float(cmd.angular.z)
+        self._last_angular_cmd_valid = abs(float(cmd.angular.z)) > 1e-9
+
+    def _clear_last_angular_cmd(self) -> None:
+        self._last_angular_z = 0.0
+        self._last_angular_cmd_valid = False
+        try:
+            self._last_cmd.angular.z = 0.0
+        except Exception:
+            pass
 
     def publish_zero_twist(self, reason: str) -> None:
         cmd = Twist()
         cmd.linear.x = 0.0
         cmd.angular.z = 0.0
         self.cmd_pub.publish(cmd)
-        self._last_cmd = cmd
+        self._record_published_cmd(cmd)
+        self._clear_last_angular_cmd()
         self.get_logger().warn("Publish ZERO cmd_vel. reason=%s" % reason)
 
     # ---------------------------
@@ -1198,6 +1808,7 @@ class HierarchicalNavRuntimeNode(Node):
         image_received_ok: Optional[bool] = None,
         sm_out: Optional[Dict[str, Any]] = None,
         extra: Optional[Dict[str, Any]] = None,
+        cmd_diag: Optional[Dict[str, Any]] = None,
     ) -> None:
         with self._img_lock:
             latest_image_receive_time = self._latest_image_receive_time
@@ -1229,7 +1840,17 @@ class HierarchicalNavRuntimeNode(Node):
                 and (float(image_age_ms) / 1000.0) <= float(self.image_timeout_sec)
             )
 
-        locked_turn_dir_out = locked_turn_dir if locked_turn_dir is not None else ""
+        cmd_diag = cmd_diag if isinstance(cmd_diag, dict) else {}
+
+        def _to_int(value: Any, default: int) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return int(default)
+
+        locked_turn_dir_out = (
+            locked_turn_dir if locked_turn_dir in ("Left", "Right") else None
+        )
         trigger_pred = self._parse_trigger_pred(outputs.get("approach_trigger", {}))
         stage3_pred = self._parse_stage3_pred(outputs.get("stage3", {}))
         junction_pred = self._parse_junction_pred(outputs.get("junction_lr", {}))
@@ -1246,95 +1867,171 @@ class HierarchicalNavRuntimeNode(Node):
             and startup_elapsed_sec <= self.startup_warmup_sec
         )
 
-        if self.debug_compact:
-            # 轻量模式：仅发布核心诊断字段，降低 JSON 序列化与发布开销。
-            debug_payload: Dict[str, Any] = {
-                "state": state,
-                "locked_turn_dir": locked_turn_dir_out,
-                "linear_x": float(linear_x),
-                "angular_z": float(angular_z),
-                "trigger_pred": trigger_pred,
-                "stage3_pred": stage3_pred,
-                "junction_pred": junction_pred,
-                "image_received_ok": bool(image_received_ok),
-                "image_age_ms": int(image_age_ms),
-                "latest_image_receive_time": latest_image_receive_time_str,
-                "stage3_age_ms": stage3_age_ms,
-                "junction_age_ms": junction_age_ms,
-                "straight_keep_age_ms": straight_keep_age_ms,
-                "trigger_age_ms": trigger_age_ms,
-                "stage3_busy": stage3_busy,
-                "junction_busy": junction_busy,
-                "straight_keep_busy": straight_keep_busy,
-                "trigger_busy": trigger_busy,
-                "tick_count": tick_count,
-                "image_rx_count": image_rx_count,
-                "has_received_first_image": has_received_first_image,
-                "startup_warmup_active": bool(startup_warmup_active),
-                "startup_warmup_sec": float(self.startup_warmup_sec),
-                "straight_keep_bias": float(self.straight_keep_bias),
-                "straight_keep_scale": float(self.straight_keep_scale),
-                "straight_keep_deadband": float(self.straight_keep_deadband),
-                "stage3_last_run_step": stage3_last_run_step,
-                "junction_last_run_step": junction_last_run_step,
-                "straight_keep_last_run_step": straight_keep_last_run_step,
-                "trigger_last_run_step": trigger_last_run_step,
-                "reason": reason,
-                "consecutive_errors": int(self._consecutive_errors),
-            }
-        else:
-            debug_payload = {
-                "state": state,
-                "locked_turn_dir": locked_turn_dir_out,
-                "linear_x": float(linear_x),
-                "angular_z": float(angular_z),
-                "trigger_pred": trigger_pred,
-                "stage3_pred": stage3_pred,
-                "junction_pred": junction_pred,
-                "ran_stage3": bool(run_flags.get("stage3", False)),
-                "ran_junction": bool(run_flags.get("junction_lr", False)),
-                "ran_straight_keep": bool(run_flags.get("straight_keep", False)),
-                "ran_trigger": bool(run_flags.get("approach_trigger", False)),
-                "stage3_busy": stage3_busy,
-                "junction_busy": junction_busy,
-                "straight_keep_busy": straight_keep_busy,
-                "trigger_busy": trigger_busy,
-                "subscribed_image_topic": self.image_topic,
-                "image_received_ok": bool(image_received_ok),
-                "image_age_ms": int(image_age_ms),
-                "image_header_stamp": image_header_stamp_str,
-                "latest_image_receive_time": latest_image_receive_time_str,
-                "stage3_age_ms": stage3_age_ms,
-                "junction_age_ms": junction_age_ms,
-                "straight_keep_age_ms": straight_keep_age_ms,
-                "trigger_age_ms": trigger_age_ms,
-                "tick_count": tick_count,
-                "image_rx_count": image_rx_count,
-                "has_received_first_image": has_received_first_image,
-                "startup_warmup_active": bool(startup_warmup_active),
-                "startup_warmup_sec": float(self.startup_warmup_sec),
-                "straight_keep_bias": float(self.straight_keep_bias),
-                "straight_keep_scale": float(self.straight_keep_scale),
-                "straight_keep_deadband": float(self.straight_keep_deadband),
-                "stage3_last_run_step": stage3_last_run_step,
-                "junction_last_run_step": junction_last_run_step,
-                "straight_keep_last_run_step": straight_keep_last_run_step,
-                "trigger_last_run_step": trigger_last_run_step,
-                "reason": reason,
-                "consecutive_errors": int(self._consecutive_errors),
-            }
+        latest_inference_age_ms = _to_int(cmd_diag.get("latest_inference_age_ms", -1), -1)
+        if latest_inference_age_ms < 0:
+            valid_ages = [
+                age
+                for age in (stage3_age_ms, junction_age_ms, straight_keep_age_ms, trigger_age_ms)
+                if isinstance(age, int) and age >= 0
+            ]
+            latest_inference_age_ms = min(valid_ages) if valid_ages else -1
+
+        cmd_linear_x = self._safe_float(cmd_diag.get("cmd_linear_x", linear_x), linear_x)
+        cmd_angular_z = self._safe_float(cmd_diag.get("cmd_angular_z", angular_z), angular_z)
+        cmd_from_new_inference = bool(cmd_diag.get("cmd_from_new_inference", False))
+        cmd_from_cached_output = bool(cmd_diag.get("cmd_from_cached_output", False))
+        reused_last_cmd = bool(cmd_diag.get("reused_last_cmd", False))
+        omega_source = cmd_diag.get("omega_source")
+        if not isinstance(omega_source, str) or not omega_source:
+            omega_source = self._resolve_omega_source(
+                state=state,
+                reason=reason,
+                image_age_ms=int(image_age_ms),
+                latest_inference_age_ms=int(latest_inference_age_ms),
+                cmd_from_cached_output=cmd_from_cached_output,
+            )
+
+        omega_same_sign_as_last_turn = cmd_diag.get("omega_same_sign_as_last_turn")
+        if not isinstance(omega_same_sign_as_last_turn, bool):
+            omega_same_sign_as_last_turn = None
+
+        nav_state = str(cmd_diag.get("nav_state", state))
+        prev_nav_state = cmd_diag.get("prev_nav_state", None)
+        state_step_count = _to_int(cmd_diag.get("state_step_count", -1), -1)
+        turn_step_count = _to_int(cmd_diag.get("turn_step_count", -1), -1)
+        recover_step_count = _to_int(cmd_diag.get("recover_step_count", -1), -1)
+        locked_turn_dir_diag = cmd_diag.get("locked_turn_dir", locked_turn_dir_out)
+        if locked_turn_dir_diag not in ("Left", "Right"):
+            locked_turn_dir_diag = None
+        last_turn_dir = cmd_diag.get("last_turn_dir", None)
+        if last_turn_dir not in ("Left", "Right"):
+            last_turn_dir = None
+        last_turn_sign = cmd_diag.get("last_turn_sign", None)
+        if last_turn_sign not in (-1, 1):
+            last_turn_sign = None
+
+        straight_keep_raw_omega = cmd_diag.get("straight_keep_raw_omega", None)
+        straight_keep_after_bias = cmd_diag.get("straight_keep_after_bias", None)
+        straight_keep_after_scale = cmd_diag.get("straight_keep_after_scale", None)
+        straight_keep_after_deadband = cmd_diag.get("straight_keep_after_deadband", None)
+        straight_keep_after_clip = cmd_diag.get("straight_keep_after_clip", None)
+        straight_keep_final_omega = cmd_diag.get("straight_keep_final_omega", None)
+        straight_keep_bias_dbg = self._safe_float(
+            cmd_diag.get("straight_keep_bias", self.straight_keep_bias),
+            self.straight_keep_bias,
+        )
+        straight_keep_scale_dbg = self._safe_float(
+            cmd_diag.get("straight_keep_scale", self.straight_keep_scale),
+            self.straight_keep_scale,
+        )
+        straight_keep_deadband_dbg = self._safe_float(
+            cmd_diag.get("straight_keep_deadband", self.straight_keep_deadband),
+            self.straight_keep_deadband,
+        )
+        model_output_timeout = self._safe_float(
+            cmd_diag.get("model_output_timeout", self.model_output_timeout_sec),
+            self.model_output_timeout_sec,
+        )
+        image_timeout = self._safe_float(
+            cmd_diag.get("image_timeout", self.image_timeout_sec),
+            self.image_timeout_sec,
+        )
+        stale_omega_suppressed = bool(cmd_diag.get("stale_omega_suppressed", False))
+        stale_omega_before = cmd_diag.get("stale_omega_before", None)
+        stale_omega_after = cmd_diag.get("stale_omega_after", None)
+        max_omega_hold_sec = self._safe_float(
+            cmd_diag.get("max_omega_hold_sec", self.max_omega_hold_sec),
+            self.max_omega_hold_sec,
+        )
+        omega_stale_decay = self._safe_float(
+            cmd_diag.get("omega_stale_decay", self.omega_stale_decay),
+            self.omega_stale_decay,
+        )
+
+        debug_payload: Dict[str, Any] = {
+            "state": state,
+            "nav_state": nav_state,
+            "prev_nav_state": prev_nav_state,
+            "state_step_count": int(state_step_count),
+            "turn_step_count": int(turn_step_count),
+            "recover_step_count": int(recover_step_count),
+            "locked_turn_dir": locked_turn_dir_diag,
+            "last_turn_dir": last_turn_dir,
+            "last_turn_sign": last_turn_sign,
+            "linear_x": float(linear_x),
+            "angular_z": float(angular_z),
+            "cmd_linear_x": float(cmd_linear_x),
+            "cmd_angular_z": float(cmd_angular_z),
+            "omega_source": str(omega_source),
+            "cmd_from_new_inference": bool(cmd_from_new_inference),
+            "cmd_from_cached_output": bool(cmd_from_cached_output),
+            "reused_last_cmd": bool(reused_last_cmd),
+            "omega_same_sign_as_last_turn": omega_same_sign_as_last_turn,
+            "trigger_pred": trigger_pred,
+            "stage3_pred": stage3_pred,
+            "junction_pred": junction_pred,
+            "image_received_ok": bool(image_received_ok),
+            "image_age_ms": int(image_age_ms),
+            "latest_image_receive_time": latest_image_receive_time_str,
+            "stage3_age_ms": stage3_age_ms,
+            "junction_age_ms": junction_age_ms,
+            "straight_keep_age_ms": straight_keep_age_ms,
+            "trigger_age_ms": trigger_age_ms,
+            "latest_inference_age_ms": int(latest_inference_age_ms),
+            "stage3_busy": stage3_busy,
+            "junction_busy": junction_busy,
+            "straight_keep_busy": straight_keep_busy,
+            "trigger_busy": trigger_busy,
+            "tick_count": tick_count,
+            "image_rx_count": image_rx_count,
+            "has_received_first_image": has_received_first_image,
+            "startup_warmup_active": bool(startup_warmup_active),
+            "startup_warmup_sec": float(self.startup_warmup_sec),
+            "straight_keep_raw_omega": straight_keep_raw_omega,
+            "straight_keep_bias": float(straight_keep_bias_dbg),
+            "straight_keep_scale": float(straight_keep_scale_dbg),
+            "straight_keep_deadband": float(straight_keep_deadband_dbg),
+            "straight_keep_after_bias": straight_keep_after_bias,
+            "straight_keep_after_scale": straight_keep_after_scale,
+            "straight_keep_after_deadband": straight_keep_after_deadband,
+            "straight_keep_after_clip": straight_keep_after_clip,
+            "straight_keep_final_omega": straight_keep_final_omega,
+            "stale_omega_suppressed": bool(stale_omega_suppressed),
+            "stale_omega_before": stale_omega_before,
+            "stale_omega_after": stale_omega_after,
+            "max_omega_hold_sec": float(max_omega_hold_sec),
+            "omega_stale_decay": float(omega_stale_decay),
+            "stage3_last_run_step": stage3_last_run_step,
+            "junction_last_run_step": junction_last_run_step,
+            "straight_keep_last_run_step": straight_keep_last_run_step,
+            "trigger_last_run_step": trigger_last_run_step,
+            "model_output_timeout": float(model_output_timeout),
+            "image_timeout": float(image_timeout),
+            "reason": reason,
+            "consecutive_errors": int(self._consecutive_errors),
+        }
+
+        if not self.debug_compact:
+            debug_payload.update(
+                {
+                    "ran_stage3": bool(run_flags.get("stage3", False)),
+                    "ran_junction": bool(run_flags.get("junction_lr", False)),
+                    "ran_straight_keep": bool(run_flags.get("straight_keep", False)),
+                    "ran_trigger": bool(run_flags.get("approach_trigger", False)),
+                    "subscribed_image_topic": self.image_topic,
+                    "image_header_stamp": image_header_stamp_str,
+                }
+            )
             if sm_out is not None:
                 debug_payload["state_machine_debug"] = sm_out.get("debug", {})
-            if extra:
-                debug_payload.update(extra)
+
+        if extra:
+            debug_payload.update(extra)
 
         msg = String()
         msg.data = json.dumps(debug_payload, ensure_ascii=False)
         self.debug_pub.publish(msg)
 
-    # ---------------------------
-    # 小工具
-    # ---------------------------
     def _get_state_name(self) -> str:
         state_obj = getattr(self.state_machine, "state", None)
         if state_obj is None:
