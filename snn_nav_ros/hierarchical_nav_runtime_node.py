@@ -16,6 +16,7 @@ import inspect
 import json
 import os
 import sys
+import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -50,6 +51,10 @@ class ModuleCache:
     busy: bool = False
     future: Optional[Future] = None
     last_run_step: int = 0
+    last_latency_ms: Optional[float] = None
+    last_start_wall_time: Optional[float] = None
+    last_finish_wall_time: Optional[float] = None
+    exception_count: int = 0
 
 
 class HierarchicalNavRuntimeNode(Node):
@@ -1539,15 +1544,18 @@ class HierarchicalNavRuntimeNode(Node):
         completed_modules: List[str] = []
         for module_name, future in completed_jobs:
             try:
-                out = future.result()
+                out, latency_ms, finish_wall_time = future.result()
                 if not isinstance(out, dict):
                     raise TypeError("%s 输出不是 dict" % module_name)
                 with self._module_lock:
                     cache = self.module_cache[module_name]
                     cache.last_output = out
+                    cache.last_latency_ms = float(latency_ms)
+                    cache.last_finish_wall_time = float(finish_wall_time)
                     cache.last_update_time = now
                     cache.busy = False
                     cache.future = None
+                    cache.exception_count += 1
                 completed_modules.append(module_name)
             except Exception as exc:
                 had_exception = True
@@ -1591,6 +1599,7 @@ class HierarchicalNavRuntimeNode(Node):
                 if not cache.busy:
                     cache.busy = True
                     cache.last_run_step = self._tick_count
+                    cache.last_start_wall_time = time.perf_counter()
                     should_submit = True
 
             if not should_submit:
@@ -1610,6 +1619,7 @@ class HierarchicalNavRuntimeNode(Node):
                     cache = self.module_cache[module_name]
                     cache.busy = False
                     cache.future = None
+                    cache.exception_count += 1
                 self.get_logger().error(
                     "提交异步推理失败[%s]: %s" % (module_name, str(exc))
                 )
@@ -1632,17 +1642,24 @@ class HierarchicalNavRuntimeNode(Node):
                 outputs[module_name] = out
         return outputs
 
-    def _run_model(self, module_name: str, image_np: np.ndarray) -> Dict[str, Any]:
+    def _run_model(
+        self, module_name: str, image_np: np.ndarray
+    ) -> Tuple[Dict[str, Any], float, float]:
         model = self.models.get(module_name)
         if model is None:
             raise RuntimeError("模型未加载: %s" % module_name)
 
         # 优先走 predict()
+        start_wall_time = time.perf_counter()
         if hasattr(model, "predict"):
-            return model.predict(image_np)
-        if callable(model):
-            return model(image_np)
-        raise RuntimeError("模型对象不可调用: %s" % module_name)
+            out = model.predict(image_np)
+        elif callable(model):
+            out = model(image_np)
+        else:
+            raise RuntimeError("model object is not callable: %s" % module_name)
+        finish_wall_time = time.perf_counter()
+        latency_ms = (finish_wall_time - start_wall_time) * 1000.0
+        return out, float(latency_ms), float(finish_wall_time)
 
     def _default_output(self, module_name: str) -> Dict[str, Any]:
         if module_name == "stage3":
@@ -1848,6 +1865,20 @@ class HierarchicalNavRuntimeNode(Node):
             junction_busy = bool(self.module_cache["junction_lr"].busy)
             straight_keep_busy = bool(self.module_cache["straight_keep"].busy)
             trigger_busy = bool(self.module_cache["approach_trigger"].busy)
+            stage3_latency_ms = self.module_cache["stage3"].last_latency_ms
+            junction_latency_ms = self.module_cache["junction_lr"].last_latency_ms
+            straight_keep_latency_ms = self.module_cache["straight_keep"].last_latency_ms
+            trigger_latency_ms = self.module_cache["approach_trigger"].last_latency_ms
+            stage3_exception_count = int(self.module_cache["stage3"].exception_count)
+            junction_exception_count = int(
+                self.module_cache["junction_lr"].exception_count
+            )
+            straight_keep_exception_count = int(
+                self.module_cache["straight_keep"].exception_count
+            )
+            trigger_exception_count = int(
+                self.module_cache["approach_trigger"].exception_count
+            )
 
         if image_received_ok is None:
             image_received_ok = (
@@ -2007,6 +2038,14 @@ class HierarchicalNavRuntimeNode(Node):
             "junction_busy": junction_busy,
             "straight_keep_busy": straight_keep_busy,
             "trigger_busy": trigger_busy,
+            "stage3_latency_ms": stage3_latency_ms,
+            "junction_latency_ms": junction_latency_ms,
+            "straight_keep_latency_ms": straight_keep_latency_ms,
+            "trigger_latency_ms": trigger_latency_ms,
+            "stage3_exception_count": int(stage3_exception_count),
+            "junction_exception_count": int(junction_exception_count),
+            "straight_keep_exception_count": int(straight_keep_exception_count),
+            "trigger_exception_count": int(trigger_exception_count),
             "ran_stage3": bool(run_flags.get("stage3", False)),
             "ran_junction": bool(run_flags.get("junction_lr", False)),
             "ran_straight_keep": bool(run_flags.get("straight_keep", False)),
