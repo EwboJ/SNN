@@ -184,7 +184,16 @@ class HierarchicalNavRuntimeNode(Node):
             self.scheduler_cfg.get("policy", "state_conditioned_v2")
         ).strip()
         self.stage3_probe_stride = max(
-            1, int(self.scheduler_cfg.get("stage3_probe_stride", 3))
+            1, int(self.scheduler_cfg.get("stage3_probe_stride", 8))
+        )
+        self.straight_keep_stride = max(
+            1, int(self.scheduler_cfg.get("straight_keep_stride", 1))
+        )
+        self.trigger_stride = max(
+            1, int(self.scheduler_cfg.get("trigger_stride", 2))
+        )
+        self.junction_probe_stride = max(
+            1, int(self.scheduler_cfg.get("junction_probe_stride", 1))
         )
         self.turn_stage3_stride = max(
             1, int(self.scheduler_cfg.get("turn_stage3_stride", 2))
@@ -1483,8 +1492,8 @@ class HierarchicalNavRuntimeNode(Node):
         }
 
         if state == "STRAIGHTKEEP":
-            run["straight_keep"] = True
-            run["approach_trigger"] = True
+            run["straight_keep"] = self._is_stride_tick(self.straight_keep_stride)
+            run["approach_trigger"] = self._is_stride_tick(self.trigger_stride)
             run["stage3"] = self._is_stride_tick(self.stage3_probe_stride)
         elif state == "APPROACH":
             run["stage3"] = True
@@ -1499,13 +1508,13 @@ class HierarchicalNavRuntimeNode(Node):
             if self.disable_junction_after_lock and locked_turn_dir in ("Left", "Right"):
                 run["junction_lr"] = False
             else:
-                run["junction_lr"] = True
+                run["junction_lr"] = self._is_stride_tick(self.junction_probe_stride)
         elif state == "RECOVER":
             run["straight_keep"] = True
             run["stage3"] = self._is_stride_tick(self.recover_stage3_stride)
         else:  # BOOT/未知状态：保守预热
-            run["straight_keep"] = True
-            run["approach_trigger"] = True
+            run["straight_keep"] = self._is_stride_tick(self.straight_keep_stride)
+            run["approach_trigger"] = self._is_stride_tick(self.trigger_stride)
             run["stage3"] = self._is_stride_tick(self.stage3_probe_stride)
 
         return run
@@ -1706,16 +1715,13 @@ class HierarchicalNavRuntimeNode(Node):
         self, state: str, locked_turn_dir: Optional[str]
     ) -> list[str]:
         if state == "STRAIGHTKEEP":
-            return ["straight_keep", "approach_trigger", "stage3"]
+            return ["straight_keep", "approach_trigger"]
         if state == "APPROACH":
             return ["stage3", "junction_lr", "straight_keep"]
         if state == "PROVISIONAL_TURN":
-            return ["stage3", "junction_lr", "straight_keep"]
+            return ["stage3", "junction_lr"]
         if state == "TURN":
-            req = ["stage3"]
-            if not (self.disable_junction_after_lock and locked_turn_dir in ("Left", "Right")):
-                req.append("junction_lr")
-            return req
+            return ["stage3"]
         if state == "RECOVER":
             return ["straight_keep", "stage3"]
         # BOOT 默认不做严格模型超时约束，避免冷启动误触发
@@ -1908,6 +1914,9 @@ class HierarchicalNavRuntimeNode(Node):
         locked_turn_dir_diag = cmd_diag.get("locked_turn_dir", locked_turn_dir_out)
         if locked_turn_dir_diag not in ("Left", "Right"):
             locked_turn_dir_diag = None
+        required_modules = self._required_modules_for_state(
+            state, locked_turn_dir_diag
+        )
         last_turn_dir = cmd_diag.get("last_turn_dir", None)
         if last_turn_dir not in ("Left", "Right"):
             last_turn_dir = None
@@ -1992,6 +2001,14 @@ class HierarchicalNavRuntimeNode(Node):
             "junction_busy": junction_busy,
             "straight_keep_busy": straight_keep_busy,
             "trigger_busy": trigger_busy,
+            "ran_stage3": bool(run_flags.get("stage3", False)),
+            "ran_junction": bool(run_flags.get("junction_lr", False)),
+            "ran_straight_keep": bool(run_flags.get("straight_keep", False)),
+            "ran_trigger": bool(run_flags.get("approach_trigger", False)),
+            "straight_keep_stride": int(self.straight_keep_stride),
+            "trigger_stride": int(self.trigger_stride),
+            "stage3_probe_stride": int(self.stage3_probe_stride),
+            "required_modules": list(required_modules),
             "tick_count": tick_count,
             "image_rx_count": image_rx_count,
             "has_received_first_image": has_received_first_image,
@@ -2024,10 +2041,6 @@ class HierarchicalNavRuntimeNode(Node):
         if not self.debug_compact:
             debug_payload.update(
                 {
-                    "ran_stage3": bool(run_flags.get("stage3", False)),
-                    "ran_junction": bool(run_flags.get("junction_lr", False)),
-                    "ran_straight_keep": bool(run_flags.get("straight_keep", False)),
-                    "ran_trigger": bool(run_flags.get("approach_trigger", False)),
                     "subscribed_image_topic": self.image_topic,
                     "image_header_stamp": image_header_stamp_str,
                 }
