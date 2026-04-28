@@ -55,6 +55,7 @@ class ModuleCache:
     last_start_wall_time: Optional[float] = None
     last_finish_wall_time: Optional[float] = None
     exception_count: int = 0
+    success_count: int = 0
 
 
 class HierarchicalNavRuntimeNode(Node):
@@ -229,6 +230,23 @@ class HierarchicalNavRuntimeNode(Node):
         if infer_max_workers_raw is None:
             infer_max_workers_raw = self.system_cfg.get("infer_max_workers", 1)
         self.infer_max_workers = max(1, int(infer_max_workers_raw))
+        self.runtime_mode = str(
+            self.scheduler_cfg.get("runtime_mode", "event_v2")
+        ).strip()
+        self.single_active_model = bool(
+            self.scheduler_cfg.get("single_active_model", False)
+        )
+        self.global_max_inflight_models = max(
+            1,
+            int(
+                self.scheduler_cfg.get(
+                    "global_max_inflight_models", self.infer_max_workers
+                )
+            ),
+        )
+        self.max_submits_per_tick = max(
+            1, int(self.scheduler_cfg.get("max_submits_per_tick", 99))
+        )
 
         self.image_timeout_sec = max(
             0.01, float(self.safety_cfg.get("image_timeout_sec", 1.0))
@@ -331,13 +349,17 @@ class HierarchicalNavRuntimeNode(Node):
         self._debug_recover_step_count = 0
         self._debug_last_turn_dir: Optional[str] = None
         self._debug_last_turn_sign: Optional[int] = None
+        self._active_scheduled_module_this_tick: Optional[str] = None
         self.control_timer = self.create_timer(
             1.0 / self.cmd_publish_hz,
             self._control_tick,
             callback_group=self._control_cb_group,
         )
 
-        if self.scheduler_policy != "state_conditioned_v2":
+        if self.scheduler_policy not in (
+            "state_conditioned_v2",
+            "slow_safe_straight_only",
+        ):
             self.get_logger().warn(
                 "scheduler.policy=%s，当前节点仅实现 state_conditioned_v2，已按该策略运行。"
                 % self.scheduler_policy
@@ -346,7 +368,8 @@ class HierarchicalNavRuntimeNode(Node):
         self.get_logger().info(
             "HierarchicalNavRuntimeNode started. runtime_build_tag=%s, runtime_file=%s, "
             "config_path=%s, image_topic=%s, cmd_vel_topic=%s, state_topic=%s, "
-            "debug_topic=%s, hz=%.2f, infer_max_workers=%d"
+            "debug_topic=%s, hz=%.2f, infer_max_workers=%d, runtime_mode=%s, "
+            "single_active_model=%s, global_max_inflight_models=%d, max_submits_per_tick=%d"
             % (
                 self.runtime_build_tag,
                 self.runtime_file,
@@ -357,6 +380,10 @@ class HierarchicalNavRuntimeNode(Node):
                 self.debug_topic,
                 self.cmd_publish_hz,
                 self.infer_max_workers,
+                self.runtime_mode,
+                str(self.single_active_model),
+                self.global_max_inflight_models,
+                self.max_submits_per_tick,
             )
         )
         self.get_logger().info(
@@ -1182,6 +1209,7 @@ class HierarchicalNavRuntimeNode(Node):
     # ---------------------------
     def _control_tick(self) -> None:
         self._tick_count += 1
+        self._active_scheduled_module_this_tick = None
         now = self.get_clock().now()
 
         state_now = self._get_state_name()
@@ -1210,6 +1238,9 @@ class HierarchicalNavRuntimeNode(Node):
                 self._consecutive_errors += 1
             else:
                 self._consecutive_errors = 0
+            if self.runtime_mode == "slow_straight_only":
+                state_now = self._slow_straight_state_name(startup_warmup_active)
+                locked_now = None
 
             image_ok, image_age_ms = self._get_latest_image_status(now)
             if tick_had_exception:
@@ -1413,6 +1444,17 @@ class HierarchicalNavRuntimeNode(Node):
                 self.publish_zero_twist(reason)
                 return
 
+            if self.runtime_mode == "slow_straight_only":
+                self._control_tick_slow_straight_only(
+                    now=now,
+                    outputs=outputs,
+                    run_flags=run_flags,
+                    completed_modules=completed_modules,
+                    startup_warmup_active=startup_warmup_active,
+                    image_age_ms=image_age_ms,
+                )
+                return
+
             debug_reason = "startup_warmup" if startup_warmup_active else "ok"
 
             timeout_modules = []
@@ -1576,10 +1618,211 @@ class HierarchicalNavRuntimeNode(Node):
             )
             self.publish_zero_twist("control_tick_exception")
 
+    def _control_tick_slow_straight_only(
+        self,
+        *,
+        now: Time,
+        outputs: Dict[str, Dict[str, Any]],
+        run_flags: Dict[str, bool],
+        completed_modules: List[str],
+        startup_warmup_active: bool,
+        image_age_ms: int,
+    ) -> None:
+        """慢模型安全直行模式：只依赖 straight_keep，绕开路口状态机。"""
+        locked_turn_dir: Optional[str] = None
+
+        with self._module_lock:
+            straight_keep_update = self.module_cache["straight_keep"].last_update_time
+
+        has_first_output = straight_keep_update is not None
+        waiting_first_output = not has_first_output
+
+        def publish_zero(
+            *,
+            zero_state: str,
+            reason: str,
+            safety_level: str,
+            hard_stop_reason: str = "",
+        ) -> None:
+            cmd_diag = self._build_cmd_diag(
+                now=now,
+                state=zero_state,
+                locked_turn_dir=locked_turn_dir,
+                linear_x=0.0,
+                angular_z=0.0,
+                reason=reason,
+                image_age_ms=image_age_ms,
+                source_override="timeout_zero"
+                if safety_level == "HARD_STOP"
+                else "boot_zero",
+                cmd_from_new_inference=False,
+                cmd_from_cached_output=False,
+            )
+            cmd_diag.update(
+                {
+                    "slow_safe_waiting_first_model_output": bool(waiting_first_output),
+                    "safety_level": str(safety_level),
+                    "hard_stop_reason": str(hard_stop_reason),
+                }
+            )
+            self._publish_state(zero_state)
+            self._publish_debug(
+                now=now,
+                state=zero_state,
+                locked_turn_dir=locked_turn_dir,
+                linear_x=0.0,
+                angular_z=0.0,
+                outputs=outputs,
+                run_flags=run_flags,
+                reason=reason,
+                image_age_ms=image_age_ms,
+                image_received_ok=True,
+                cmd_diag=cmd_diag,
+            )
+            self.publish_zero_twist(reason)
+
+        if startup_warmup_active:
+            publish_zero(
+                zero_state="BOOT",
+                reason="startup_warmup",
+                safety_level="WAITING_FIRST_MODEL"
+                if waiting_first_output
+                else "NORMAL",
+            )
+            return
+
+        if waiting_first_output:
+            publish_zero(
+                zero_state="BOOT",
+                reason="waiting_first_straight_keep_output",
+                safety_level="WAITING_FIRST_MODEL",
+            )
+            return
+
+        straight_keep_age_ms = self._age_ms(straight_keep_update, now)
+        if (
+            int(straight_keep_age_ms) < 0
+            or (float(straight_keep_age_ms) / 1000.0)
+            > float(self.model_output_timeout_sec)
+        ):
+            reason = "model_output_timeout:straight_keep"
+            publish_zero(
+                zero_state="STRAIGHTKEEP",
+                reason=reason,
+                safety_level="HARD_STOP",
+                hard_stop_reason=reason,
+            )
+            return
+
+        omega_raw = self._safe_float(
+            outputs.get("straight_keep", {}).get("omega_cmd_raw", 0.0), 0.0
+        )
+        linear_x, angular_z, straight_keep_trace = self._compose_control_cmd(
+            state="STRAIGHTKEEP",
+            locked_turn_dir=locked_turn_dir,
+            omega_cmd_final=omega_raw,
+            straight_keep_raw_omega=omega_raw,
+        )
+        (
+            linear_x,
+            angular_z,
+            source_override,
+            stale_omega_diag,
+            cmd_from_new,
+            cmd_from_cached,
+        ) = self._apply_stale_omega_policy(
+            now=now,
+            state="STRAIGHTKEEP",
+            linear_x=linear_x,
+            angular_z=angular_z,
+            reason="ok",
+            image_age_ms=image_age_ms,
+            # slow_straight_only 下不让 trigger/stage3 阻塞低速保持。
+            trigger_pred="Straight",
+            stage3_pred="Approach",
+            completed_modules=completed_modules,
+        )
+        hard_stop_reason = ""
+        if bool(stale_omega_diag.get("stale_linear_hold_active", False)):
+            safety_level = "STALE_MODEL_CREEP"
+        elif (
+            bool(stale_omega_diag.get("stale_omega_suppressed", False))
+            and bool(cmd_from_cached)
+            and abs(float(linear_x)) < 1e-9
+        ):
+            safety_level = "HARD_STOP"
+            hard_stop_reason = "stale_straight_keep_hold_blocked:%s" % str(
+                stale_omega_diag.get("stale_linear_hold_reason", "")
+            )
+        else:
+            safety_level = "NORMAL"
+        cmd_diag = self._build_cmd_diag(
+            now=now,
+            state="STRAIGHTKEEP",
+            locked_turn_dir=locked_turn_dir,
+            linear_x=linear_x,
+            angular_z=angular_z,
+            reason="ok",
+            image_age_ms=image_age_ms,
+            omega_cmd_final=omega_raw,
+            straight_keep_trace=straight_keep_trace,
+            completed_modules=completed_modules,
+            source_override=source_override,
+            cmd_from_new_inference=cmd_from_new,
+            cmd_from_cached_output=cmd_from_cached,
+            reused_last_cmd=False,
+        )
+        cmd_diag.update(stale_omega_diag)
+        cmd_diag.update(
+            {
+                "slow_safe_waiting_first_model_output": False,
+                "safety_level": safety_level,
+                "hard_stop_reason": hard_stop_reason,
+            }
+        )
+
+        cmd = Twist()
+        cmd.linear.x = float(linear_x)
+        cmd.angular.z = float(angular_z)
+
+        self._publish_state("STRAIGHTKEEP")
+        self._publish_debug(
+            now=now,
+            state="STRAIGHTKEEP",
+            locked_turn_dir=locked_turn_dir,
+            linear_x=linear_x,
+            angular_z=angular_z,
+            outputs=outputs,
+            run_flags=run_flags,
+            reason="ok",
+            image_age_ms=image_age_ms,
+            image_received_ok=True,
+            cmd_diag=cmd_diag,
+        )
+        self.cmd_pub.publish(cmd)
+        self._record_published_cmd(cmd)
+
     def _is_stride_tick(self, stride: int) -> bool:
         s = max(1, int(stride))
         # 第一个 tick 即命中（tick=1 -> 0 % s == 0）
         return ((self._tick_count - 1) % s) == 0
+
+    def _count_busy_modules(self) -> int:
+        with self._module_lock:
+            return sum(1 for m in self._module_names if self.module_cache[m].busy)
+
+    def _any_model_busy(self) -> bool:
+        return self._count_busy_modules() > 0
+
+    def _slow_straight_state_name(self, startup_warmup_active: bool) -> str:
+        """slow_straight_only 的对外状态只在 BOOT 和 STRAIGHTKEEP 间切换。"""
+        if startup_warmup_active:
+            return "BOOT"
+        with self._module_lock:
+            has_first_output = (
+                self.module_cache["straight_keep"].last_update_time is not None
+            )
+        return "STRAIGHTKEEP" if has_first_output else "BOOT"
 
     def _decide_schedule(
         self, state: str, locked_turn_dir: Optional[str]
@@ -1598,6 +1841,10 @@ class HierarchicalNavRuntimeNode(Node):
             "straight_keep": False,
             "approach_trigger": False,
         }
+
+        if self.runtime_mode == "slow_straight_only":
+            run["straight_keep"] = self._is_stride_tick(self.straight_keep_stride)
+            return run
 
         if state == "STRAIGHTKEEP":
             run["straight_keep"] = self._is_stride_tick(self.straight_keep_stride)
@@ -1653,7 +1900,7 @@ class HierarchicalNavRuntimeNode(Node):
                     cache.last_update_time = now
                     cache.busy = False
                     cache.future = None
-                    cache.exception_count += 1
+                    cache.success_count += 1
                 completed_modules.append(module_name)
             except Exception as exc:
                 had_exception = True
@@ -1661,6 +1908,7 @@ class HierarchicalNavRuntimeNode(Node):
                     cache = self.module_cache[module_name]
                     cache.busy = False
                     cache.future = None
+                    cache.exception_count += 1
                 self.get_logger().error(
                     "异步模型运行异常[%s]: %s\n%s"
                     % (module_name, str(exc), traceback.format_exc())
@@ -1683,16 +1931,39 @@ class HierarchicalNavRuntimeNode(Node):
             "approach_trigger": False,
         }
         had_exception = False
+        submitted_this_tick = 0
+        priority = (
+            ["straight_keep"]
+            if self.runtime_mode == "slow_straight_only"
+            else ["straight_keep", "approach_trigger", "stage3", "junction_lr"]
+        )
+        max_submits_this_tick = min(
+            int(self.max_submits_per_tick), 1 if self.single_active_model else 99
+        )
 
-        for module_name in self._module_names:
+        if self.single_active_model and self._any_model_busy():
+            return ran_flags, False
+        if self._count_busy_modules() >= int(self.global_max_inflight_models):
+            return ran_flags, False
+
+        for module_name in priority:
             if not schedule_flags.get(module_name, False):
                 continue
+            if submitted_this_tick >= max_submits_this_tick:
+                break
             model = self.models.get(module_name)
             if model is None:
                 continue
 
             should_submit = False
             with self._module_lock:
+                busy_count = sum(
+                    1 for m in self._module_names if self.module_cache[m].busy
+                )
+                if self.single_active_model and busy_count > 0:
+                    break
+                if busy_count >= int(self.global_max_inflight_models):
+                    break
                 cache = self.module_cache[module_name]
                 if not cache.busy:
                     cache.busy = True
@@ -1727,6 +1998,11 @@ class HierarchicalNavRuntimeNode(Node):
                 cache = self.module_cache[module_name]
                 cache.future = future
             ran_flags[module_name] = True
+            submitted_this_tick += 1
+            if self._active_scheduled_module_this_tick is None:
+                self._active_scheduled_module_this_tick = module_name
+            if self.single_active_model:
+                break
 
         return ran_flags, had_exception
 
@@ -1834,6 +2110,8 @@ class HierarchicalNavRuntimeNode(Node):
     def _required_modules_for_state(
         self, state: str, locked_turn_dir: Optional[str]
     ) -> list[str]:
+        if self.runtime_mode == "slow_straight_only":
+            return ["straight_keep"]
         if state == "STRAIGHTKEEP":
             return ["straight_keep", "approach_trigger"]
         if state == "APPROACH":
@@ -1963,6 +2241,9 @@ class HierarchicalNavRuntimeNode(Node):
             junction_busy = bool(self.module_cache["junction_lr"].busy)
             straight_keep_busy = bool(self.module_cache["straight_keep"].busy)
             trigger_busy = bool(self.module_cache["approach_trigger"].busy)
+            busy_module_count = sum(
+                1 for m in self._module_names if self.module_cache[m].busy
+            )
             stage3_latency_ms = self.module_cache["stage3"].last_latency_ms
             junction_latency_ms = self.module_cache["junction_lr"].last_latency_ms
             straight_keep_latency_ms = self.module_cache["straight_keep"].last_latency_ms
@@ -2118,6 +2399,34 @@ class HierarchicalNavRuntimeNode(Node):
             ),
             self.linear_hold_max_image_age_sec,
         )
+        active_scheduled_module = self._active_scheduled_module_this_tick
+        if active_scheduled_module not in self._module_names:
+            active_scheduled_module = None
+        slow_safe_waiting_first_model_output = bool(
+            cmd_diag.get("slow_safe_waiting_first_model_output", False)
+        )
+        reason_s = str(reason or "")
+        safety_level_default = "NORMAL"
+        hard_stop_reason_default = ""
+        if reason_s == "waiting_first_straight_keep_output":
+            safety_level_default = "WAITING_FIRST_MODEL"
+        elif reason_s.startswith("model_output_timeout") or reason_s in (
+            "missing_image",
+            "missing_image_or_timeout",
+            "model_inference_exception",
+            "model_submit_exception",
+            "too_many_consecutive_errors",
+            "exception",
+            "control_tick_exception",
+        ):
+            safety_level_default = "HARD_STOP"
+            hard_stop_reason_default = reason_s
+        if bool(cmd_diag.get("stale_linear_hold_active", False)):
+            safety_level_default = "STALE_MODEL_CREEP"
+        safety_level = str(cmd_diag.get("safety_level", safety_level_default))
+        hard_stop_reason = str(
+            cmd_diag.get("hard_stop_reason", hard_stop_reason_default)
+        )
 
         debug_payload: Dict[str, Any] = {
             "runtime_build_tag": str(self.runtime_build_tag),
@@ -2126,6 +2435,17 @@ class HierarchicalNavRuntimeNode(Node):
             "cmd_vel_topic": str(self.cmd_vel_topic),
             "debug_schema_version": 2,
             "infer_max_workers": int(self.infer_max_workers),
+            "runtime_mode": str(self.runtime_mode),
+            "single_active_model": bool(self.single_active_model),
+            "busy_module_count": int(busy_module_count),
+            "global_max_inflight_models": int(self.global_max_inflight_models),
+            "max_submits_per_tick": int(self.max_submits_per_tick),
+            "active_scheduled_module_this_tick": active_scheduled_module,
+            "slow_safe_waiting_first_model_output": bool(
+                slow_safe_waiting_first_model_output
+            ),
+            "safety_level": safety_level,
+            "hard_stop_reason": hard_stop_reason,
             "state": state,
             "nav_state": nav_state,
             "prev_nav_state": prev_nav_state,
