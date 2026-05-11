@@ -185,6 +185,34 @@ class HierarchicalNavRuntimeNode(Node):
             0.0,
             float(self.robot_control_cfg.get("linear_hold_max_image_age_sec", 0.5)),
         )
+        # slow_straight_only 专用：脉冲式纠偏，非纠偏 tick 强制保持零角速度。
+        self.pulse_recenter_enable = bool(
+            self.robot_control_cfg.get("pulse_recenter_enable", False)
+        )
+        self.pulse_recenter_enter_abs = max(
+            0.0, float(self.robot_control_cfg.get("pulse_recenter_enter_abs", 0.055))
+        )
+        self.pulse_recenter_exit_abs = max(
+            0.0, float(self.robot_control_cfg.get("pulse_recenter_exit_abs", 0.025))
+        )
+        self.pulse_recenter_enter_votes = max(
+            1, int(self.robot_control_cfg.get("pulse_recenter_enter_votes", 2))
+        )
+        self.pulse_recenter_exit_votes = max(
+            1, int(self.robot_control_cfg.get("pulse_recenter_exit_votes", 1))
+        )
+        self.pulse_recenter_max_steps = max(
+            1, int(self.robot_control_cfg.get("pulse_recenter_max_steps", 3))
+        )
+        self.pulse_recenter_cooldown_steps = max(
+            0, int(self.robot_control_cfg.get("pulse_recenter_cooldown_steps", 4))
+        )
+        self.pulse_recenter_omega = max(
+            0.0, float(self.robot_control_cfg.get("pulse_recenter_omega", 0.025))
+        )
+        self.pulse_recenter_stop_on_sign_flip = bool(
+            self.robot_control_cfg.get("pulse_recenter_stop_on_sign_flip", True)
+        )
 
         self.linear_speed_map: Dict[str, float] = {
             "BOOT": float(self.robot_control_cfg.get("linear_speed_boot", 0.0)),
@@ -350,6 +378,12 @@ class HierarchicalNavRuntimeNode(Node):
         self._debug_last_turn_dir: Optional[str] = None
         self._debug_last_turn_sign: Optional[int] = None
         self._active_scheduled_module_this_tick: Optional[str] = None
+        self._pulse_recenter_state = "CENTER_HOLD"
+        self._pulse_recenter_dir = 0
+        self._pulse_recenter_step_count = 0
+        self._pulse_recenter_enter_count = 0
+        self._pulse_recenter_exit_count = 0
+        self._pulse_recenter_cooldown_count = 0
         self.control_timer = self.create_timer(
             1.0 / self.cmd_publish_hz,
             self._control_tick,
@@ -730,6 +764,180 @@ class HierarchicalNavRuntimeNode(Node):
             }
         )
         return float(final_omega), trace
+
+    def _build_pulse_recenter_diag(
+        self, *, error: float, reason: str
+    ) -> Dict[str, Any]:
+        return {
+            "pulse_recenter_enable": bool(self.pulse_recenter_enable),
+            "pulse_recenter_state": str(self._pulse_recenter_state),
+            "pulse_recenter_error": float(error),
+            "pulse_recenter_dir": int(self._pulse_recenter_dir),
+            "pulse_recenter_step_count": int(self._pulse_recenter_step_count),
+            "pulse_recenter_enter_count": int(self._pulse_recenter_enter_count),
+            "pulse_recenter_exit_count": int(self._pulse_recenter_exit_count),
+            "pulse_recenter_cooldown_count": int(
+                self._pulse_recenter_cooldown_count
+            ),
+            "pulse_recenter_enter_abs": float(self.pulse_recenter_enter_abs),
+            "pulse_recenter_exit_abs": float(self.pulse_recenter_exit_abs),
+            "pulse_recenter_omega": float(self.pulse_recenter_omega),
+            "pulse_recenter_reason": str(reason),
+        }
+
+    def _apply_pulse_recenter_policy(
+        self,
+        *,
+        raw_omega: float,
+        linear_x: float,
+        image_age_ms: int,
+    ) -> Tuple[float, float, Dict[str, Any]]:
+        """
+        slow_straight_only 专用脉冲纠偏策略。
+
+        straight_keep_bias 在这里表示模型零点标定值：
+        error = raw_omega + bias。默认保持 angular.z=0，仅在误差连续
+        超过进入阈值时输出短脉冲，随后进入冷却并回到零角速度直行。
+        """
+        del image_age_ms  # 预留给后续图像新鲜度门控；当前策略只记录控制误差。
+
+        raw_omega = float(raw_omega)
+        linear_x = float(linear_x)
+        error = raw_omega + float(self.straight_keep_bias)
+        angular_z = 0.0
+        reason = "disabled"
+
+        if not self.pulse_recenter_enable:
+            self._pulse_recenter_state = "CENTER_HOLD"
+            self._pulse_recenter_dir = 0
+            self._pulse_recenter_step_count = 0
+            self._pulse_recenter_enter_count = 0
+            self._pulse_recenter_exit_count = 0
+            self._pulse_recenter_cooldown_count = 0
+            return (
+                linear_x,
+                0.0,
+                self._build_pulse_recenter_diag(error=error, reason=reason),
+            )
+
+        if self._pulse_recenter_state not in (
+            "CENTER_HOLD",
+            "RECENTERING",
+            "COOLDOWN",
+        ):
+            self._pulse_recenter_state = "CENTER_HOLD"
+            self._pulse_recenter_dir = 0
+            self._pulse_recenter_step_count = 0
+            self._pulse_recenter_enter_count = 0
+            self._pulse_recenter_exit_count = 0
+            self._pulse_recenter_cooldown_count = 0
+
+        state = self._pulse_recenter_state
+
+        if state == "CENTER_HOLD":
+            # 默认保持零角速度；只有连续达到进入阈值才触发一次纠偏脉冲。
+            angular_z = 0.0
+            self._pulse_recenter_dir = 0
+            self._pulse_recenter_step_count = 0
+            self._pulse_recenter_exit_count = 0
+
+            if abs(error) >= float(self.pulse_recenter_enter_abs):
+                self._pulse_recenter_enter_count += 1
+                reason = "enter_vote"
+            else:
+                self._pulse_recenter_enter_count = 0
+                reason = "center_hold"
+
+            if self._pulse_recenter_enter_count >= int(
+                self.pulse_recenter_enter_votes
+            ):
+                self._pulse_recenter_state = "RECENTERING"
+                self._pulse_recenter_dir = 1 if error > 0.0 else -1
+                self._pulse_recenter_step_count = 0
+                self._pulse_recenter_enter_count = 0
+                self._pulse_recenter_exit_count = 0
+                reason = "enter_recentering"
+
+                # 进入纠偏状态的同一帧发出首个短脉冲，减少慢模型下的响应延迟。
+                angular_z = (
+                    float(self._pulse_recenter_dir)
+                    * float(self.pulse_recenter_omega)
+                )
+                self._pulse_recenter_step_count = 1
+
+        elif state == "RECENTERING":
+            recenter_dir = int(self._pulse_recenter_dir)
+            if recenter_dir not in (-1, 1):
+                recenter_dir = 1 if error > 0.0 else -1
+                self._pulse_recenter_dir = recenter_dir
+
+            error_sign = self._sign_of(error)
+            sign_flip = (
+                bool(self.pulse_recenter_stop_on_sign_flip)
+                and error_sign in (-1, 1)
+                and error_sign == -recenter_dir
+            )
+
+            if abs(error) <= float(self.pulse_recenter_exit_abs):
+                self._pulse_recenter_exit_count += 1
+            else:
+                self._pulse_recenter_exit_count = 0
+
+            should_stop = False
+            if sign_flip:
+                should_stop = True
+                reason = "sign_flip_stop"
+            elif self._pulse_recenter_exit_count >= int(
+                self.pulse_recenter_exit_votes
+            ):
+                should_stop = True
+                reason = "exit_abs_hold"
+            elif self._pulse_recenter_step_count >= int(
+                self.pulse_recenter_max_steps
+            ):
+                should_stop = True
+                reason = "max_steps"
+            else:
+                reason = "recentering"
+
+            if should_stop:
+                angular_z = 0.0
+                self._pulse_recenter_state = "COOLDOWN"
+                self._pulse_recenter_cooldown_count = int(
+                    self.pulse_recenter_cooldown_steps
+                )
+                self._pulse_recenter_dir = 0
+                self._pulse_recenter_step_count = 0
+                self._pulse_recenter_enter_count = 0
+                self._pulse_recenter_exit_count = 0
+            else:
+                angular_z = recenter_dir * float(self.pulse_recenter_omega)
+                self._pulse_recenter_step_count += 1
+
+        else:  # COOLDOWN
+            # 冷却期间强制零角速度，避免连续脉冲变成持续转向。
+            angular_z = 0.0
+            self._pulse_recenter_enter_count = 0
+            self._pulse_recenter_exit_count = 0
+            self._pulse_recenter_dir = 0
+            self._pulse_recenter_step_count = 0
+            if self._pulse_recenter_cooldown_count > 0:
+                self._pulse_recenter_cooldown_count -= 1
+                reason = "cooldown"
+            else:
+                reason = "cooldown_done"
+            if self._pulse_recenter_cooldown_count <= 0:
+                self._pulse_recenter_state = "CENTER_HOLD"
+                self._pulse_recenter_cooldown_count = 0
+
+        if self._pulse_recenter_state != "RECENTERING":
+            angular_z = 0.0
+
+        return (
+            linear_x,
+            float(angular_z),
+            self._build_pulse_recenter_diag(error=error, reason=reason),
+        )
 
     def _recover_same_direction_suppressed_omega(
         self, *, omega: float, locked_turn_dir: Optional[str]
@@ -1717,31 +1925,91 @@ class HierarchicalNavRuntimeNode(Node):
         omega_raw = self._safe_float(
             outputs.get("straight_keep", {}).get("omega_cmd_raw", 0.0), 0.0
         )
-        linear_x, angular_z, straight_keep_trace = self._compose_control_cmd(
+        pulse_diag: Dict[str, Any] = {}
+        cmd_from_new, cmd_from_cached = self._compute_cmd_origin_flags(
             state="STRAIGHTKEEP",
-            locked_turn_dir=locked_turn_dir,
-            omega_cmd_final=omega_raw,
-            straight_keep_raw_omega=omega_raw,
-        )
-        (
-            linear_x,
-            angular_z,
-            source_override,
-            stale_omega_diag,
-            cmd_from_new,
-            cmd_from_cached,
-        ) = self._apply_stale_omega_policy(
-            now=now,
-            state="STRAIGHTKEEP",
-            linear_x=linear_x,
-            angular_z=angular_z,
-            reason="ok",
-            image_age_ms=image_age_ms,
-            # slow_straight_only 下不让 trigger/stage3 阻塞低速保持。
-            trigger_pred="Straight",
-            stage3_pred="Approach",
             completed_modules=completed_modules,
+            cmd_from_new_inference=None,
+            cmd_from_cached_output=None,
         )
+
+        if self.pulse_recenter_enable:
+            # pulse 模式绕开连续角速度和 stale 衰减：非新推理 tick 必须零角速度。
+            linear_x = float(self.linear_speed_map.get("STRAIGHTKEEP", 0.0))
+            if cmd_from_new:
+                linear_x, angular_z, pulse_diag = self._apply_pulse_recenter_policy(
+                    raw_omega=omega_raw,
+                    linear_x=linear_x,
+                    image_age_ms=image_age_ms,
+                )
+            else:
+                angular_z = 0.0
+                pulse_error = float(omega_raw) + float(self.straight_keep_bias)
+                pulse_reason = "cached_zero_omega"
+                if self._pulse_recenter_state == "COOLDOWN":
+                    if self._pulse_recenter_cooldown_count > 0:
+                        self._pulse_recenter_cooldown_count -= 1
+                        pulse_reason = "cached_cooldown"
+                    if self._pulse_recenter_cooldown_count <= 0:
+                        self._pulse_recenter_state = "CENTER_HOLD"
+                        self._pulse_recenter_cooldown_count = 0
+                        pulse_reason = "cached_cooldown_done"
+                pulse_diag = self._build_pulse_recenter_diag(
+                    error=pulse_error,
+                    reason=pulse_reason,
+                )
+
+            straight_keep_trace = self._empty_straight_keep_trace()
+            pulse_error = float(omega_raw) + float(self.straight_keep_bias)
+            straight_keep_trace.update(
+                {
+                    "straight_keep_raw_omega": float(omega_raw),
+                    "straight_keep_after_bias": float(pulse_error),
+                    "straight_keep_after_scale": float(pulse_error),
+                    "straight_keep_after_deadband": float(angular_z),
+                    "straight_keep_after_clip": float(angular_z),
+                    "straight_keep_final_omega": float(angular_z),
+                }
+            )
+
+            pulse_state = str(
+                pulse_diag.get("pulse_recenter_state", self._pulse_recenter_state)
+            )
+            if abs(float(angular_z)) > 1e-9:
+                source_override = "pulse_recenter"
+            elif pulse_state == "COOLDOWN":
+                source_override = "pulse_recenter_cooldown"
+            elif pulse_state == "CENTER_HOLD":
+                source_override = "pulse_center_hold"
+            else:
+                source_override = "pulse_cached_zero"
+            stale_omega_diag = self._empty_stale_omega_diag()
+        else:
+            linear_x, angular_z, straight_keep_trace = self._compose_control_cmd(
+                state="STRAIGHTKEEP",
+                locked_turn_dir=locked_turn_dir,
+                omega_cmd_final=omega_raw,
+                straight_keep_raw_omega=omega_raw,
+            )
+            (
+                linear_x,
+                angular_z,
+                source_override,
+                stale_omega_diag,
+                cmd_from_new,
+                cmd_from_cached,
+            ) = self._apply_stale_omega_policy(
+                now=now,
+                state="STRAIGHTKEEP",
+                linear_x=linear_x,
+                angular_z=angular_z,
+                reason="ok",
+                image_age_ms=image_age_ms,
+                # slow_straight_only 下不让 trigger/stage3 阻塞低速保持。
+                trigger_pred="Straight",
+                stage3_pred="Approach",
+                completed_modules=completed_modules,
+            )
         hard_stop_reason = ""
         if bool(stale_omega_diag.get("stale_linear_hold_active", False)):
             safety_level = "STALE_MODEL_CREEP"
@@ -1773,6 +2041,8 @@ class HierarchicalNavRuntimeNode(Node):
             reused_last_cmd=False,
         )
         cmd_diag.update(stale_omega_diag)
+        if pulse_diag:
+            cmd_diag.update(pulse_diag)
         cmd_diag.update(
             {
                 "slow_safe_waiting_first_model_output": False,
@@ -2399,6 +2669,63 @@ class HierarchicalNavRuntimeNode(Node):
             ),
             self.linear_hold_max_image_age_sec,
         )
+        pulse_recenter_enable = bool(
+            cmd_diag.get("pulse_recenter_enable", self.pulse_recenter_enable)
+        )
+        pulse_recenter_state = str(
+            cmd_diag.get("pulse_recenter_state", self._pulse_recenter_state)
+        )
+        pulse_recenter_error = self._safe_float(
+            cmd_diag.get(
+                "pulse_recenter_error",
+                self._safe_float(straight_keep_raw_omega, 0.0)
+                + float(self.straight_keep_bias),
+            ),
+            0.0,
+        )
+        pulse_recenter_dir = _to_int(
+            cmd_diag.get("pulse_recenter_dir", self._pulse_recenter_dir), 0
+        )
+        pulse_recenter_step_count = _to_int(
+            cmd_diag.get(
+                "pulse_recenter_step_count", self._pulse_recenter_step_count
+            ),
+            0,
+        )
+        pulse_recenter_enter_count = _to_int(
+            cmd_diag.get(
+                "pulse_recenter_enter_count", self._pulse_recenter_enter_count
+            ),
+            0,
+        )
+        pulse_recenter_exit_count = _to_int(
+            cmd_diag.get(
+                "pulse_recenter_exit_count", self._pulse_recenter_exit_count
+            ),
+            0,
+        )
+        pulse_recenter_cooldown_count = _to_int(
+            cmd_diag.get(
+                "pulse_recenter_cooldown_count",
+                self._pulse_recenter_cooldown_count,
+            ),
+            0,
+        )
+        pulse_recenter_enter_abs = self._safe_float(
+            cmd_diag.get("pulse_recenter_enter_abs", self.pulse_recenter_enter_abs),
+            self.pulse_recenter_enter_abs,
+        )
+        pulse_recenter_exit_abs = self._safe_float(
+            cmd_diag.get("pulse_recenter_exit_abs", self.pulse_recenter_exit_abs),
+            self.pulse_recenter_exit_abs,
+        )
+        pulse_recenter_omega = self._safe_float(
+            cmd_diag.get("pulse_recenter_omega", self.pulse_recenter_omega),
+            self.pulse_recenter_omega,
+        )
+        pulse_recenter_reason = str(
+            cmd_diag.get("pulse_recenter_reason", "")
+        )
         active_scheduled_module = self._active_scheduled_module_this_tick
         if active_scheduled_module not in self._module_names:
             active_scheduled_module = None
@@ -2520,6 +2847,20 @@ class HierarchicalNavRuntimeNode(Node):
             "linear_hold_speed_on_stale": float(linear_hold_speed_on_stale),
             "max_linear_hold_sec": float(max_linear_hold_sec),
             "linear_hold_max_image_age_sec": float(linear_hold_max_image_age_sec),
+            "pulse_recenter_enable": bool(pulse_recenter_enable),
+            "pulse_recenter_state": str(pulse_recenter_state),
+            "pulse_recenter_error": float(pulse_recenter_error),
+            "pulse_recenter_dir": int(pulse_recenter_dir),
+            "pulse_recenter_step_count": int(pulse_recenter_step_count),
+            "pulse_recenter_enter_count": int(pulse_recenter_enter_count),
+            "pulse_recenter_exit_count": int(pulse_recenter_exit_count),
+            "pulse_recenter_cooldown_count": int(
+                pulse_recenter_cooldown_count
+            ),
+            "pulse_recenter_enter_abs": float(pulse_recenter_enter_abs),
+            "pulse_recenter_exit_abs": float(pulse_recenter_exit_abs),
+            "pulse_recenter_omega": float(pulse_recenter_omega),
+            "pulse_recenter_reason": str(pulse_recenter_reason),
             "stage3_last_run_step": stage3_last_run_step,
             "junction_last_run_step": junction_last_run_step,
             "straight_keep_last_run_step": straight_keep_last_run_step,

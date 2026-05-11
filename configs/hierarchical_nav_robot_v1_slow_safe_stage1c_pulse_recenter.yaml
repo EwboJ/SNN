@@ -1,0 +1,139 @@
+# slow_safe_stage1c: slow-model real-robot validation with pulse recentering
+# Only straight_keep runs online. Other trigger/stage3/junction modules are disabled.
+# Goal: pulse-style correction when deviation is clear, then hold straight with zero omega.
+system:
+  image_h: 48
+  image_w: 64
+  control_rate_hz: 5
+
+models:
+  junction_lr_ckpt: "checkpoint/corridor_task/raw_data/corridor_task_junction_lr_APLIF_ADD_T4/best_model.ckpt"
+  stage3_ckpt: "checkpoint/corridor_task/corridor_task_stage3a_APLIF_ADD_T4/best_model.ckpt"
+  straight_keep_ckpt: "checkpoint/corridor/corridor_regression_dim1_rate_APLIF_ADD_T4_seq4/best_model.ckpt"
+  approach_trigger_ckpt: "checkpoint/corridor_task/approach_trigger_sameenv_shortwin/best_model.ckpt"
+
+state_machine:
+  boot_steps: 6
+  stage_window_size: 7
+  stage_enter_turn_votes: 5
+  stage_exit_turn_votes: 5
+  junction_window_size: 5
+  junction_lock_votes: 4
+  recover_min_steps: 4
+  recover_blend_steps: 12
+  straightkeep_suppress_in_turn: true
+
+  min_turn_steps: 5
+  soft_exit_min_turn_steps: 6
+  max_turn_steps: 10
+  recover_support_steps_needed: 2
+  turn_exit_vote_threshold: 3
+  straight_recover_omega_thresh: 0.12
+  straight_recover_hold_steps: 3
+  recover_recenter_omega_thresh: 0.15
+  recover_recenter_hold_steps: 2
+
+  straightkeep_min_steps_before_approach: 8
+  approach_arm_turn_votes: 3
+  approach_arm_consecutive_steps: 2
+  approach_arm_use_junction_hint: true
+  approach_arm_junction_consistency_steps: 2
+
+  min_approach_steps_before_junction_lock: 4
+  min_turn_votes_before_junction_lock: 3
+  start_junction_hist_on_turn_signal: true
+  min_turn_votes_to_start_junction_hist: 3
+  reset_junction_hist_when_no_turn_signal: true
+  allow_turn_relock_once: false
+
+  provisional_turn_window_steps: 6
+  provisional_turn_commit_votes: 4
+  provisional_turn_mix_ratio: 0.35
+  provisional_turn_min_observe_steps: 3
+  provisional_turn_recent_consistency_steps: 3
+  provisional_turn_margin_votes: 2
+  provisional_turn_use_omega_gate: true
+  provisional_turn_omega_sign_thresh: 0.12
+  provisional_turn_require_omega_agreement: false
+
+turn_control:
+  left_omega: 0.5
+  right_omega: -0.5
+  use_fixed_turn_rate: true
+  max_turn_steps: 10
+
+straight_keep:
+  omega_clip: 0.25
+  use_clip: true
+
+scheduler:
+  policy: slow_safe_straight_only
+  runtime_mode: slow_straight_only
+  reuse_last_outputs: true
+  straight_keep_stride: 1
+  trigger_stride: 999999
+  stage3_probe_stride: 999999
+  junction_probe_stride: 999999
+  turn_stage3_stride: 999999
+  recover_stage3_stride: 999999
+  infer_max_workers: 1
+  single_active_model: true
+  global_max_inflight_models: 1
+  max_submits_per_tick: 1
+  disable_junction_after_lock: true
+
+robot_control:
+  cmd_publish_hz: 5
+  use_state_based_linear_speed: true
+  linear_speed_boot: 0.0
+  linear_speed_straightkeep: 0.035
+  linear_speed_approach: 0.0
+  linear_speed_provisional_turn: 0.0
+  linear_speed_turn: 0.0
+  linear_speed_recover: 0.0
+  angular_clip: 0.035
+  straight_keep_bias: -0.06
+  straight_keep_scale: 1.0
+  straight_keep_deadband: 0.0
+  max_omega_hold_sec: 0.0
+  omega_stale_decay: 0.0
+  zero_omega_on_stale_inference: true
+  omega_rate_limit_per_step: 0.02
+  allow_linear_hold_on_stale_straight: true
+  linear_hold_speed_on_stale: 0.03
+  max_linear_hold_sec: 1.4
+  linear_hold_require_trigger_straight: false
+  linear_hold_block_stage3_turn: false
+  linear_hold_max_image_age_sec: 0.6
+  publish_last_cmd_when_no_new_inference: true
+
+  pulse_recenter_enable: true
+  pulse_recenter_enter_abs: 0.055
+  pulse_recenter_exit_abs: 0.025
+  pulse_recenter_enter_votes: 2
+  pulse_recenter_exit_votes: 1
+  pulse_recenter_max_steps: 3
+  pulse_recenter_cooldown_steps: 4
+  pulse_recenter_omega: 0.025
+  pulse_recenter_stop_on_sign_flip: true
+
+safety:
+  image_timeout_sec: 1.0
+  model_output_timeout_sec: 2.5
+  startup_warmup_sec: 3.0
+  publish_zero_on_timeout: true
+  publish_zero_on_missing_image: true
+  max_consecutive_errors: 3
+  stop_on_exception: true
+  debug_compact: false
+
+topics:
+  image_topic: /camera/color/image_raw
+  cmd_vel_topic: /cmd_vel
+  debug_topic: /nav/debug
+  state_topic: /nav/state
+
+logging:
+  save_debug_json: false
+  save_csv: false
+  verbose: true
