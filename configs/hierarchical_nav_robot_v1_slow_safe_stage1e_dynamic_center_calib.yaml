@@ -86,7 +86,7 @@ robot_control:
   cmd_publish_hz: 5
   use_state_based_linear_speed: true
   linear_speed_boot: 0.0
-  linear_speed_straightkeep: 0.08
+  linear_speed_straightkeep: 0.05
   linear_speed_approach: 0.0
   linear_speed_provisional_turn: 0.0
   linear_speed_turn: 0.0
