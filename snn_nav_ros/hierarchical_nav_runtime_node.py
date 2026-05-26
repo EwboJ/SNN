@@ -19,7 +19,7 @@ import sys
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
@@ -54,6 +54,7 @@ class ModuleCache:
     last_latency_ms: Optional[float] = None
     last_start_wall_time: Optional[float] = None
     last_finish_wall_time: Optional[float] = None
+    last_timing: Dict[str, float] = field(default_factory=dict)
     exception_count: int = 0
     success_count: int = 0
 
@@ -92,6 +93,7 @@ class HierarchicalNavRuntimeNode(Node):
         self.robot_control_cfg = self._cfg_dict("robot_control")
         self.safety_cfg = self._cfg_dict("safety")
         self.topics_cfg = self._cfg_dict("topics")
+        self.logging_cfg = self._cfg_dict("logging")
 
         # ===== 2) 按配置准备运行参数 =====
         ros_image_topic = (
@@ -316,6 +318,10 @@ class HierarchicalNavRuntimeNode(Node):
             1, int(self.safety_cfg.get("max_consecutive_errors", 5))
         )
         self.debug_compact = bool(self.safety_cfg.get("debug_compact", True))
+        # 开启后模型内部会做 CUDA synchronize，用于精确拆解推理耗时。
+        self.debug_timing_enable = bool(
+            self.logging_cfg.get("debug_timing_enable", False)
+        )
 
         # ===== 3) 动态导入仓库内模块（兼容源码运行与安装运行） =====
         self._prepare_repo_import_path(self.config_path)
@@ -401,6 +407,9 @@ class HierarchicalNavRuntimeNode(Node):
         self._debug_last_turn_dir: Optional[str] = None
         self._debug_last_turn_sign: Optional[int] = None
         self._active_scheduled_module_this_tick: Optional[str] = None
+        self._scheduler_priority_list_this_tick: List[str] = []
+        self._scheduler_selected_module_this_tick: Optional[str] = None
+        self._scheduler_skip_reason_this_tick = ""
         self._pulse_recenter_state = "CENTER_HOLD"
         self._pulse_recenter_dir = 0
         self._pulse_recenter_step_count = 0
@@ -1389,7 +1398,10 @@ class HierarchicalNavRuntimeNode(Node):
                 continue
 
             try:
-                self.models[name] = cls_obj(ckpt_path=ckpt_path, device=None)
+                model = cls_obj(ckpt_path=ckpt_path, device=None)
+                if hasattr(model, "set_profiling"):
+                    model.set_profiling(self.debug_timing_enable)
+                self.models[name] = model
                 # 在线串流推理前，显式重置一次内部状态
                 if hasattr(self.models[name], "reset_state"):
                     self.models[name].reset_state()
@@ -1500,6 +1512,9 @@ class HierarchicalNavRuntimeNode(Node):
     def _control_tick(self) -> None:
         self._tick_count += 1
         self._active_scheduled_module_this_tick = None
+        self._scheduler_priority_list_this_tick = []
+        self._scheduler_selected_module_this_tick = None
+        self._scheduler_skip_reason_this_tick = ""
         now = self.get_clock().now()
 
         state_now = self._get_state_name()
@@ -1665,6 +1680,8 @@ class HierarchicalNavRuntimeNode(Node):
             run_flags, submit_had_exception = self._submit_inference_jobs(
                 image_np=image_np,
                 schedule_flags=schedule_flags,
+                state=state_now,
+                locked_turn_dir=locked_now,
             )
             outputs = self._get_cached_outputs()
             if submit_had_exception:
@@ -2210,6 +2227,28 @@ class HierarchicalNavRuntimeNode(Node):
 
         return run
 
+    def _priority_for_state(
+        self, state: str, locked_turn_dir: Optional[str]
+    ) -> List[str]:
+        """按导航状态动态选择模型提交优先级，避免路口阶段被低优先级模型抢占。"""
+        _ = locked_turn_dir  # 保留参数，便于后续按锁定方向细化 TURN/JUNCTION 调度。
+        if self.runtime_mode == "slow_straight_only":
+            return ["straight_keep"]
+
+        state_name = str(state or "")
+        if state_name == "STRAIGHTKEEP":
+            return ["straight_keep", "approach_trigger"]
+        if state_name == "APPROACH":
+            # 路口接近阶段优先 stage3/junction，默认不让 straight_keep 抢占单模型推理槽。
+            return ["stage3", "approach_trigger", "junction_lr"]
+        if state_name == "PROVISIONAL_TURN":
+            return ["junction_lr", "stage3"]
+        if state_name == "TURN":
+            return ["stage3"]
+        if state_name == "RECOVER":
+            return ["stage3", "straight_keep"]
+        return ["straight_keep", "approach_trigger"]
+
     def _collect_finished_inference_results(self, now: Time) -> Tuple[bool, List[str]]:
         """
         仅收集已经完成的 future，不阻塞控制线程。
@@ -2225,7 +2264,7 @@ class HierarchicalNavRuntimeNode(Node):
         completed_modules: List[str] = []
         for module_name, future in completed_jobs:
             try:
-                out, latency_ms, finish_wall_time = future.result()
+                out, latency_ms, finish_wall_time, timing = future.result()
                 if not isinstance(out, dict):
                     raise TypeError("%s 输出不是 dict" % module_name)
                 with self._module_lock:
@@ -2233,6 +2272,7 @@ class HierarchicalNavRuntimeNode(Node):
                     cache.last_output = out
                     cache.last_latency_ms = float(latency_ms)
                     cache.last_finish_wall_time = float(finish_wall_time)
+                    cache.last_timing = dict(timing)
                     cache.last_update_time = now
                     cache.busy = False
                     cache.future = None
@@ -2244,6 +2284,7 @@ class HierarchicalNavRuntimeNode(Node):
                     cache = self.module_cache[module_name]
                     cache.busy = False
                     cache.future = None
+                    cache.last_timing = {}
                     cache.exception_count += 1
                 self.get_logger().error(
                     "异步模型运行异常[%s]: %s\n%s"
@@ -2253,7 +2294,11 @@ class HierarchicalNavRuntimeNode(Node):
         return had_exception, completed_modules
 
     def _submit_inference_jobs(
-        self, image_np: np.ndarray, schedule_flags: Dict[str, bool]
+        self,
+        image_np: np.ndarray,
+        schedule_flags: Dict[str, bool],
+        state: str,
+        locked_turn_dir: Optional[str],
     ) -> Tuple[Dict[str, bool], bool]:
         """
         按调度策略提交后台推理任务：
@@ -2268,18 +2313,31 @@ class HierarchicalNavRuntimeNode(Node):
         }
         had_exception = False
         submitted_this_tick = 0
-        priority = (
-            ["straight_keep"]
-            if self.runtime_mode == "slow_straight_only"
-            else ["straight_keep", "approach_trigger", "stage3", "junction_lr"]
-        )
+        priority = self._priority_for_state(state, locked_turn_dir)
+        self._scheduler_priority_list_this_tick = list(priority)
+        self._scheduler_selected_module_this_tick = None
+        self._scheduler_skip_reason_this_tick = ""
         max_submits_this_tick = min(
             int(self.max_submits_per_tick), 1 if self.single_active_model else 99
         )
 
-        if self.single_active_model and self._any_model_busy():
+        scheduled_modules = [
+            m for m in self._module_names if schedule_flags.get(m, False)
+        ]
+        if not scheduled_modules:
+            self._scheduler_skip_reason_this_tick = "no_module_due"
             return ran_flags, False
-        if self._count_busy_modules() >= int(self.global_max_inflight_models):
+        due_modules = [m for m in priority if schedule_flags.get(m, False)]
+        if not due_modules:
+            self._scheduler_skip_reason_this_tick = "no_priority_module_due"
+            return ran_flags, False
+
+        busy_module_count = self._count_busy_modules()
+        if self.single_active_model and busy_module_count > 0:
+            self._scheduler_skip_reason_this_tick = "busy_single_active_model"
+            return ran_flags, False
+        if busy_module_count >= int(self.global_max_inflight_models):
+            self._scheduler_skip_reason_this_tick = "global_inflight_limit"
             return ran_flags, False
 
         for module_name in priority:
@@ -2297,8 +2355,10 @@ class HierarchicalNavRuntimeNode(Node):
                     1 for m in self._module_names if self.module_cache[m].busy
                 )
                 if self.single_active_model and busy_count > 0:
+                    self._scheduler_skip_reason_this_tick = "busy_single_active_model"
                     break
                 if busy_count >= int(self.global_max_inflight_models):
+                    self._scheduler_skip_reason_this_tick = "global_inflight_limit"
                     break
                 cache = self.module_cache[module_name]
                 if not cache.busy:
@@ -2324,6 +2384,7 @@ class HierarchicalNavRuntimeNode(Node):
                     cache = self.module_cache[module_name]
                     cache.busy = False
                     cache.future = None
+                    cache.last_timing = {}
                     cache.exception_count += 1
                 self.get_logger().error(
                     "提交异步推理失败[%s]: %s" % (module_name, str(exc))
@@ -2337,6 +2398,9 @@ class HierarchicalNavRuntimeNode(Node):
             submitted_this_tick += 1
             if self._active_scheduled_module_this_tick is None:
                 self._active_scheduled_module_this_tick = module_name
+            if self._scheduler_selected_module_this_tick is None:
+                self._scheduler_selected_module_this_tick = module_name
+                self._scheduler_skip_reason_this_tick = ""
             if self.single_active_model:
                 break
 
@@ -2354,7 +2418,7 @@ class HierarchicalNavRuntimeNode(Node):
 
     def _run_model(
         self, module_name: str, image_np: np.ndarray
-    ) -> Tuple[Dict[str, Any], float, float]:
+    ) -> Tuple[Dict[str, Any], float, float, Dict[str, float]]:
         model = self.models.get(module_name)
         if model is None:
             raise RuntimeError("模型未加载: %s" % module_name)
@@ -2369,7 +2433,10 @@ class HierarchicalNavRuntimeNode(Node):
             raise RuntimeError("model object is not callable: %s" % module_name)
         finish_wall_time = time.perf_counter()
         latency_ms = (finish_wall_time - start_wall_time) * 1000.0
-        return out, float(latency_ms), float(finish_wall_time)
+        timing = self._sanitize_model_timing(
+            out.get("timing") if isinstance(out, dict) else None
+        )
+        return out, float(latency_ms), float(finish_wall_time), timing
 
     def _default_output(self, module_name: str) -> Dict[str, Any]:
         if module_name == "stage3":
@@ -2589,6 +2656,10 @@ class HierarchicalNavRuntimeNode(Node):
             junction_latency_ms = self.module_cache["junction_lr"].last_latency_ms
             straight_keep_latency_ms = self.module_cache["straight_keep"].last_latency_ms
             trigger_latency_ms = self.module_cache["approach_trigger"].last_latency_ms
+            model_timings = {
+                m: dict(self.module_cache[m].last_timing)
+                for m in self._module_names
+            }
             stage3_exception_count = int(self.module_cache["stage3"].exception_count)
             junction_exception_count = int(
                 self.module_cache["junction_lr"].exception_count
@@ -2824,9 +2895,15 @@ class HierarchicalNavRuntimeNode(Node):
         pulse_recenter_reason = str(
             cmd_diag.get("pulse_recenter_reason", "")
         )
+        model_timing_debug = self._build_model_timing_debug(model_timings)
         active_scheduled_module = self._active_scheduled_module_this_tick
         if active_scheduled_module not in self._module_names:
             active_scheduled_module = None
+        scheduler_priority_list = list(self._scheduler_priority_list_this_tick)
+        scheduler_selected_module = self._scheduler_selected_module_this_tick
+        if scheduler_selected_module not in self._module_names:
+            scheduler_selected_module = None
+        scheduler_skip_reason = str(self._scheduler_skip_reason_this_tick or "")
         slow_safe_waiting_first_model_output = bool(
             cmd_diag.get("slow_safe_waiting_first_model_output", False)
         )
@@ -2859,6 +2936,7 @@ class HierarchicalNavRuntimeNode(Node):
             "config_path": str(self.config_path),
             "cmd_vel_topic": str(self.cmd_vel_topic),
             "debug_schema_version": 2,
+            "debug_timing_enable": bool(self.debug_timing_enable),
             "infer_max_workers": int(self.infer_max_workers),
             "runtime_mode": str(self.runtime_mode),
             "single_active_model": bool(self.single_active_model),
@@ -2866,6 +2944,9 @@ class HierarchicalNavRuntimeNode(Node):
             "global_max_inflight_models": int(self.global_max_inflight_models),
             "max_submits_per_tick": int(self.max_submits_per_tick),
             "active_scheduled_module_this_tick": active_scheduled_module,
+            "scheduler_priority_list": scheduler_priority_list,
+            "scheduler_selected_module": scheduler_selected_module,
+            "scheduler_skip_reason": scheduler_skip_reason,
             "slow_safe_waiting_first_model_output": bool(
                 slow_safe_waiting_first_model_output
             ),
@@ -2975,6 +3056,7 @@ class HierarchicalNavRuntimeNode(Node):
             "reason": reason,
             "consecutive_errors": int(self._consecutive_errors),
         }
+        debug_payload.update(model_timing_debug)
 
         if not self.debug_compact:
             debug_payload.update(
@@ -3055,6 +3137,48 @@ class HierarchicalNavRuntimeNode(Node):
         sec = ns // 1_000_000_000
         nsec = ns % 1_000_000_000
         return "%d.%09d" % (sec, nsec)
+
+    @staticmethod
+    def _sanitize_model_timing(timing: Any) -> Dict[str, float]:
+        """把模型 predict() 返回的 timing 清洗成可安全写入 /nav/debug 的数字 dict。"""
+        if not isinstance(timing, dict):
+            return {}
+        cleaned: Dict[str, float] = {}
+        for key, value in timing.items():
+            if not isinstance(key, str):
+                continue
+            try:
+                number = float(value)
+            except Exception:
+                continue
+            if bool(np.isfinite(number)):
+                cleaned[key] = number
+        return cleaned
+
+    def _build_model_timing_debug(
+        self, timings_by_module: Dict[str, Dict[str, float]]
+    ) -> Dict[str, Optional[float]]:
+        """展开每个模型的耗时拆解字段，缺失时发布 null 以保持 debug schema 稳定。"""
+        timing_keys = (
+            "preprocess_ms",
+            "to_tensor_ms",
+            "resize_ms",
+            "normalize_ms",
+            "to_device_ms",
+            "forward_ms",
+            "reset_net_ms",
+            "output_to_cpu_ms",
+            "postprocess_ms",
+            "total_ms",
+        )
+        debug: Dict[str, Optional[float]] = {}
+        for module_name in self._module_names:
+            timing = timings_by_module.get(module_name, {})
+            if not isinstance(timing, dict):
+                timing = {}
+            for key in timing_keys:
+                debug["%s_%s" % (module_name, key)] = timing.get(key)
+        return debug
 
     @staticmethod
     def _safe_float(v: Any, default: float = 0.0) -> float:

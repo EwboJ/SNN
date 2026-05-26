@@ -145,4 +145,5 @@ topics:
 logging:
   save_debug_json: false
   save_csv: false
+  debug_timing_enable: true
   verbose: true

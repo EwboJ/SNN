@@ -47,6 +47,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Any, Dict, Optional, Sequence, Union
 
 import numpy as np
@@ -188,6 +189,34 @@ class _BaseCorridorInfer:
 
         self.net.to(self.device)
         self.net.eval()
+        self.enable_profiling = False
+        self.last_timing: Dict[str, float] = {}
+
+    def set_profiling(self, enable: bool) -> None:
+        """开启/关闭推理耗时拆解；关闭时不做 CUDA 同步，避免影响正常运行。"""
+        self.enable_profiling = bool(enable)
+        self.last_timing = {}
+
+    def _sync_cuda_for_timing(self) -> None:
+        """profiling 模式下同步 CUDA，让分段耗时更接近真实执行时间。"""
+        if self.enable_profiling and self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+
+    def _timer_start(self) -> Optional[float]:
+        if not self.enable_profiling:
+            return None
+        self._sync_cuda_for_timing()
+        return time.perf_counter()
+
+    def _timer_stop_ms(self, start: Optional[float]) -> Optional[float]:
+        if start is None:
+            return None
+        self._sync_cuda_for_timing()
+        return (time.perf_counter() - start) * 1000.0
+
+    def _record_timing(self, name: str, value_ms: Optional[float]) -> None:
+        if self.enable_profiling and value_ms is not None:
+            self.last_timing[name] = float(value_ms)
 
     def reset_state(self) -> None:
         """
@@ -280,21 +309,67 @@ class _BaseCorridorInfer:
           3) Normalize(mean=0.5,std=0.5)
           4) 补 batch 维并移动到 device
         """
+        timer = self._timer_start()
         x = self._to_chw_tensor_01(image)
+        self._record_timing('to_tensor_ms', self._timer_stop_ms(timer))
+        timer = self._timer_start()
         x = TF.resize(x, [self.img_h, self.img_w], antialias=True)
+        self._record_timing('resize_ms', self._timer_stop_ms(timer))
+        timer = self._timer_start()
         x = TF.normalize(x, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        self._record_timing('normalize_ms', self._timer_stop_ms(timer))
+        timer = self._timer_start()
         x = x.unsqueeze(0).to(self.device, non_blocking=True)
+        self._record_timing('to_device_ms', self._timer_stop_ms(timer))
         return x
 
-    @torch.no_grad()
     def _forward_single(self, image: ImageInput) -> torch.Tensor:
         """单帧前向，返回 shape=[D] 的 CPU tensor。"""
-        x = self._preprocess(image)
+        self.last_timing = {}
+        total_timer = self._timer_start()
+
+        with torch.inference_mode():
+            timer = self._timer_start()
+            x = self._preprocess(image)
+            self._record_timing('preprocess_ms', self._timer_stop_ms(timer))
+
+            out = self._forward_net_for_timing(x)
+
+            timer = self._timer_start()
+            out = out.detach().float().cpu().squeeze(0)
+            self._record_timing('output_to_cpu_ms', self._timer_stop_ms(timer))
+
+        self._record_timing('total_ms', self._timer_stop_ms(total_timer))
+        return out
+
+    def _forward_net_for_timing(self, x: torch.Tensor) -> torch.Tensor:
+        """执行模型前向；profiling 时尽量把 rate 编码的 reset_net 单独拆出。"""
+        # CorridorPolicyNet.step() 在 rate 编码下等价于 forward + reset_net(backbone)。
+        # profiling 时手动拆开，便于确认耗时来自 SNN forward 还是 reset_net。
+        if (
+            self.enable_profiling
+            and hasattr(self.net, 'step')
+            and getattr(self.net, 'encoding', None) == 'rate'
+            and hasattr(self.net, 'backbone')
+            and callable(getattr(self.net, 'forward', None))
+        ):
+            timer = self._timer_start()
+            out = self.net.forward(x)
+            self._record_timing('forward_ms', self._timer_stop_ms(timer))
+
+            timer = self._timer_start()
+            from spikingjelly.clock_driven import functional
+
+            functional.reset_net(self.net.backbone)
+            self._record_timing('reset_net_ms', self._timer_stop_ms(timer))
+            return out
+
+        timer = self._timer_start()
         if hasattr(self.net, 'step'):
             out = self.net.step(x)
         else:
             out = self.net(x)
-        out = out.detach().float().cpu().squeeze(0)
+        self._record_timing('forward_ms', self._timer_stop_ms(timer))
         return out
 
 
@@ -323,9 +398,11 @@ class JunctionLRInfer(_BaseCorridorInfer):
             default_img_w=64,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(self, image: ImageInput) -> Dict[str, Any]:
+        predict_timer = self._timer_start()
         logits = self._forward_single(image)
+        post_timer = self._timer_start()
         probs_t = torch.softmax(logits, dim=0)
         pred_id = int(torch.argmax(probs_t).item())
         labels = list(self.LABELS)
@@ -339,12 +416,16 @@ class JunctionLRInfer(_BaseCorridorInfer):
 
         pred_label = labels[pred_id] if pred_id < len(labels) else str(pred_id)
         confidence = float(probs_t[pred_id].item())
-        return {
+        result = {
             'pred_label': pred_label,
             'pred_id': pred_id,
             'probs': probs,
             'confidence': confidence,
         }
+        self._record_timing('postprocess_ms', self._timer_stop_ms(post_timer))
+        self._record_timing('total_ms', self._timer_stop_ms(predict_timer))
+        result['timing'] = dict(self.last_timing)
+        return result
 
     __call__ = predict
 
@@ -374,9 +455,11 @@ class Stage3Infer(_BaseCorridorInfer):
             default_img_w=64,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(self, image: ImageInput) -> Dict[str, Any]:
+        predict_timer = self._timer_start()
         logits = self._forward_single(image)
+        post_timer = self._timer_start()
         probs_t = torch.softmax(logits, dim=0)
         pred_id = int(torch.argmax(probs_t).item())
         labels = list(self.LABELS)
@@ -390,12 +473,16 @@ class Stage3Infer(_BaseCorridorInfer):
 
         pred_stage = labels[pred_id] if pred_id < len(labels) else str(pred_id)
         confidence = float(probs_t[pred_id].item())
-        return {
+        result = {
             'pred_stage': pred_stage,
             'pred_id': pred_id,
             'probs': probs,
             'confidence': confidence,
         }
+        self._record_timing('postprocess_ms', self._timer_stop_ms(post_timer))
+        self._record_timing('total_ms', self._timer_stop_ms(predict_timer))
+        result['timing'] = dict(self.last_timing)
+        return result
 
     __call__ = predict
 
@@ -428,9 +515,11 @@ class StraightKeepInfer(_BaseCorridorInfer):
         if self.seq_len <= 1:
             self.seq_len = 4
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(self, image: ImageInput) -> Dict[str, Any]:
+        predict_timer = self._timer_start()
         out = self._forward_single(image)
+        post_timer = self._timer_start()
         if out.ndim == 0:
             omega = float(out.item())
         elif out.numel() == 1:
@@ -440,10 +529,14 @@ class StraightKeepInfer(_BaseCorridorInfer):
             idx = 1 if out.numel() >= 2 else 0
             omega = float(out.reshape(-1)[idx].item())
 
-        return {
+        result = {
             'omega_cmd_raw': float(omega),
             'omega_abs': float(abs(omega)),
         }
+        self._record_timing('postprocess_ms', self._timer_stop_ms(post_timer))
+        self._record_timing('total_ms', self._timer_stop_ms(predict_timer))
+        result['timing'] = dict(self.last_timing)
+        return result
 
     __call__ = predict
 
@@ -481,10 +574,12 @@ class ApproachTriggerInfer(_BaseCorridorInfer):
             default_img_w=64,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(self, image: ImageInput) -> Dict[str, Any]:
         """单帧推理，返回结构化 dict。"""
+        predict_timer = self._timer_start()
         logits = self._forward_single(image)
+        post_timer = self._timer_start()
         probs_t = torch.softmax(logits, dim=0)
         pred_id = int(torch.argmax(probs_t).item())
         labels = list(self.LABELS)
@@ -498,12 +593,16 @@ class ApproachTriggerInfer(_BaseCorridorInfer):
 
         pred_label = labels[pred_id] if pred_id < len(labels) else str(pred_id)
         confidence = float(probs_t[pred_id].item())
-        return {
+        result = {
             'pred_label': pred_label,
             'pred_id': pred_id,
             'probs': probs,
             'confidence': confidence,
         }
+        self._record_timing('postprocess_ms', self._timer_stop_ms(post_timer))
+        self._record_timing('total_ms', self._timer_stop_ms(predict_timer))
+        result['timing'] = dict(self.last_timing)
+        return result
 
     __call__ = predict
 
