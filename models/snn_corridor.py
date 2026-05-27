@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from spikingjelly.clock_driven import functional
-from typing import Optional, Union, Tuple
+from typing import Optional, Sequence, Union, Tuple
 
 import sys
 import os
@@ -143,7 +143,7 @@ class CorridorPolicyNet(nn.Module):
             )
 
         self.backbone = backbone
-        self.feat_dim = 128 * BasicBlock.expansion
+        self.feat_dim = int(getattr(backbone, "feature_dim", 128 * BasicBlock.expansion))
 
         if head_type == 'discrete':
             self.head = DiscreteHead(self.feat_dim, num_actions, dropout)
@@ -239,6 +239,8 @@ def build_corridor_net(
     dropout: float = 0.3,
     pretrained_backbone: Optional[str] = None,
     framediff_gain: float = 1.0,
+    base_channels: int = 32,
+    corridor_layers: Sequence[int] = (18, 18, 18),
 
     # ===== 新增：神经元超参数 =====
     tau: float = 2.0,
@@ -264,6 +266,14 @@ def build_corridor_net(
         backbone_in_channels = raw_in_channels
 
     # ===== 新增：统一传给 SorResNet -> build_neuron =====
+    # 支持轻量化走廊网络；默认 32 + [18,18,18] 与旧 checkpoint 兼容。
+    corridor_layers = [int(v) for v in corridor_layers]
+    if len(corridor_layers) != 3:
+        raise ValueError("corridor_layers 必须包含 3 个整数，例如 [3, 3, 3]")
+    base_channels = int(base_channels)
+    if base_channels <= 0:
+        raise ValueError("base_channels 必须为正整数")
+
     neuron_kwargs = dict(
         tau=tau,
         init_tau=init_tau,
@@ -278,12 +288,13 @@ def build_corridor_net(
 
     backbone = SorResNet(
         block=BasicBlock,
-        layers=[18, 18, 18],
+        layers=list(corridor_layers),
         num_classes=num_actions if head_type == 'discrete' else control_dim,
         T=T,
         neuron_type=neuron_type,
         residual_mode=residual_mode,
         in_channels=backbone_in_channels,
+        base_channels=base_channels,
         neuron_kwargs=neuron_kwargs,   # ===== 关键新增 =====
     )
 

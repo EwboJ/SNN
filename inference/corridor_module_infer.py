@@ -83,6 +83,25 @@ def _as_str(value: Any, default: str) -> str:
     return s if s else default
 
 
+def _as_int_list(value: Any, default: Sequence[int]) -> Sequence[int]:
+    """安全解析整数列表；旧 checkpoint 缺字段时回退到默认网络结构。"""
+    if value is None:
+        return tuple(int(v) for v in default)
+    if isinstance(value, str):
+        items = [v.strip() for v in value.split(',') if v.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return tuple(int(v) for v in default)
+    try:
+        parsed = [int(v) for v in items]
+    except Exception:
+        return tuple(int(v) for v in default)
+    if len(parsed) != 3 or any(v <= 0 for v in parsed):
+        return tuple(int(v) for v in default)
+    return tuple(parsed)
+
+
 def _extract_state_dict(ckpt_obj: Any) -> Dict[str, torch.Tensor]:
     """
     从不同 checkpoint 格式中提取 state_dict。
@@ -158,6 +177,10 @@ class _BaseCorridorInfer:
         self.residual_mode = _as_str(self.cfg.get('residual_mode'), default_residual_mode)
         self.img_h = _as_int(self.cfg.get('img_h'), default_img_h)
         self.img_w = _as_int(self.cfg.get('img_w'), default_img_w)
+        self.base_channels = _as_int(self.cfg.get('base_channels'), 32)
+        self.corridor_layers = _as_int_list(
+            self.cfg.get('corridor_layers'), (18, 18, 18)
+        )
 
         self.num_actions = _as_int(
             self.cfg.get('task_num_classes', self.cfg.get('num_classes')),
@@ -178,6 +201,8 @@ class _BaseCorridorInfer:
             raw_in_channels=3,
             # 与训练链一致：回归默认允许 tanh 限幅；分类无影响
             use_tanh=(self.head_type == 'regression'),
+            base_channels=self.base_channels,
+            corridor_layers=self.corridor_layers,
         )
 
         state_dict = _strip_module_prefix(_extract_state_dict(ckpt))

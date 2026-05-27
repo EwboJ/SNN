@@ -206,12 +206,14 @@ class SorResNet(nn.Module):
         residual_mode: str = 'ADD',
         in_channels: int = 3,
         neuron_kwargs: Optional[dict] = None,
+        base_channels: int = 32,
     ) -> None:
         super(SorResNet, self).__init__()
         self.return_features = return_features  # 控制是否返回中间特征
         self.T = T
         self.neuron_type = neuron_type
         self.residual_mode = residual_mode
+        self.base_channels = int(base_channels)
         
         # 构建神经元工厂
         # self._neuron_builder = build_neuron(neuron_type)
@@ -222,7 +224,7 @@ class SorResNet(nn.Module):
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
 
-        self.inplanes = 32
+        self.inplanes = self.base_channels
         self.dilation = 1
         if replace_stride_with_dilation is None:
             # each element in the tuple indicates if we should replace
@@ -238,17 +240,18 @@ class SorResNet(nn.Module):
         self.bn1 = norm_layer(self.inplanes)
         self.sn = self._neuron_builder()
         # self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 32, layers[0])
-        self.layer2 = self._make_layer(block, 64, layers[1], stride=2,
+        self.layer1 = self._make_layer(block, self.base_channels, layers[0])
+        self.layer2 = self._make_layer(block, self.base_channels * 2, layers[1], stride=2,
                                        dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, 128, layers[2], stride=2,
+        self.layer3 = self._make_layer(block, self.base_channels * 4, layers[2], stride=2,
                                        dilate=replace_stride_with_dilation[1])
         # self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
         #                                dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.feature_dim = self.base_channels * 4 * block.expansion
         self.fc = nn.Sequential(
             # nn.Dropout(0.5),
-            nn.Linear(128 * block.expansion, num_classes, bias=False),
+            nn.Linear(self.feature_dim, num_classes, bias=False),
             # APLIFNode(init_tau=2.0, surrogate_function=surrogate.ATan(), detach_reset=True)
         )
 

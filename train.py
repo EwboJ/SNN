@@ -667,6 +667,21 @@ def run_evaluation(net, loader, compute_loss, is_discrete, is_sequence,
     }
 
 
+def parse_corridor_layers(text):
+    """解析轻量化走廊网络层数配置，例如 '3,3,3' -> [3, 3, 3]。"""
+    try:
+        layers = [int(v.strip()) for v in str(text).split(',') if v.strip()]
+    except Exception as exc:
+        raise argparse.ArgumentTypeError(
+            "corridor_layers 必须是逗号分隔整数，例如 3,3,3"
+        ) from exc
+    if len(layers) != 3 or any(v <= 0 for v in layers):
+        raise argparse.ArgumentTypeError(
+            "corridor_layers 必须包含 3 个正整数，例如 3,3,3"
+        )
+    return layers
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='SNN 可迁移研究框架 - 统一训练入口',
@@ -753,6 +768,11 @@ def main():
     parser.add_argument('--framediff_gain', default=1.0, type=float,
                         help='framediff 编码增益系数，放大帧差信号以提升'
                              '脉冲发放率 (推荐 5.0~15.0)')
+    parser.add_argument('--base_channels', default=32, type=int,
+                        help='走廊 SNN backbone 起始通道数；默认 32 兼容旧模型，tiny 可用 8/16')
+    parser.add_argument('--corridor_layers', default='18,18,18',
+                        type=parse_corridor_layers,
+                        help='走廊 SNN 三个 stage 的 block 数，例如 3,3,3')
     parser.add_argument('--v_max', default=0.22, type=float,
                         help='最大线速度 (m/s)')
     parser.add_argument('--w_max', default=2.84, type=float,
@@ -817,6 +837,8 @@ def main():
                         help='训练结束后对 test 集做最终评估')
 
     args = parser.parse_args()
+    if args.base_channels <= 0:
+        parser.error("--base_channels 必须为正整数")
 
     # 判断数据集类型
     is_corridor = (args.dataset == 'corridor')
@@ -969,6 +991,8 @@ def main():
             raw_in_channels=in_channels,
             use_tanh=False,
             framediff_gain=args.framediff_gain,
+            base_channels=args.base_channels,
+            corridor_layers=args.corridor_layers,
 
             tau=args.tau,
             init_tau=args.init_tau,
@@ -995,6 +1019,8 @@ def main():
             v_max=args.v_max,
             w_max=args.w_max,
             framediff_gain=args.framediff_gain,
+            base_channels=args.base_channels,
+            corridor_layers=args.corridor_layers,
 
             tau=args.tau,
             init_tau=args.init_tau,
@@ -1159,6 +1185,8 @@ def main():
         'exp_name': exp_name,
         'seed': args.seed,
         'dataset': args.dataset,
+        'base_channels': int(args.base_channels),
+        'corridor_layers': list(args.corridor_layers),
 
         'tau': args.tau,
         'init_tau': args.init_tau,
